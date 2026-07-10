@@ -1,0 +1,43 @@
+# Re-export głównego modułu DB (implementacja w aihub._db_impl, bo aihub.db to ten pakiet).
+# Dzięki temu "from aihub.db import append_event, init_db, ..." działa.
+from aihub._db_impl import (
+    init_db,
+    now_ts,
+    json_dumps,
+    json_loads,
+    exec_one,
+    fetch_all,
+    fetch_one,
+    upsert_psyche,
+    get_psyche,
+    append_event,
+    get_events_since,
+    insert_stm_message,
+    get_stm,
+    prune_stm,
+    upsert_node,
+    search_nodes_fts,
+    list_recent_nodes,
+    soft_delete_node,
+)
+
+__all__ = [
+    "init_db",
+    "now_ts",
+    "json_dumps",
+    "json_loads",
+    "exec_one",
+    "fetch_all",
+    "fetch_one",
+    "upsert_psyche",
+    "get_psyche",
+    "append_event",
+    "get_events_since",
+    "insert_stm_message",
+    "get_stm",
+    "prune_stm",
+    "upsert_node",
+    "search_nodes_fts",
+    "list_recent_nodes",
+    "soft_delete_node",
+]

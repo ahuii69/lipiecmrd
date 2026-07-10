@@ -1,0 +1,4 @@
+{
+    "enable_env": "AIHUB_USE_CODEBASE_DEV_KEY",
+    "hub_key": "morda-dev-hub-insecure-public-repo-do-not-use-prod"
+}

@@ -1,0 +1,222 @@
+{
+  "description": "Cockpit BFF → AI-Hub proxy (method + path templates).",
+  "version": 1,
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/system/ping"
+    },
+    {
+      "method": "GET",
+      "path": "/ops/health"
+    },
+    {
+      "method": "GET",
+      "path": "/ops/ready"
+    },
+    {
+      "method": "GET",
+      "path": "/ops/capabilities"
+    },
+    {
+      "method": "GET",
+      "path": "/system/health/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cognitive/health"
+    },
+    {
+      "method": "GET",
+      "path": "/chat/sessions"
+    },
+    {
+      "method": "GET",
+      "path": "/chat/session/{session_id}/history"
+    },
+    {
+      "method": "PATCH",
+      "path": "/chat/session/rename"
+    },
+    {
+      "method": "DELETE",
+      "path": "/chat/session"
+    },
+    {
+      "method": "POST",
+      "path": "/chat/turn"
+    },
+    {
+      "method": "POST",
+      "path": "/chat/upload"
+    },
+    {
+      "method": "POST",
+      "path": "/chat/stt"
+    },
+    {
+      "method": "GET",
+      "path": "/chat/capabilities"
+    },
+    {
+      "method": "POST",
+      "path": "/chat/capabilities/execute"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/schema-health"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/consistency/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/reflections/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/policy/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/simulations/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/overview/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/memory-v2/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/psyche-v2/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/identity/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/memory-v2/retrieval/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/psyche-v2/habits/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/psyche-v2/relations/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/cockpit/calibration/{user_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/agent/run"
+    },
+    {
+      "method": "POST",
+      "path": "/agent/loop"
+    },
+    {
+      "method": "GET",
+      "path": "/agent/status/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/agent/goals/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/agent/goals/{user_id}/{goal_id}/trace"
+    },
+    {
+      "method": "GET",
+      "path": "/memory/v2/summary/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/memory/v2/procedures/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/memory/v2/contradictions/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/memory/v2/autobio/{user_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/autobio/compact/{user_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/consolidate/{user_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/forgetting/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/memory/v2/retrieval-explain/{user_id}"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/item"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/search"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/item/suppress"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/item/pin"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/item/archive"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/context-pack"
+    },
+    {
+      "method": "GET",
+      "path": "/memory/v2/index-jobs"
+    },
+    {
+      "method": "POST",
+      "path": "/memory/v2/index-jobs/process"
+    },
+    {
+      "method": "GET",
+      "path": "/psyche/runtime/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/psyche/v2/runtime/{user_id}"
+    },
+    {
+      "method": "GET",
+      "path": "/web/health"
+    },
+    {
+      "method": "POST",
+      "path": "/web/ingest"
+    },
+    {
+      "method": "POST",
+      "path": "/web/research"
+    }
+  ]
+}

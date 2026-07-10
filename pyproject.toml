@@ -1,0 +1,21 @@
+[tool.black]
+line-length = 88
+target-version = ["py39"]
+
+[tool.isort]
+profile = "black"
+line_length = 88
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "legacy_sqlite_v2: create pre-migration V2 tables on DB_PATH before init_db()",
+    "system_gate: canonical product E2E / production gate (run via scripts/product_system_gate.sh)",
+]
+addopts = "-ra --tb=short --override-ini=log_file=logs/test.log"
+log_file_level = "DEBUG"
+log_file_format = "%(asctime)s [%(levelname)-8s] %(name)s:%(funcName)s:%(lineno)d - %(message)s"
+filterwarnings = [
+    "ignore::FutureWarning:huggingface_hub",
+    "ignore::DeprecationWarning:importlib",
+]

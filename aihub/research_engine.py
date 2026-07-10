@@ -1,0 +1,710 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+
+import asyncio
+import hashlib
+import logging
+import os
+import re
+import ssl
+import time
+from dataclasses import dataclass
+from typing import Any, Awaitable, Dict, List, Optional
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+import httpx
+
+from aihub.config import (
+    BRAVE_API_KEY,
+    HTTP_CA_BUNDLE,
+    HTTP_MAX_BYTES,
+    HTTP_TIMEOUT_S,
+    HTTP_TRUST_ENV,
+)
+from aihub.db import append_event, now_ts
+from aihub.memory_core import get_memory_core
+from aihub.psyche_core import get_psyche_core
+
+logger = logging.getLogger(__name__)
+
+# Optional aggregation backends: failures are soft (Brave remains primary when configured).
+_OPTIONAL_RESEARCH_BACKENDS = frozenset({"Wikipedia", "DuckDuckGo"})
+
+
+def _optional_research_backends_enabled() -> bool:
+    """Return whether public no-key research backends may be called.
+
+    Default is off in CI/test/offline environments to prevent hidden network stalls.
+    Enable explicitly with AIHUB_ENABLE_OPTIONAL_RESEARCH_BACKENDS=1.
+    Brave remains available whenever BRAVE_API_KEY is configured.
+    """
+    value = os.getenv("AIHUB_ENABLE_OPTIONAL_RESEARCH_BACKENDS", "0").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
+def _method_is_overridden(bound_method: Any, original_func: Any) -> bool:
+    """True when tests/plugins replace a backend method with a mock/custom callable."""
+    return getattr(bound_method, "__func__", None) is not original_func
+
+
+def _http_client_kwargs(timeout: float) -> dict[str, Any]:
+    verify = (
+        ssl.create_default_context(cafile=HTTP_CA_BUNDLE)
+        if HTTP_CA_BUNDLE
+        else ssl.create_default_context()
+    )
+    return {
+        "timeout": timeout,
+        "verify": verify,
+        "trust_env": HTTP_TRUST_ENV,
+    }
+
+
+# ---- Hardening constants ----
+RESEARCH_CACHE_TTL = 300  # seconds — skip same normalised query within this window
+RESEARCH_MIN_FACT_LEN = 40
+RESEARCH_MAX_FACT_LEN = 800
+_BACKOFF_DELAYS = (0.2, 0.6, 1.5)
+_TRACKING_PARAMS = frozenset(
+    {
+        "utm_source",
+        "utm_medium",
+        "utm_campaign",
+        "utm_term",
+        "utm_content",
+        "fbclid",
+        "gclid",
+        "ref",
+        "source",
+    }
+)
+_BOILERPLATE_RE = re.compile(
+    r"(?i)\b(?:cookies?\s*(?:policy|settings)?|privacy\s*policy|javascript\s*required"
+    r"|sign\s*in|log\s*in|accept\s*all|terms\s*of\s*(?:service|use)"
+    r"|subscribe|newsletter|advertisement|click\s*here|cookie\s*settings)\b"
+)
+
+
+def normalize_query(q: str) -> str:
+    """Lowercase, collapse whitespace, strip."""
+    return re.sub(r"\s+", " ", q.strip().lower())
+
+
+def normalize_url(url: str) -> str:
+    """Lowercase host, strip tracking params, trim trailing slash."""
+    try:
+        p = urlparse(url.strip())
+        if p.query:
+            qs = parse_qs(p.query, keep_blank_values=False)
+            clean_qs = {
+                k: v for k, v in qs.items() if k.lower() not in _TRACKING_PARAMS
+            }
+            new_query = urlencode(clean_qs, doseq=True)
+        else:
+            new_query = ""
+        return urlunparse(
+            (p.scheme, p.netloc.lower(), p.path.rstrip("/"), p.params, new_query, "")
+        )
+    except Exception:
+        return url.strip().lower()
+
+
+def _research_fingerprint(user_id: str, backend: str, query: str, url: str) -> str:
+    """Stable hash for (user, backend, query, url) dedup."""
+    nq = normalize_query(query)
+    nu = normalize_url(url)
+    return hashlib.sha256(
+        f"{user_id}\0research\0{backend}\0{nq}\0{nu}".encode()
+    ).hexdigest()[:32]
+
+
+def filter_research_text(text: str) -> Optional[str]:
+    """Quality gate: normalise whitespace, reject short/boilerplate, truncate."""
+    if not text:
+        return None
+    t = re.sub(r"\s+", " ", text.strip())
+    if len(t) < RESEARCH_MIN_FACT_LEN:
+        return None
+    if _BOILERPLATE_RE.search(t):
+        return None
+    return t[:RESEARCH_MAX_FACT_LEN]
+
+
+def _http_get_with_backoff(client: httpx.Client, url: str, **kwargs) -> httpx.Response:
+    """HTTP GET with retry on 429/5xx (3 retries, exponential backoff)."""
+    for attempt in range(len(_BACKOFF_DELAYS) + 1):
+        try:
+            resp = client.get(url, **kwargs)
+            if resp.status_code == 429 or resp.status_code >= 500:
+                if attempt < len(_BACKOFF_DELAYS):
+                    logger.warning(
+                        "research.backoff: HTTP %d from %s, retry %d/%d in %.1fs",
+                        resp.status_code,
+                        url,
+                        attempt + 1,
+                        len(_BACKOFF_DELAYS),
+                        _BACKOFF_DELAYS[attempt],
+                    )
+                    time.sleep(_BACKOFF_DELAYS[attempt])
+                    continue
+                resp.raise_for_status()
+            return resp
+        except httpx.HTTPError:
+            if attempt < len(_BACKOFF_DELAYS):
+                logger.warning(
+                    "research.backoff: error from %s, retry %d/%d",
+                    url,
+                    attempt + 1,
+                    len(_BACKOFF_DELAYS),
+                )
+                time.sleep(_BACKOFF_DELAYS[attempt])
+                continue
+            raise
+    raise httpx.HTTPError(f"max retries exceeded for {url}")
+
+
+@dataclass
+class ResearchResult:
+    """Wynik researchu."""
+
+    title: str
+    url: str
+    content: str
+    source: str
+    relevance_score: float
+    extraction_ts: float
+
+
+class ResearchEngine:
+    """
+    Research Engine - system wyszukiwania i ekstrakcji wiedzy.
+
+    Features:
+    - Structured research queries
+    - Result parsing and extraction
+    - Knowledge integration
+    - Source tracking
+    - Relevance scoring
+    """
+
+    def __init__(self, max_results: int = 10):
+        self.max_results = max_results
+        self.extraction_patterns = self._init_patterns()
+        self._query_cache: Dict[str, float] = {}
+
+    def _init_patterns(self) -> Dict[str, List[str]]:
+        """Regex patterns dla ekstrakcji faktów."""
+        return {
+            "definition": [
+                r"(?:is|jest|to)\s+(?:a|an)?\s*([^.!?]{20,200})[.!?]",
+                r"(?:defined as|definiuje się jako)\s+([^.!?]{20,200})[.!?]",
+            ],
+            "statistics": [
+                r"(\d+)\s*(?:%|\d+\s*(?:thousands|millions|billions))",
+                r"(?:about|około|roughly)\s+(\d+)\s*(?:percent|%)",
+            ],
+            "date": [
+                r"(?:in|w)\s+(19|20)\d{2}",
+                r"(\d{1,2})\s+(?:of\s+)?(?:January|February|March|April|May|June|July|August|September|October|November|December|stycznia|lutego|marca|kwietnia|maja|czerwca|lipca|sierpnia|września|października|listopada|grudnia)",
+            ],
+            "claim": [
+                r"(?:according to|wg\.?|według)\s+([^.!?]{20,150})",
+                r"(?:research shows|badania wykazują)\s+([^.!?]{20,150})",
+            ],
+        }
+
+    def _extract_facts_from_text(
+        self, text: str, source_url: str
+    ) -> List[Dict[str, Any]]:
+        """Ekstrakcja faktów z tekstu."""
+        facts = []
+
+        try:
+            # Split text into sentences
+            sentences = re.split(r"[.!?]+", text)
+
+            for sentence in sentences[:20]:  # Limit to first 20 sentences
+                sentence = sentence.strip()
+                if len(sentence) < 20:
+                    continue
+
+                # Try pattern matching
+                for pattern_type, patterns in self.extraction_patterns.items():
+                    for pattern in patterns:
+                        matches = re.findall(pattern, sentence, re.IGNORECASE)
+                        if matches:
+                            facts.append(
+                                {
+                                    "type": pattern_type,
+                                    "extracted": sentence,
+                                    "source_url": source_url,
+                                    "extraction_ts": now_ts(),
+                                    "confidence": 0.6,
+                                }
+                            )
+                            break
+
+        except Exception as e:
+            logger.debug(f"Error extracting facts: {e}")
+
+        return facts[:10]  # Limit to 10 facts
+
+    def _calculate_relevance(self, query: str, text: str) -> float:
+        """Oblicz relevance score tekstu do query."""
+        if not text or not query:
+            return 0.0
+
+        query_words = set(query.lower().split())
+        text_words = text.lower().split()
+
+        matches = sum(1 for w in text_words if w in query_words)
+        max_matches = len(query_words)
+
+        if max_matches == 0:
+            return 0.0
+
+        return min(1.0, matches / max_matches)
+
+    async def research(
+        self, user_id: str, query: str, research_type: str = "general"
+    ) -> Dict[str, Any]:
+        """
+        Przeprowadź research na zadany temat.
+
+        Args:
+            user_id: ID użytkownika
+            query: Zapytanie research
+            research_type: Typ researchu (general, factual, technical)
+
+        Returns:
+            Dict z wynikami researchu
+        """
+        try:
+            get_psyche_core().ensure_user(user_id)
+
+            # Query-level dedup cache
+            cache_key = f"{user_id}\0{normalize_query(query)}"
+            cached_ts = self._query_cache.get(cache_key, 0.0)
+            age = now_ts() - cached_ts
+            if age < RESEARCH_CACHE_TTL:
+                logger.info(
+                    "research.cached: user=%s query=%s (%.0fs ago)", user_id, query, age
+                )
+                return {
+                    "ok": True,
+                    "user_id": user_id,
+                    "query": query,
+                    "cached": True,
+                    "total_results": 0,
+                    "total_facts": 0,
+                    "ts": now_ts(),
+                }
+
+            logger.info("Starting research for user %s: %s", user_id, query)
+            try:
+                get_psyche_core().v2_service.apply_event(
+                    user_id=user_id,
+                    event_type="web_research_triggered",
+                    reason_text=f"research.query {query}",
+                    source_ref=query,
+                    signal_strength=0.55,
+                    metadata={"research_type": research_type},
+                )
+            except Exception:
+                logger.debug("psyche v2 research trigger event skipped", exc_info=True)
+
+            results: List[Dict[str, Any]] = []
+
+            search_results = await self._fetch_search_results(query)
+
+            for result in search_results[: self.max_results]:
+                try:
+                    # Extract facts from result
+                    facts = self._extract_facts_from_text(
+                        result["content"], result["url"]
+                    )
+
+                    # Store facts in memory (quality gate + fingerprint dedup)
+                    stored = 0
+                    for fact in facts:
+                        try:
+                            cleaned = filter_research_text(fact["extracted"])
+                            if cleaned is None:
+                                logger.debug(
+                                    "research.filtered: low-quality fact skipped"
+                                )
+                                continue
+                            fp = _research_fingerprint(
+                                user_id,
+                                result.get("source", "unknown"),
+                                query,
+                                result["url"],
+                            )
+                            get_memory_core().ingest_fact(
+                                user_id,
+                                cleaned,
+                                tags=[
+                                    "research",
+                                    fact["type"],
+                                    normalize_query(query)[:30],
+                                ],
+                                meta={
+                                    "source_url": fact["source_url"],
+                                    "source_title": result["title"],
+                                    "backend": result.get("source", "unknown"),
+                                    "research_query": query,
+                                    "research_type": research_type,
+                                    "confidence": fact["confidence"],
+                                    "research_fingerprint": fp,
+                                },
+                            )
+                            stored += 1
+                        except Exception as e:
+                            logger.debug("Error storing fact: %s", e)
+
+                    # Calculate relevance
+                    relevance = self._calculate_relevance(query, result["content"])
+
+                    results.append(
+                        {
+                            "title": result["title"],
+                            "url": result["url"],
+                            "relevance": relevance,
+                            "facts_extracted": stored,
+                            "source": result.get("source", "unknown"),
+                        }
+                    )
+
+                except Exception as e:
+                    logger.warning(f"Error processing result: {e}")
+
+            try:
+                get_psyche_core().v2_service.apply_event(
+                    user_id=user_id,
+                    event_type="tool_success",
+                    reason_text="research.query completed",
+                    source_ref=query,
+                    signal_strength=0.5 if results else 0.35,
+                    metadata={
+                        "research_type": research_type,
+                        "results": len(results),
+                        "facts": sum(r.get("facts_extracted", 0) for r in results),
+                    },
+                )
+            except Exception:
+                logger.debug("psyche v2 research completion event skipped", exc_info=True)
+
+            # Log research completion
+            append_event(
+                user_id,
+                "research.completed",
+                {
+                    "query": query,
+                    "type": research_type,
+                    "results_count": len(results),
+                    "facts_extracted": sum(
+                        r.get("facts_extracted", 0) for r in results
+                    ),
+                },
+            )
+
+            # Update query cache
+            self._query_cache[cache_key] = now_ts()
+
+            logger.info(
+                "Research completed for user %s: %d results, %d facts",
+                user_id,
+                len(results),
+                sum(r.get("facts_extracted", 0) for r in results),
+            )
+
+            return {
+                "ok": True,
+                "user_id": user_id,
+                "query": query,
+                "type": research_type,
+                "results": results,
+                "total_results": len(results),
+                "total_facts": sum(r.get("facts_extracted", 0) for r in results),
+                "ts": now_ts(),
+            }
+
+        except Exception as e:
+            logger.error(f"Error in research: {e}", exc_info=True)
+            try:
+                get_psyche_core().v2_service.apply_event(
+                    user_id=user_id,
+                    event_type="tool_failure",
+                    reason_text=f"research.query failed: {str(e)[:240]}",
+                    source_ref=query,
+                    signal_strength=0.55,
+                    metadata={"research_type": research_type},
+                )
+            except Exception:
+                logger.debug("psyche v2 research failure event skipped", exc_info=True)
+            append_event(user_id, "research.error", {"query": query, "error": str(e)})
+            return {
+                "ok": False,
+                "user_id": user_id,
+                "query": query,
+                "error": str(e),
+                "ts": now_ts(),
+            }
+
+    async def _fetch_search_results(self, query: str) -> List[Dict[str, Any]]:
+        """Fetch results from Brave Search, Wikipedia, and DuckDuckGo in parallel."""
+        results: List[Dict[str, Any]] = []
+
+        tasks: List[Awaitable[Any]] = []
+        names: List[str] = []
+
+        if BRAVE_API_KEY:
+            tasks.append(asyncio.to_thread(self._fetch_brave, query))
+            names.append("Brave")
+
+        optional_enabled = (
+            _optional_research_backends_enabled()
+            or _method_is_overridden(self._fetch_wikipedia, ResearchEngine._fetch_wikipedia)
+            or _method_is_overridden(self._fetch_duckduckgo, ResearchEngine._fetch_duckduckgo)
+        )
+        if optional_enabled:
+            tasks.append(asyncio.to_thread(self._fetch_wikipedia, query))
+            names.append("Wikipedia")
+
+            tasks.append(asyncio.to_thread(self._fetch_duckduckgo, query))
+            names.append("DuckDuckGo")
+
+        if not tasks:
+            logger.info(
+                "ResearchEngine: no configured online backend for query=%s (set BRAVE_API_KEY or AIHUB_ENABLE_OPTIONAL_RESEARCH_BACKENDS=1)",
+                query,
+            )
+            return []
+
+        gathered = await asyncio.gather(*tasks, return_exceptions=True)
+
+        for backend_name, result in zip(names, gathered):
+            if isinstance(result, Exception):
+                if backend_name in _OPTIONAL_RESEARCH_BACKENDS:
+                    logger.debug(
+                        "Research optional backend %s skipped: %s query=%r",
+                        backend_name,
+                        result,
+                        query[:400],
+                    )
+                else:
+                    logger.warning(
+                        "Research backend %s failed: %s query=%r",
+                        backend_name,
+                        result,
+                        query[:400],
+                    )
+                continue
+            if isinstance(result, list):
+                results.extend(result)
+
+        if not results:
+            logger.info(
+                "ResearchEngine: no results from any source for query=%s", query
+            )
+        return results
+
+    # ------ real search backends ------
+
+    def _fetch_brave(self, query: str) -> List[Dict[str, Any]]:
+        """Brave Web Search API — up to 5 organic results."""
+        out: List[Dict[str, Any]] = []
+        with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
+            resp = _http_get_with_backoff(
+                client,
+                "https://api.search.brave.com/res/v1/web/search",
+                params={"q": query, "count": "5"},
+                headers={
+                    "Accept": "application/json",
+                    "Accept-Encoding": "gzip",
+                    "X-Subscription-Token": BRAVE_API_KEY,
+                },
+            )
+            resp.raise_for_status()
+            data = resp.json()
+            for item in data.get("web", {}).get("results", [])[:5]:
+                title = item.get("title", "")
+                url = item.get("url", "")
+                description = item.get("description", "")
+                extra = item.get("extra_snippets", [])
+                content = description
+                if extra:
+                    content = description + " " + " ".join(extra)
+                if content and len(content) > 30:
+                    out.append(
+                        {
+                            "title": title,
+                            "url": url,
+                            "content": content[:HTTP_MAX_BYTES],
+                            "source": "brave",
+                        }
+                    )
+        return out
+
+    def _fetch_wikipedia(self, query: str) -> List[Dict[str, Any]]:
+        """Search Wikipedia via REST API and return up to 3 article extracts."""
+        out: List[Dict[str, Any]] = []
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
+                # Step 1: opensearch to get titles
+                resp = _http_get_with_backoff(
+                    client,
+                    "https://en.wikipedia.org/w/api.php",
+                    params={
+                        "action": "opensearch",
+                        "search": query,
+                        "limit": "3",
+                        "format": "json",
+                    },
+                )
+                data = resp.json()
+                titles = data[1] if len(data) > 1 else []
+                urls = data[3] if len(data) > 3 else []
+
+                # Step 2: fetch extracts for each title
+                for i, title in enumerate(titles[:3]):
+                    try:
+                        ext_resp = _http_get_with_backoff(
+                            client,
+                            "https://en.wikipedia.org/w/api.php",
+                            params={
+                                "action": "query",
+                                "prop": "extracts",
+                                "exintro": "1",
+                                "explaintext": "1",
+                                "titles": title,
+                                "format": "json",
+                            },
+                        )
+                        pages = ext_resp.json().get("query", {}).get("pages", {})
+                        for page in pages.values():
+                            extract = page.get("extract", "")
+                            if len(extract) > 30:
+                                out.append(
+                                    {
+                                        "title": title,
+                                        "url": urls[i] if i < len(urls) else "",
+                                        "content": extract[:HTTP_MAX_BYTES],
+                                        "source": "wikipedia",
+                                    }
+                                )
+                    except httpx.HTTPError as e:
+                        logger.debug(
+                            "Wikipedia extract fetch failed for %s: %s", title, e
+                        )
+        except httpx.HTTPError as e:
+            logger.debug("Wikipedia opensearch failed (optional backend): %s", e)
+        return out
+
+    def _fetch_duckduckgo(self, query: str) -> List[Dict[str, Any]]:
+        """Fetch DuckDuckGo instant answer API (no API key needed)."""
+        out: List[Dict[str, Any]] = []
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
+                resp = _http_get_with_backoff(
+                    client,
+                    "https://api.duckduckgo.com/",
+                    params={"q": query, "format": "json", "no_redirect": "1"},
+                )
+                data = resp.json()
+
+                # Abstract text
+                abstract = data.get("AbstractText", "")
+                abstract_url = data.get("AbstractURL", "")
+                if abstract and len(abstract) > 30:
+                    out.append(
+                        {
+                            "title": data.get("Heading", query),
+                            "url": abstract_url,
+                            "content": abstract[:HTTP_MAX_BYTES],
+                            "source": "duckduckgo",
+                        }
+                    )
+
+                # Related topics
+                for topic in data.get("RelatedTopics", [])[:5]:
+                    text = topic.get("Text", "")
+                    first_url = topic.get("FirstURL", "")
+                    if text and len(text) > 30:
+                        out.append(
+                            {
+                                "title": text[:80],
+                                "url": first_url,
+                                "content": text[:HTTP_MAX_BYTES],
+                                "source": "duckduckgo",
+                            }
+                        )
+        except httpx.HTTPError as e:
+            logger.warning("DuckDuckGo API failed: %s", e)
+        return out
+
+    def research_detailed(
+        self, user_id: str, topic: str, subtopics: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Detailed research na multiple subtopics.
+
+        Args:
+            user_id: ID użytkownika
+            topic: Główny temat
+            subtopics: Dodatkowe subtopics do research
+
+        Returns:
+            Dict z detailed results
+        """
+        try:
+            get_psyche_core().ensure_user(user_id)
+
+            subtopics = subtopics or [topic]
+            all_results = {
+                "main_topic": topic,
+                "subtopics": {},
+                "total_facts": 0,
+                "started_at": now_ts(),
+            }
+
+            for subtopic in subtopics[:5]:  # Limit to 5 subtopics
+                try:
+                    # Perform research on each subtopic
+                    import asyncio
+
+                    result = asyncio.run(self.research(user_id, subtopic, "detailed"))
+
+                    if result.get("ok"):
+                        all_results["subtopics"][subtopic] = result
+                        all_results["total_facts"] += result.get("total_facts", 0)
+
+                except Exception as e:
+                    logger.warning(f"Error researching subtopic {subtopic}: {e}")
+
+            all_results["completed_at"] = now_ts()
+            all_results["ok"] = True
+
+            return all_results
+
+        except Exception as e:
+            logger.error(f"Error in research_detailed: {e}", exc_info=True)
+            return {"ok": False, "topic": topic, "error": str(e), "ts": now_ts()}
+
+
+# Singleton
+_research_engine = ResearchEngine()
+
+
+async def research(
+    user_id: str, query: str, research_type: str = "general"
+) -> Dict[str, Any]:
+    """Public API dla researchu."""
+    return await _research_engine.research(user_id, query, research_type)
+
+
+def research_detailed(
+    user_id: str, topic: str, subtopics: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Public API dla detailed research."""
+    return _research_engine.research_detailed(user_id, topic, subtopics)

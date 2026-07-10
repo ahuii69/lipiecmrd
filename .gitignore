@@ -1,0 +1,54 @@
+# --- Secrets / environment (NEVER commit) ---
+.env
+.env.*
+!.env.example
+cockpit/.env
+cockpit/.env.*
+!cockpit/.env.example
+*.pem
+*.key
+secrets/
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+
+# --- Virtualenvs ---
+.venv/
+.venvs/
+venv/
+env/
+
+# --- Node / Next.js (cockpit) ---
+node_modules/
+cockpit/node_modules/
+cockpit/.next/
+cockpit/out/
+cockpit/dist/
+cockpit/build/
+cockpit/coverage/
+*.tsbuildinfo
+
+# --- Runtime data / artifacts ---
+data/*
+!data/.gitkeep
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

@@ -1,0 +1,9 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "AIHub GPT companion surface",
+    "version": "1.0.0",
+    "description": "Intentionally-empty override slot for GPT-oriented tooling. As of the 06.07 repair sprint, GET /gpt-openapi.json in aihub/main.py ignores this file whenever its 'paths' is empty (as here) and instead serves the LIVE OpenAPI schema generated from the running app (app.openapi() - same content as GET /openapi.json). To serve a curated subset instead, replace this file's 'paths' with real, non-empty entries, or point AIHUB_GPT_OPENAPI_PATH at a different file with real paths."
+  },
+  "paths": {}
+}
