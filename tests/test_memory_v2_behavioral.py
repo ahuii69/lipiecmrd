@@ -161,6 +161,41 @@ def test_memory_reinforcement_integration(isolated_db):
     assert reinforced[0].success_reinforcements == 1
     assert reinforced[0].failure_reinforcements == 0
 
+    # Repeated reinforcement is atomic and scores remain inside their contract.
+    assert reinforce_memory_item(
+        item.id,
+        user_id,
+        success=False,
+        recurrence_boost=1.0,
+        salience_boost=1.0,
+    )
+    reinforced = get_reinforced_memories(user_id, min_reinforcements=2, limit=10)
+    assert reinforced[0].reinforcement_count == 2
+    assert reinforced[0].success_reinforcements == 1
+    assert reinforced[0].failure_reinforcements == 1
+    assert reinforced[0].recurrence_score == 1.0
+    assert reinforced[0].salience_score == 1.0
+
+
+def test_memory_reinforcement_rejects_invalid_boosts_and_missing_target():
+    with pytest.raises(ValueError, match="recurrence_boost"):
+        reinforce_memory_item(
+            "missing",
+            "user",
+            success=True,
+            recurrence_boost=float("nan"),
+        )
+
+    with pytest.raises(ValueError, match="salience_boost"):
+        reinforce_memory_item(
+            "missing",
+            "user",
+            success=True,
+            salience_boost=-0.1,
+        )
+
+    assert reinforce_memory_item("missing", "user", success=True) is False
+
 
 def test_memory_suppression_integration(isolated_db):
     """Test suppression marking."""

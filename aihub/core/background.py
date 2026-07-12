@@ -25,3 +25,13 @@ def start_background() -> None:
         log.info("background: worker konsolidacji Memory V2 uruchomiony")
     except Exception as e:  # noqa: BLE001
         log.warning("background: konsolidacja nie wystartowała: %s", e, exc_info=True)
+
+
+def stop_background() -> None:
+    """Zatrzymuje worker konsolidacji Memory V2 (join z timeoutem)."""
+    try:
+        from aihub.workers.consolidation import stop_background as stop_consolidation
+
+        stop_consolidation()
+    except Exception as e:  # noqa: BLE001
+        log.warning("background: consolidation stop failed: %s", e, exc_info=True)

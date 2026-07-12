@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
+from cryptography.fernet import Fernet
 
 
 def test_canonical_config_paths_not_ai_hub_tree() -> None:
@@ -59,6 +60,7 @@ def test_gpt_openapi_spec_env_override(
 
 def _clear_secret_envs(monkeypatch: pytest.MonkeyPatch) -> None:
     for name in (
+        "LLM_API_KEY",
         "DEEPINFRA_API_KEY",
         "BRAVE_API_KEY",
         "VOYAGE_API_KEY",
@@ -109,7 +111,7 @@ def test_production_missing_auth_secret_fails_fast_even_with_other_keys(
     monkeypatch.setenv("DEEPINFRA_API_KEY", "x")
     monkeypatch.setenv("BRAVE_API_KEY", "x")
     monkeypatch.setenv("VOYAGE_API_KEY", "x")
-    monkeypatch.setenv("AIHUB_USER_VAULT_KEY", "x" * 44)
+    monkeypatch.setenv("AIHUB_USER_VAULT_KEY", Fernet.generate_key().decode())
     with pytest.raises(RuntimeError, match="hub auth secret"):
         canon._validate_production_secrets()
 
@@ -119,10 +121,10 @@ def test_production_with_all_secrets_passes(monkeypatch: pytest.MonkeyPatch) -> 
 
     _clear_secret_envs(monkeypatch)
     monkeypatch.setenv("ENV", "production")
-    monkeypatch.setenv("DEEPINFRA_API_KEY", "x")
+    monkeypatch.setenv("LLM_API_KEY", "x")
     monkeypatch.setenv("BRAVE_API_KEY", "x")
     monkeypatch.setenv("VOYAGE_API_KEY", "x")
-    monkeypatch.setenv("AIHUB_USER_VAULT_KEY", "x" * 44)
+    monkeypatch.setenv("AIHUB_USER_VAULT_KEY", Fernet.generate_key().decode())
     monkeypatch.setenv("API_KEY", "x")
     canon._validate_production_secrets()  # must not raise
 
@@ -155,9 +157,48 @@ def test_user_vault_fernet_dev_fallback_works_outside_production(
 
     monkeypatch.delenv("AIHUB_USER_VAULT_KEY", raising=False)
     monkeypatch.setenv("ENV", "development")
+    monkeypatch.setenv("AIHUB_LOCAL_TEST_PROFILE", "1")
     f = uv._fernet()
     token = f.encrypt(b"secret")
     assert f.decrypt(token) == b"secret"
+
+
+def test_user_vault_requires_explicit_key_outside_local_test_profile(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aihub.user_vault as uv
+
+    monkeypatch.delenv("AIHUB_USER_VAULT_KEY", raising=False)
+    monkeypatch.delenv("AIHUB_LOCAL_TEST_PROFILE", raising=False)
+    monkeypatch.setenv("ENV", "development")
+    with pytest.raises(RuntimeError, match="explicit local test profile"):
+        uv._fernet()
+
+
+def test_user_vault_rejects_weak_explicit_key(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import aihub.user_vault as uv
+
+    monkeypatch.setenv("AIHUB_USER_VAULT_KEY", "x" * 44)
+    with pytest.raises(RuntimeError, match="weak"):
+        uv._fernet()
+
+
+def test_llm_key_aliases_use_one_resolver() -> None:
+    import aihub.config as canon
+
+    assert canon.resolve_llm_api_key({"LLM_API_KEY": "canonical"}) == "canonical"
+    assert (
+        canon.resolve_llm_api_key({"DEEPINFRA_API_KEY": "legacy-alias"})
+        == "legacy-alias"
+    )
+    assert (
+        canon.resolve_llm_api_key(
+            {"LLM_API_KEY": "canonical", "DEEPINFRA_API_KEY": "legacy-alias"}
+        )
+        == "canonical"
+    )
 
 
 def test_gpt_openapi_http_not_under_ai_hub(monkeypatch: pytest.MonkeyPatch) -> None:

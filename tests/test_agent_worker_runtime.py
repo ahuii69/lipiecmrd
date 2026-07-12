@@ -15,7 +15,8 @@ class _FakeThread:
     def is_alive(self):
         return self._alive
 
-    def join(self, _timeout=None):
+    def join(self, timeout=None):
+        self._alive = False
         return None
 
 
@@ -97,10 +98,11 @@ def test_run_loop_runs_tick_once_and_exits_on_keyboard_interrupt(monkeypatch):
     )
     monkeypatch.setattr(aw, "get_executive_controller", lambda: controller)
 
-    def _sleep(_seconds):
+    def _wait(_seconds):
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(aw.time, "sleep", _sleep)
+    monkeypatch.setattr(aw._stop_worker, "wait", _wait)
+    aw._stop_worker.clear()
 
     aw._run_loop()
 
@@ -128,10 +130,11 @@ def test_run_loop_disabled_state_skips_controller(monkeypatch):
     )
     monkeypatch.setattr(aw, "get_executive_controller", lambda: controller)
 
-    def _sleep(_seconds):
+    def _wait(_seconds):
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(aw.time, "sleep", _sleep)
+    monkeypatch.setattr(aw._stop_worker, "wait", _wait)
+    aw._stop_worker.clear()
 
     aw._run_loop()
 
@@ -169,10 +172,11 @@ def test_run_loop_emits_background_loop_event_when_cycle_traced(monkeypatch):
         lambda user_id, typ, data: events.append((user_id, typ, data)),
     )
 
-    def _sleep(_seconds):
+    def _wait(_seconds):
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(aw.time, "sleep", _sleep)
+    monkeypatch.setattr(aw._stop_worker, "wait", _wait)
+    aw._stop_worker.clear()
 
     aw._run_loop()
 
@@ -213,10 +217,11 @@ def test_run_loop_emits_background_tick_when_trace_present_but_legacy_not_ok(
         lambda user_id, typ, data: events.append((user_id, typ, data)),
     )
 
-    def _sleep(_seconds):
+    def _wait(_seconds):
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(aw.time, "sleep", _sleep)
+    monkeypatch.setattr(aw._stop_worker, "wait", _wait)
+    aw._stop_worker.clear()
 
     aw._run_loop()
 
@@ -257,10 +262,11 @@ def test_run_loop_records_error_when_all_retries_fail(monkeypatch):
         lambda user_id, typ, data: events.append((user_id, typ, data)),
     )
 
-    def _sleep(_seconds):
+    def _wait(_seconds):
         raise KeyboardInterrupt()
 
-    monkeypatch.setattr(aw.time, "sleep", _sleep)
+    monkeypatch.setattr(aw._stop_worker, "wait", _wait)
+    aw._stop_worker.clear()
 
     aw._run_loop()
 

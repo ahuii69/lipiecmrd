@@ -76,3 +76,10 @@ def start_background() -> None:
 
 def stop_background() -> None:
     _stop.set()
+    global _thread
+    t = _thread
+    if t is not None and t.is_alive():
+        t.join(timeout=10.0)
+        if t.is_alive():
+            raise RuntimeError("Memory V2 consolidation worker did not stop within timeout")
+    _thread = None

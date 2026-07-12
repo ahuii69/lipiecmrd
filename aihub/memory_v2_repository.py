@@ -7,10 +7,19 @@ Handles all CRUD operations for Memory V2 entities with proper SQLite row mappin
 
 import json
 import logging
+import math
 import sqlite3
 from typing import Any
 
-from aihub.db import fetch_all, fetch_one, exec_one, now_ts, json_dumps, json_loads
+from aihub.db import (
+    exec_one,
+    exec_one_rowcount,
+    fetch_all,
+    fetch_one,
+    json_dumps,
+    json_loads,
+    now_ts,
+)
 from aihub.memory_v2_models import (
     MemoryV2Item,
     MemoryV2Link,
@@ -289,39 +298,53 @@ def reinforce_memory_item(
     - Boosts recurrence and salience
     - Updates outcome_reinforcement_score
     """
-    try:
-        now = now_ts()
-        success_delta = 1 if success else 0
-        failure_delta = 0 if success else 1
-        
-        exec_one(
-            """
-            UPDATE memory_v2_items SET
-                reinforcement_count = reinforcement_count + 1,
-                success_reinforcements = success_reinforcements + ?,
-                failure_reinforcements = failure_reinforcements + ?,
-                recurrence_score = MIN(1.0, recurrence_score + ?),
-                salience_score = MIN(1.0, salience_score + ?),
-                last_reinforced_ts = ?,
-                updated_ts = ?
-            WHERE id=? AND user_id=?
-            """,
-            (
-                success_delta,
-                failure_delta,
-                recurrence_boost,
-                salience_boost,
-                now,
-                now,
-                item_id,
-                user_id,
-            ),
-        )
-        logger.debug(f"Reinforced memory: id={item_id} success={success} user={user_id}")
-        return True
-    except (sqlite3.Error, OSError) as e:
-        logger.error(f"Failed to reinforce memory: {e}")
+    for name, value in (
+        ("recurrence_boost", recurrence_boost),
+        ("salience_boost", salience_boost),
+    ):
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"{name} must be finite and between 0.0 and 1.0")
+
+    now = now_ts()
+    success_delta = 1 if success else 0
+    failure_delta = 0 if success else 1
+
+    affected = exec_one_rowcount(
+        """
+        UPDATE memory_v2_items SET
+            reinforcement_count = reinforcement_count + 1,
+            success_reinforcements = success_reinforcements + ?,
+            failure_reinforcements = failure_reinforcements + ?,
+            recurrence_score = CASE
+                WHEN recurrence_score + ? >= 1.0 THEN 1.0
+                ELSE recurrence_score + ?
+            END,
+            salience_score = CASE
+                WHEN salience_score + ? >= 1.0 THEN 1.0
+                ELSE salience_score + ?
+            END,
+            last_reinforced_ts = ?,
+            updated_ts = ?
+        WHERE id=? AND user_id=?
+        """,
+        (
+            success_delta,
+            failure_delta,
+            recurrence_boost,
+            recurrence_boost,
+            salience_boost,
+            salience_boost,
+            now,
+            now,
+            item_id,
+            user_id,
+        ),
+    )
+    if affected == 0:
+        logger.warning("Memory reinforcement target was not found")
         return False
+    logger.debug("Memory reinforcement committed: success=%s", success)
+    return True
 
 
 def mark_memory_suppressed(item_id: str, user_id: str, suppressed: bool) -> bool:

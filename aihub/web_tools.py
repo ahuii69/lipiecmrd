@@ -16,9 +16,10 @@ import logging
 import re
 import socket
 import ssl
+from dataclasses import dataclass
 from html.parser import HTMLParser
 from typing import Any, Dict, Iterable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 import httpx
 
@@ -43,6 +44,27 @@ _TEXT_CONTENT_TYPES = (
 )
 
 _BLOCKED_HOSTS = {"localhost", "metadata.google.internal"}
+
+
+class WebResponseTooLarge(ValueError):
+    """Raised as soon as the decoded response exceeds the configured hard cap."""
+
+
+async def _read_response_body_limited(
+    response: httpx.Response, *, max_bytes: int
+) -> bytes:
+    if max_bytes <= 0:
+        raise ValueError("HTTP_MAX_BYTES must be positive")
+    declared = response.headers.get("content-length", "").strip()
+    if declared.isdigit() and int(declared) > max_bytes:
+        raise WebResponseTooLarge(f"response exceeds {max_bytes} bytes")
+
+    body = bytearray()
+    async for chunk in response.aiter_bytes():
+        if len(body) + len(chunk) > max_bytes:
+            raise WebResponseTooLarge(f"decoded response exceeds {max_bytes} bytes")
+        body.extend(chunk)
+    return bytes(body)
 
 
 class _HTMLTextExtractor(HTMLParser):
@@ -163,12 +185,56 @@ def validate_url_safe(url: str, *, resolve_dns: bool = True) -> str:
     if _ip_is_private_or_reserved(host):
         raise ValueError(f"SSRF protection: blocked private/reserved ip: {host}")
     if resolve_dns:
-        for ip in _resolve_host_ips(host):
+        resolved = list(_resolve_host_ips(host))
+        if not resolved:
+            raise ValueError(f"SSRF protection: hostname did not resolve: {host}")
+        for ip in resolved:
             if _ip_is_private_or_reserved(ip):
                 raise ValueError(
                     f"SSRF protection: hostname resolves to private/reserved ip: {host} -> {ip}"
                 )
     return parsed.geturl()
+
+
+@dataclass(frozen=True)
+class _PinnedTarget:
+    logical_url: str
+    connect_url: str
+    host_header: str
+    sni_hostname: str
+
+
+def _resolve_and_pin_url(url: str) -> _PinnedTarget:
+    logical_url = validate_url_safe(url, resolve_dns=False)
+    parsed = _parse_url(logical_url)
+    hostname = (parsed.hostname or "").lower().rstrip(".")
+    addresses = list(_resolve_host_ips(hostname))
+    if not addresses:
+        raise ValueError(f"SSRF protection: hostname did not resolve: {hostname}")
+    for address in addresses:
+        if _ip_is_private_or_reserved(address):
+            raise ValueError(
+                f"SSRF protection: hostname resolves to private/reserved ip: {hostname}"
+            )
+
+    pinned_ip = sorted(set(addresses))[0]
+    ip_literal = f"[{pinned_ip}]" if ":" in pinned_ip else pinned_ip
+    connect_netloc = (
+        f"{ip_literal}:{parsed.port}" if parsed.port is not None else ip_literal
+    )
+    default_port = 443 if parsed.scheme == "https" else 80
+    host_header = (
+        f"{hostname}:{parsed.port}"
+        if parsed.port is not None and parsed.port != default_port
+        else hostname
+    )
+    connect_url = urlunparse(parsed._replace(netloc=connect_netloc))
+    return _PinnedTarget(
+        logical_url=logical_url,
+        connect_url=connect_url,
+        host_header=host_header,
+        sni_hostname=hostname,
+    )
 
 
 def extract_page_text(
@@ -219,7 +285,7 @@ def _is_text_content_type(content_type: str) -> bool:
 
 async def fetch_url(user_id: str, url: str) -> Dict[str, Any]:
     """Fetch a public HTTP(S) URL with redirect SSRF validation and text extraction."""
-    safe_url = validate_url_safe(str(url or "").strip(), resolve_dns=True)
+    safe_url = validate_url_safe(str(url or "").strip(), resolve_dns=False)
     timeout = httpx.Timeout(HTTP_TIMEOUT_S)
     try:
         async with httpx.AsyncClient(
@@ -231,56 +297,67 @@ async def fetch_url(user_id: str, url: str) -> Dict[str, Any]:
         ) as client:
             current_url = safe_url
             redirect_count = 0
-            response: httpx.Response | None = None
             while True:
-                response = await client.get(current_url)
-                if response.status_code not in (301, 302, 303, 307, 308):
-                    break
-                redirect_count += 1
-                if redirect_count > HTTP_MAX_REDIRECTS:
-                    raise ValueError(f"too many redirects (max: {HTTP_MAX_REDIRECTS})")
-                location = response.headers.get("location", "").strip()
-                if not location:
-                    raise ValueError("redirect without Location header")
-                next_url = urljoin(str(response.url), location)
-                current_url = validate_url_safe(next_url, resolve_dns=True)
+                target = _resolve_and_pin_url(current_url)
+                async with client.stream(
+                    "GET",
+                    target.connect_url,
+                    headers={"Host": target.host_header},
+                    extensions={"sni_hostname": target.sni_hostname},
+                ) as response:
+                    if response.status_code in (301, 302, 303, 307, 308):
+                        redirect_count += 1
+                        if redirect_count > HTTP_MAX_REDIRECTS:
+                            raise ValueError(
+                                f"too many redirects (max: {HTTP_MAX_REDIRECTS})"
+                            )
+                        location = response.headers.get("location", "").strip()
+                        if not location:
+                            raise ValueError("redirect without Location header")
+                        next_url = urljoin(target.logical_url, location)
+                        current_url = validate_url_safe(next_url, resolve_dns=False)
+                        continue
 
-            response.raise_for_status()
-            content_type = response.headers.get("content-type", "")
-            if not _is_text_content_type(content_type):
-                raise ValueError(f"unsupported content-type for text fetch: {content_type}")
-            content = response.content[:HTTP_MAX_BYTES]
-            extracted = extract_page_text(
-                content,
-                url=str(response.url),
-                content_type=content_type,
-                max_chars=min(HTTP_MAX_BYTES, 20_000),
-            )
-            out = {
-                "ok": True,
-                "url": str(response.url),
-                "status": response.status_code,
-                "headers": dict(response.headers),
-                "content_type": content_type,
-                "bytes": len(content),
-                "title": extracted.get("title", ""),
-                "text": extracted.get("text", ""),
-                "links": extracted.get("links", []),
-                "extraction": extracted.get("extraction", ""),
-                "redirects_followed": redirect_count,
-            }
-            append_event(
-                user_id,
-                "web.fetch",
-                {
-                    "url": out["url"],
-                    "status": out["status"],
-                    "bytes": out["bytes"],
-                    "title": out.get("title", ""),
-                    "links": len(out.get("links") or []),
-                },
-            )
-            return out
+                    response.raise_for_status()
+                    content_type = response.headers.get("content-type", "")
+                    if not _is_text_content_type(content_type):
+                        raise ValueError(
+                            f"unsupported content-type for text fetch: {content_type}"
+                        )
+                    content = await _read_response_body_limited(
+                        response, max_bytes=HTTP_MAX_BYTES
+                    )
+                    extracted = extract_page_text(
+                        content,
+                        url=target.logical_url,
+                        content_type=content_type,
+                        max_chars=min(HTTP_MAX_BYTES, 20_000),
+                    )
+                    out = {
+                        "ok": True,
+                        "url": target.logical_url,
+                        "status": response.status_code,
+                        "headers": dict(response.headers),
+                        "content_type": content_type,
+                        "bytes": len(content),
+                        "title": extracted.get("title", ""),
+                        "text": extracted.get("text", ""),
+                        "links": extracted.get("links", []),
+                        "extraction": extracted.get("extraction", ""),
+                        "redirects_followed": redirect_count,
+                    }
+                    append_event(
+                        user_id,
+                        "web.fetch",
+                        {
+                            "url": out["url"],
+                            "status": out["status"],
+                            "bytes": out["bytes"],
+                            "title": out.get("title", ""),
+                            "links": len(out.get("links") or []),
+                        },
+                    )
+                    return out
     except Exception as err:
         append_event(user_id, "web.fetch.error", {"url": safe_url, "error": str(err)})
         raise

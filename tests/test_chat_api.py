@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 from fastapi.testclient import TestClient
@@ -55,7 +56,103 @@ def test_chat_turn_endpoint_and_capabilities(monkeypatch):
         assert isinstance(caps_body["capabilities"], list)
 
 
-def test_chat_turn_stream_sse_deltas_and_done(monkeypatch):
+def test_capability_execute_contract_and_client_errors(monkeypatch):
+    from aihub import main
+
+    monkeypatch.setenv("API_KEY", "")
+    monkeypatch.setattr(main, "start_worker_once", lambda: None)
+
+    base = {
+        "user_id": "capability-user",
+        "session_id": "capability-session",
+        "mode": "chat",
+        "include_debug": False,
+        "tool_name": "memory.search",
+        "arguments": {"query": "nieistniejący wpis", "limit": 3},
+    }
+
+    with TestClient(main.app) as client:
+        no_override = client.post("/chat/capabilities/execute", json=base)
+        assert no_override.status_code == 200
+        assert no_override.json()["tool_name"] == "memory.search"
+        assert no_override.json()["tool_result"]["ok"] is True
+
+        valid_override = client.post(
+            "/chat/capabilities/execute",
+            json={
+                **base,
+                "tool_policy_overrides": {"allow_sensitive_mutations": False},
+            },
+        )
+        assert valid_override.status_code == 200
+
+        invalid_override = client.post(
+            "/chat/capabilities/execute",
+            json={
+                **base,
+                "tool_policy_overrides": {"unknown_policy_switch": True},
+            },
+        )
+        assert invalid_override.status_code == 422
+
+        legacy_name = client.post(
+            "/chat/capabilities/execute",
+            json={**base, "policy_overrides": {}},
+        )
+        assert legacy_name.status_code == 422
+
+        denied = client.post(
+            "/chat/capabilities/execute",
+            json={
+                **base,
+                "tool_name": "fs.write_file",
+                "arguments": {"path": "blocked.txt", "content": "blocked"},
+            },
+        )
+        assert denied.status_code == 403
+        assert denied.json()["detail"]["error"].startswith("policy_blocked:")
+
+
+def test_sse_disconnect_cancels_worker_and_resets_context():
+    import aihub.chat_api as chat_api
+    from aihub.chat_contracts import ChatTurnInput
+    from aihub.chat_stream_session import CHAT_STREAM_SESSION
+
+    worker_closed = asyncio.Event()
+
+    class _BlockingRuntime:
+        async def run_turn(self, _payload):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                worker_closed.set()
+
+    class _DisconnectedRequest:
+        async def is_disconnected(self):
+            return True
+
+    payload = ChatTurnInput(
+        user_id="stream-user",
+        session_id="stream-session",
+        message="stop",
+    )
+    stream = chat_api._sse_chat_turn(
+        _BlockingRuntime(),
+        payload,
+        _DisconnectedRequest(),
+        include_turn_result=False,
+    )
+
+    async def consume() -> None:
+        async for _chunk in stream:
+            raise AssertionError("Disconnected stream must not emit data")
+
+    asyncio.run(consume())
+    assert worker_closed.is_set()
+    assert CHAT_STREAM_SESSION.get() is None
+
+
+def test_chat_turn_stream_sse_deltas_and_done(client: TestClient, monkeypatch):
     import aihub.chat_api as chat_api
     from aihub import main
 
@@ -76,20 +173,19 @@ def test_chat_turn_stream_sse_deltas_and_done(monkeypatch):
 
     monkeypatch.setattr(chat_api, "get_chat_runtime", lambda: _FakeRuntime())
 
-    with TestClient(main.app) as client:
-        with client.stream(
-            "POST",
-            "/chat/turn?stream=true&include_turn_result=true",
-            json={
-                "user_id": "u",
-                "session_id": "s",
-                "message": "hi",
-                "mode": "chat",
-            },
-        ) as resp:
-            assert resp.status_code == 200
-            assert "text/event-stream" in (resp.headers.get("content-type") or "")
-            raw = b"".join(resp.iter_bytes())
+    with client.stream(
+        "POST",
+        "/chat/turn?stream=true&include_turn_result=true",
+        json={
+            "user_id": "u",
+            "session_id": "s",
+            "message": "hi",
+            "mode": "chat",
+        },
+    ) as resp:
+        assert resp.status_code == 200
+        assert "text/event-stream" in (resp.headers.get("content-type") or "")
+        raw = b"".join(resp.iter_bytes())
     text = raw.decode("utf-8")
     assert "data:" in text
     assert '"type": "delta"' in text
@@ -113,7 +209,7 @@ def test_chat_turn_stream_sse_deltas_and_done(monkeypatch):
     assert "".join(deltas) == long_text
 
 
-def test_chat_turn_stream_includes_status_from_runtime(monkeypatch):
+def test_chat_turn_stream_includes_status_from_runtime(client: TestClient, monkeypatch):
     import aihub.chat_api as chat_api
     from aihub import main
     from aihub.chat_stream_session import emit_status
@@ -134,18 +230,17 @@ def test_chat_turn_stream_includes_status_from_runtime(monkeypatch):
 
     monkeypatch.setattr(chat_api, "get_chat_runtime", lambda: _FakeRuntime())
 
-    with TestClient(main.app) as client:
-        with client.stream(
-            "POST",
-            "/chat/turn?stream=true",
-            json={
-                "user_id": "u",
-                "session_id": "s",
-                "message": "hi",
-                "mode": "chat",
-            },
-        ) as resp:
-            raw = b"".join(resp.iter_bytes())
+    with client.stream(
+        "POST",
+        "/chat/turn?stream=true",
+        json={
+            "user_id": "u",
+            "session_id": "s",
+            "message": "hi",
+            "mode": "chat",
+        },
+    ) as resp:
+        raw = b"".join(resp.iter_bytes())
     assert b'"type": "status"' in raw
     assert b'"stage": "thinking"' in raw
 

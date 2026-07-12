@@ -73,6 +73,8 @@ def collect_route_keys(app) -> FrozenSet[MethodPath]:
 
 
 def source_file_for_path(path: str) -> str:
+    if path.startswith("/auth/"):
+        return "aihub/auth_api.py"
     if path.startswith("/admin/"):
         return "aihub/admin_api.py"
     if path.startswith("/agent/"):
@@ -111,6 +113,9 @@ CANONICAL_HTTP_ROUTES: Tuple[Tuple[str, str, str, str, str], ...] = (
         "tests/test_chat_sessions_api.py",
     ),
     ("GET", "/admin/ping", "aihub/admin_api.py", "NIE", "BRAK DANYCH"),
+    ("GET", "/auth/me", "aihub/auth_api.py", "TAK", "tests/test_auth_ownership.py"),
+    ("POST", "/auth/login", "aihub/auth_api.py", "TAK", "tests/test_auth_ownership.py"),
+    ("POST", "/auth/logout", "aihub/auth_api.py", "TAK", "tests/test_auth_ownership.py"),
     (
         "GET",
         "/agent/goals/{user_id}",

@@ -7,8 +7,9 @@ import sqlite3
 import threading
 import time
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 try:
     import psycopg2
@@ -414,7 +415,11 @@ def _sqlite_backfill_active_stack(cur: sqlite3.Cursor, report: dict[str, Any]) -
             )
         cur.execute(
             """
-            UPDATE memory_v2_items SET retrieval_priority_score = MIN(1.0, MAX(0.0, salience_score * 0.92))
+            UPDATE memory_v2_items SET retrieval_priority_score = CASE
+                WHEN salience_score * 0.92 < 0.0 THEN 0.0
+                WHEN salience_score * 0.92 > 1.0 THEN 1.0
+                ELSE salience_score * 0.92
+            END
             WHERE (retrieval_priority_score IS NULL OR retrieval_priority_score <= 0.001)
               AND salience_score > 0.05
             """
@@ -437,8 +442,11 @@ def _sqlite_backfill_active_stack(cur: sqlite3.Cursor, report: dict[str, Any]) -
     if _table_exists(cur, "psyche_v2_profile"):
         cur.execute(
             """
-            UPDATE psyche_v2_profile SET relation_interaction_quality_ema =
-                MIN(1.0, MAX(0.0, (relation_trust * 0.55 + relation_sync * 0.45)))
+            UPDATE psyche_v2_profile SET relation_interaction_quality_ema = CASE
+                WHEN (relation_trust * 0.55 + relation_sync * 0.45) < 0.0 THEN 0.0
+                WHEN (relation_trust * 0.55 + relation_sync * 0.45) > 1.0 THEN 1.0
+                ELSE (relation_trust * 0.55 + relation_sync * 0.45)
+            END
             WHERE relation_interaction_quality_ema IS NULL
             """
         )
@@ -448,8 +456,11 @@ def _sqlite_backfill_active_stack(cur: sqlite3.Cursor, report: dict[str, Any]) -
             )
         cur.execute(
             """
-            UPDATE psyche_v2_profile SET relation_interaction_quality_ema =
-                MIN(1.0, MAX(0.0, (relation_trust * 0.55 + relation_sync * 0.45)))
+            UPDATE psyche_v2_profile SET relation_interaction_quality_ema = CASE
+                WHEN (relation_trust * 0.55 + relation_sync * 0.45) < 0.0 THEN 0.0
+                WHEN (relation_trust * 0.55 + relation_sync * 0.45) > 1.0 THEN 1.0
+                ELSE (relation_trust * 0.55 + relation_sync * 0.45)
+            END
             WHERE ABS(relation_interaction_quality_ema - 0.5) < 1e-6
               AND (ABS(relation_trust - 0.5) > 0.02 OR ABS(relation_sync - 0.5) > 0.02)
             """
@@ -784,9 +795,27 @@ def _get_adapter() -> DBAdapter:
     return current
 
 
-def _conn() -> Any:
+@contextmanager
+def _conn() -> Iterator[Any]:
+    """Open one DB connection for the block and always close it."""
     adapter = _get_adapter()
-    return adapter.connect()
+    con = adapter.connect()
+    try:
+        yield con
+    finally:
+        try:
+            con.close()
+        except Exception:
+            logger.debug("sqlite/pg connection close failed", exc_info=True)
+
+
+def active_sqlite_adapter_path() -> Path | None:
+    """Return the SQLite path held by the cached adapter, if any."""
+    with _DB_LOCK:
+        adapter = _ADAPTER_HOLDER[0] if _ADAPTER_HOLDER else None
+        if isinstance(adapter, SQLiteAdapter):
+            return Path(adapter.db_path)
+    return None
 
 
 def dispose_sqlite_engine() -> None:
@@ -794,28 +823,41 @@ def dispose_sqlite_engine() -> None:
 
     Used between tests and when switching DB_PATH so temp files can be removed
     and ``database is locked`` does not persist across pytest cases.
+
+    Adapter cache is cleared before WAL checkpoint so concurrent ``_get_adapter``
+    calls cannot resurrect a stale path while the temp directory is being removed.
     """
     with _DB_LOCK:
         adapter: DBAdapter | None = _ADAPTER_HOLDER[0] if _ADAPTER_HOLDER else None
+        _ADAPTER_HOLDER.clear()
         if isinstance(adapter, PostgresAdapter):
-            _ADAPTER_HOLDER.clear()
             return
-        if isinstance(adapter, SQLiteAdapter):
-            p = adapter.db_path
-            if p.exists():
+        if not isinstance(adapter, SQLiteAdapter):
+            return
+        p = adapter.db_path
+        parent = p.parent
+        if not parent.exists() or not p.exists():
+            return
+        aux: sqlite3.Connection | None = None
+        try:
+            aux = sqlite3.connect(str(p), timeout=30.0)
+            aux.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        except (OSError, sqlite3.Error):
+            logger.debug(
+                "dispose_sqlite_engine: checkpoint failed for %s",
+                p,
+                exc_info=True,
+            )
+        finally:
+            if aux is not None:
                 try:
-                    aux = sqlite3.connect(str(p), timeout=30.0)
-                    try:
-                        aux.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-                    finally:
-                        aux.close()
-                except (OSError, sqlite3.Error):
+                    aux.close()
+                except Exception:
                     logger.debug(
-                        "dispose_sqlite_engine: checkpoint failed for %s",
+                        "dispose_sqlite_engine: aux close failed for %s",
                         p,
                         exc_info=True,
                     )
-        _ADAPTER_HOLDER.clear()
 
 
 def init_db() -> None:
@@ -1543,6 +1585,14 @@ def exec_one(sql: str, params: tuple[Any, ...] = ()) -> None:
         con.commit()
 
 
+def exec_one_rowcount(sql: str, params: tuple[Any, ...] = ()) -> int:
+    """Execute one atomic write and return the affected-row count."""
+    with _DB_LOCK, _conn() as con:
+        result = con.execute(sql, params)
+        con.commit()
+        return int(result.rowcount or 0)
+
+
 def fetch_all(sql: str, params: tuple[Any, ...] = ()) -> list[Any]:
     with _DB_LOCK, _conn() as con:
         return con.execute(sql, params).fetchall()
@@ -1817,6 +1867,10 @@ def search_nodes_fts(
                 (user_id, layer, f"%{q}%", limit),
             )
     else:
+        from aihub.db.fts5_query import build_fts5_match_query, build_lexical_like_pattern
+
+        q = (query or "").strip()
+        fts_expr = build_fts5_match_query(q).expression
         try:
             rows = fetch_all(
                 """
@@ -1827,18 +1881,25 @@ def search_nodes_fts(
             ORDER BY rank ASC
             LIMIT ?
             """,
-                (f"content:{query}", user_id, layer, limit),
+                (fts_expr, user_id, layer, limit),
             )
         except sqlite3.OperationalError:
+            logger.debug(
+                "search_nodes_fts sqlite FTS failed for %r; using LIKE fallback",
+                q,
+                exc_info=True,
+            )
+            like_pat = build_lexical_like_pattern(q)
             rows = fetch_all(
                 """
-            SELECT id, layer, content, tags, meta, ts, importance, confidence
+            SELECT id, layer, content, tags, meta, ts, importance, confidence,
+                   0.0 AS rank
             FROM memory_nodes
-            WHERE user_id=? AND layer=? AND deleted=0 AND content LIKE ?
+            WHERE user_id=? AND layer=? AND deleted=0 AND content LIKE ? ESCAPE '\\'
             ORDER BY importance DESC, confidence DESC, ts DESC
             LIMIT ?
             """,
-                (user_id, layer, f"%{query}%", limit),
+                (user_id, layer, like_pat, limit),
             )
 
     out = []

@@ -1,13 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 
-import {
-    cockpitProxyForbiddenDetail,
-    isCockpitProxyAllowed,
-} from "@/lib/api/cockpit-proxy-gate";
-import {
-    loadMordaDotenvFromDisk,
-    resolveHubApiKeyFromNextRequest,
-} from "@/lib/api/resolve-hub-api-key";
+import { classifyBffRoute } from "@/lib/api/bff-route-policy";
+import { validateSessionFromRequest } from "@/lib/api/bff-session-auth";
+import { SESSION_COOKIE_NAME } from "@/lib/auth/session-constants";
+import { newRequestId, signPrincipalForBackend } from "@/lib/api/signed-principal";
 
 const DEFAULT_TIMEOUT_MS = Number(process.env.AIHUB_TIMEOUT_MS || "45000");
 const HOP_BY_HOP_HEADERS = new Set([
@@ -35,7 +31,6 @@ function buildTargetPath(path: string[]): string {
     return `/${path.map((segment) => encodeURIComponent(segment)).join("/")}`;
 }
 
-/** Decoded pathname for allowlist matching (must match canonical `{user_id}` segments). */
 function logicalPathnameFromSegments(segments: string[]): string {
     if (!Array.isArray(segments) || segments.length === 0) {
         return "/";
@@ -43,13 +38,30 @@ function logicalPathnameFromSegments(segments: string[]): string {
     return `/${segments.join("/")}`;
 }
 
-function buildForwardHeaders(req: NextRequest, canHaveBody: boolean): Headers {
+function buildForwardHeaders(
+    req: NextRequest,
+    canHaveBody: boolean,
+    opts: {
+        routeClass: "public" | "user" | "admin";
+        session: Awaited<ReturnType<typeof validateSessionFromRequest>>;
+        targetPath: string;
+        method: string;
+    },
+): Headers {
     const headers = new Headers();
-
     for (const [name, value] of req.headers.entries()) {
         const key = name.toLowerCase();
         if (HOP_BY_HOP_HEADERS.has(key)) continue;
-        if (key === "x-aihub-api-key-override") continue;
+        if (
+            key === "x-aihub-api-key-override" ||
+            key === "x-api-key" ||
+            key === "authorization" ||
+            key === "x-aihub-proxy-token" ||
+            key === "x-user-id" ||
+            key.startsWith("x-aihub-principal")
+        ) {
+            continue;
+        }
         headers.set(name, value);
     }
 
@@ -57,26 +69,39 @@ function buildForwardHeaders(req: NextRequest, canHaveBody: boolean): Headers {
         headers.set("accept", "application/json");
     }
 
-    headers.delete("x-api-key");
-    headers.delete("authorization");
-    headers.delete("x-aihub-proxy-token");
-
-    const diskEnv = loadMordaDotenvFromDisk();
-    const apiKey = resolveHubApiKeyFromNextRequest(req);
-    if (apiKey) {
-        headers.set("x-api-key", apiKey);
-    }
-
-    const proxyTok =
-        (process.env.AIHUB_PROXY_TOKEN || "").trim() ||
-        (diskEnv ? (diskEnv.AIHUB_PROXY_TOKEN || "").trim() : "") ||
-        apiKey;
-    if (proxyTok) {
-        headers.set("x-aihub-proxy-token", proxyTok);
-    }
+    const requestId =
+        headers.get("x-request-id") ||
+        headers.get("x-correlation-id") ||
+        newRequestId();
+    headers.set("x-request-id", requestId);
+    headers.set("x-correlation-id", requestId);
 
     if (canHaveBody && !headers.has("content-type")) {
         headers.set("content-type", "application/json");
+    }
+
+    if (opts.routeClass === "public") {
+        return headers;
+    }
+
+    if (!opts.session) {
+        throw new Error("missing session for protected route");
+    }
+
+    const signature = signPrincipalForBackend({
+        session: opts.session,
+        method: opts.method,
+        path: opts.targetPath,
+        requestId,
+    });
+    headers.set("x-aihub-principal", signature);
+
+    const sessionToken = req.cookies.get(SESSION_COOKIE_NAME)?.value;
+    if (sessionToken) {
+        headers.set("cookie", `${SESSION_COOKIE_NAME}=${sessionToken}`);
+    }
+    if (opts.session.csrfToken && !["GET", "HEAD"].includes(opts.method)) {
+        headers.set("x-csrf-token", opts.session.csrfToken);
     }
 
     return headers;
@@ -98,6 +123,7 @@ function buildResponseHeaders(source: Headers): Headers {
         "x-request-id",
         "x-correlation-id",
         "x-accel-buffering",
+        "set-cookie",
     ];
 
     for (const name of passthrough) {
@@ -105,11 +131,10 @@ function buildResponseHeaders(source: Headers): Headers {
         if (value) headers.set(name, value);
     }
 
-    // Don't force content-type if already set (preserve text/event-stream for streaming)
     if (!headers.has("content-type")) {
         headers.set("content-type", "application/json");
     }
-
+    headers.set("cache-control", "private, no-store, max-age=0");
     return headers;
 }
 
@@ -117,16 +142,56 @@ async function forward(req: NextRequest, path: string[]) {
     const targetPath = buildTargetPath(path);
     const query = req.nextUrl.search || "";
     const url = `${backendBaseUrl()}${targetPath}${query}`;
-
     const method = req.method.toUpperCase();
     const logicalPath = logicalPathnameFromSegments(path);
-    if (!isCockpitProxyAllowed(method, logicalPath)) {
-        const { detail, code } = cockpitProxyForbiddenDetail(method, logicalPath);
-        console.warn("[aihub-proxy] forbidden", { method, path: logicalPath, code });
-        return NextResponse.json({ detail, ok: false, code }, { status: 403 });
+    const routeClass = classifyBffRoute(method, logicalPath);
+
+    if (routeClass === "deny") {
+        return NextResponse.json(
+            {
+                detail: "route denied by BFF policy",
+                ok: false,
+                code: "bff_route_denied",
+            },
+            { status: 403 },
+        );
     }
+
+    let session: Awaited<ReturnType<typeof validateSessionFromRequest>> = null;
+    if (routeClass === "user" || routeClass === "admin") {
+        session = await validateSessionFromRequest(req);
+        if (!session) {
+            return NextResponse.json(
+                { detail: "authentication required", ok: false },
+                { status: 401 },
+            );
+        }
+        if (routeClass === "admin" && !session.roles.includes("admin")) {
+            return NextResponse.json(
+                { detail: "admin role required", ok: false },
+                { status: 403 },
+            );
+        }
+    }
+
     const canHaveBody = !["GET", "HEAD"].includes(method);
-    const headers = buildForwardHeaders(req, canHaveBody);
+    let headers: Headers;
+    try {
+        headers = buildForwardHeaders(req, canHaveBody, {
+            routeClass,
+            session,
+            targetPath,
+            method,
+        });
+    } catch (error) {
+        return NextResponse.json(
+            {
+                detail: error instanceof Error ? error.message : "auth failure",
+                ok: false,
+            },
+            { status: 401 },
+        );
+    }
 
     let body: BodyInit | undefined = undefined;
     if (canHaveBody) {
@@ -149,14 +214,6 @@ async function forward(req: NextRequest, path: string[]) {
             redirect: "manual",
         });
 
-        if (response.status >= 400) {
-            console.warn("[aihub-proxy] backend_error", {
-                method,
-                path: targetPath,
-                status: response.status,
-            });
-        }
-
         return new NextResponse(response.body, {
             status: response.status,
             headers: buildResponseHeaders(response.headers),
@@ -169,18 +226,8 @@ async function forward(req: NextRequest, path: string[]) {
                 ? error.message
                 : "Błąd połączenia z AI-Hub backend";
 
-        console.error("[aihub-proxy] upstream_failure", {
-            method,
-            path: targetPath,
-            timeout: isTimeout,
-            message,
-        });
-
         return NextResponse.json(
-            {
-                detail: message,
-                ok: false,
-            },
+            { detail: message, ok: false },
             { status: isTimeout ? 504 : 502 },
         );
     } finally {

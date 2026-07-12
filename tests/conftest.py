@@ -9,17 +9,32 @@ import os
 # production background workers or production Postgres from a real .env.
 os.environ.setdefault("AGENT_AUTOSTART", "0")
 os.environ.setdefault("AIHUB_BACKGROUND_AGENT_LOOP_ENABLED", "0")
+os.environ.setdefault("AIHUB_CONSOLIDATION_WORKER", "0")
 os.environ.setdefault("DB_BACKEND", "sqlite")
 os.environ.setdefault("AIHUB_DISABLE_REMOTE_EMBEDDINGS", "1")
 os.environ.setdefault("AIHUB_DETERMINISTIC_EMBEDDING_FALLBACK", "1")
 os.environ.setdefault("AIHUB_ALLOW_NUMPY_VECTOR_FALLBACK", "1")
+os.environ.setdefault("AIHUB_BFF_PRINCIPAL_SECRET", "test-principal-secret-value-123456")
 
 import pytest
 from fastapi.testclient import TestClient
+from starlette.testclient import TestClient as StarletteTestClient
+
+from urllib.parse import parse_qs, urlparse
 
 from aihub.auth_patch import HUB_KEY_ENV_NAMES
 from aihub.logs import setup_test_logging
 from aihub.main import app
+from aihub.testing.runtime_reset import (
+    assert_no_adapter_for_path,
+    reset_runtime_for_tests,
+)
+from aihub.testing.test_auth_helpers import (
+    infer_user_id,
+    is_admin_test_path,
+    is_public_test_path,
+    signed_headers_for_request,
+)
 
 # Route test logs to logs/test.log (not aihub.log)
 setup_test_logging()
@@ -34,6 +49,14 @@ def pytest_configure(config):
     not natively supported" before any assertion runs. We register the marker here (to silence
     the unknown-mark warning) and provide a minimal stdlib runner in ``pytest_pyfunc_call`` below.
     """
+    config.addinivalue_line(
+        "markers",
+        "no_auth_injection: do not auto-sign TestClient requests (auth negative tests).",
+    )
+    config.addinivalue_line(
+        "markers",
+        "no_isolated_db: skip per-test isolated_db fixture (resource leak harness).",
+    )
     config.addinivalue_line(
         "markers",
         "asyncio: run this coroutine test via asyncio.run() (stdlib runner defined in "
@@ -63,27 +86,152 @@ def pytest_pyfunc_call(pyfuncitem):
 
 
 @pytest.fixture(autouse=True)
-def isolated_db(tmp_path, monkeypatch, request):
-    """Use a temporary SQLite DB per test; teardown checkpoints WAL and drops adapter cache.
+def inject_signed_principal_for_testclient(request, monkeypatch):
+    """Sign backend requests in tests unless a case explicitly checks auth failures."""
+    if request.node.get_closest_marker("no_auth_injection"):
+        yield
+        return
 
-    Do **not** ``importlib.reload(aihub.db)``: the package re-executing would bind a second
-    copy of the legacy runtime while ``memory_v2_repository`` etc. keep the first ``fetch_one``.
-    """
+    original_request = StarletteTestClient.request
+    original_stream = StarletteTestClient.stream
+
+    def _request_path(url: object) -> str:
+        text = str(url)
+        if "://" in text:
+            return urlparse(text).path or "/"
+        return (text.split("?", 1)[0].split("#", 1)[0] or "/")
+
+    def _request_query(url: object) -> str:
+        text = str(url)
+        if "://" in text:
+            return urlparse(text).query
+        if "?" not in text:
+            return ""
+        return text.split("?", 1)[1].split("#", 1)[0]
+
+    def _query_user_id(url: object) -> str | None:
+        values = parse_qs(_request_query(url)).get("user_id") or []
+        return str(values[0]) if values else None
+
+    def _params_user_id(params: object | None) -> str | None:
+        if not params:
+            return None
+        if isinstance(params, dict):
+            value = params.get("user_id")
+            return str(value) if value is not None else None
+        if isinstance(params, (list, tuple)):
+            for item in params:
+                if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == "user_id":
+                    return str(item[1])
+        return None
+
+    def _merge_signed_headers(
+        *,
+        method: str,
+        url: object,
+        headers: dict | None,
+        json=None,
+        data=None,
+        content=None,
+        params=None,
+    ) -> dict:
+        merged = dict(headers or {})
+        lower = {str(k).lower(): v for k, v in merged.items()}
+        if "x-aihub-principal" not in lower and "cookie" not in lower:
+            path = _request_path(url)
+            if not is_public_test_path(path):
+                raw = content if content is not None else data
+                user_id = infer_user_id(
+                    path=path,
+                    json_payload=json,
+                    raw_content=raw,
+                    query_user_id=_query_user_id(url) or _params_user_id(params),
+                )
+                merged.update(
+                    signed_headers_for_request(
+                        method=str(method).upper(),
+                        path=path,
+                        user_id=user_id,
+                        roles=["admin"] if is_admin_test_path(path) else ["user"],
+                    )
+                )
+        return merged
+
+    def _request(self, method, url, *, headers=None, json=None, data=None, content=None, params=None, **kwargs):
+        merged = _merge_signed_headers(
+            method=str(method),
+            url=url,
+            headers=headers,
+            json=json,
+            data=data,
+            content=content,
+            params=params,
+        )
+        return original_request(
+            self,
+            method,
+            url,
+            headers=merged,
+            json=json,
+            data=data,
+            content=content,
+            params=params,
+            **kwargs,
+        )
+
+    def _stream(self, method, url, *, headers=None, json=None, data=None, content=None, params=None, **kwargs):
+        merged = _merge_signed_headers(
+            method=str(method),
+            url=url,
+            headers=headers,
+            json=json,
+            data=data,
+            content=content,
+            params=params,
+        )
+        return original_stream(
+            self,
+            method,
+            url,
+            headers=merged,
+            json=json,
+            data=data,
+            content=content,
+            params=params,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(StarletteTestClient, "request", _request)
+    monkeypatch.setattr(StarletteTestClient, "stream", _stream)
+    yield
+
+
+@pytest.fixture(autouse=True)
+def isolated_db(tmp_path, monkeypatch, request):
+    """Use a temporary SQLite DB per test with full runtime reset on setup/teardown."""
+    if request.node.get_closest_marker("no_isolated_db"):
+        reset_runtime_for_tests()
+        yield None
+        reset_runtime_for_tests()
+        return
+
     import importlib
 
     import aihub.config as cfg
     import aihub.db as db_pkg
 
+    reset_runtime_for_tests()
+
     db_file = tmp_path / "test_aihub.sqlite3"
-    # Tests are hermetic and must not inherit a production DB_BACKEND=postgres from .env.
-    # Production startup is guarded by scripts/doctor.py; unit/integration tests use SQLite.
+    db_file.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setenv("DB_BACKEND", "sqlite")
-    monkeypatch.setenv("DB_PATH", str(db_file))
+    monkeypatch.setenv("DB_PATH", str(db_file.resolve()))
     monkeypatch.setenv("DATA_DIR", str(tmp_path))
     monkeypatch.setenv("FS_ROOT", str(tmp_path / "fs"))
     monkeypatch.setenv("SNAPSHOT_DIR", str(tmp_path / "snapshots"))
     monkeypatch.setenv("AIHUB_DISABLE_REMOTE_EMBEDDINGS", "1")
     monkeypatch.setenv("AIHUB_DETERMINISTIC_EMBEDDING_FALLBACK", "1")
+    monkeypatch.setenv("AIHUB_CONSOLIDATION_WORKER", "0")
     vec_index = tmp_path / "vector.index"
     vec_meta = tmp_path / "vector_meta.json"
     monkeypatch.setenv("VECTOR_INDEX_PATH", str(vec_index))
@@ -93,7 +241,7 @@ def isolated_db(tmp_path, monkeypatch, request):
     monkeypatch.setenv("API_KEY", "")
 
     importlib.reload(cfg)
-    monkeypatch.setattr(cfg, "DB_PATH", db_file)
+    monkeypatch.setattr(cfg, "DB_PATH", db_file.resolve())
     monkeypatch.setattr(cfg, "DATA_DIR", tmp_path)
 
     import aihub.vector_engine as ve_mod
@@ -106,19 +254,16 @@ def isolated_db(tmp_path, monkeypatch, request):
     ve_mod._effective_dim = None
     clear_faiss_dimension_probe_cache()
 
-    def _teardown_db() -> None:
-        try:
-            db_pkg.dispose_sqlite_engine()
-        except Exception:
-            pass
-
-    _teardown_db()
-
     if request.node.get_closest_marker("legacy_sqlite_v2"):
         try:
             yield db_file
         finally:
-            _teardown_db()
+            reset_info = reset_runtime_for_tests()
+            assert_no_adapter_for_path(db_file)
+            if reset_info["leftovers"]:
+                raise RuntimeError(
+                    "isolated_db teardown leftovers: " + "; ".join(reset_info["leftovers"])
+                )
         return
 
     db_pkg.init_db()
@@ -127,21 +272,23 @@ def isolated_db(tmp_path, monkeypatch, request):
 
     agent_db_mod.ensure_schema()
 
-    import aihub.knowledge_graph as kg_mod
-
-    kg_mod._graph.nodes.clear()
-    kg_mod._graph.edges.clear()
-    kg_mod._graph.relation_index.clear()
-
     try:
         yield db_file
     finally:
-        _teardown_db()
+        reset_info = reset_runtime_for_tests()
+        assert_no_adapter_for_path(db_file)
+        if reset_info["leftovers"]:
+            raise RuntimeError(
+                "isolated_db teardown leftovers: " + "; ".join(reset_info["leftovers"])
+            )
 
 
 @pytest.fixture(autouse=True)
 def reset_strategy_confidence_bias_between_tests(isolated_db, request):
     """Clear strategy routing bias after DB is bound (avoids DELETE on empty pre-migrate DB)."""
+    if request.node.get_closest_marker("no_isolated_db"):
+        yield
+        return
     from aihub.strategy_selector import reset_strategy_confidence_bias
 
     if not request.node.get_closest_marker("legacy_sqlite_v2"):
@@ -153,8 +300,9 @@ def reset_strategy_confidence_bias_between_tests(isolated_db, request):
 
 @pytest.fixture
 def client():
-    """Return FastAPI test client."""
-    return TestClient(app)
+    """Return FastAPI test client with lifespan shutdown."""
+    with TestClient(app) as test_client:
+        yield test_client
 
 
 @pytest.fixture(autouse=True)

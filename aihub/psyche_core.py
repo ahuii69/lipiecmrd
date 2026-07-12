@@ -46,6 +46,44 @@ class PsycheCanonicalCore:
 
         return _evolve(user_id, text, role)
 
+    def evolve_once(
+        self,
+        user_id: str,
+        text: str,
+        role: str,
+        idempotency_key: str,
+    ) -> Dict[str, Any]:
+        """Apply a durable event once, including after worker restart."""
+        from aihub.db import exec_one, exec_one_rowcount, fetch_one, now_ts
+
+        exec_one(
+            """
+            CREATE TABLE IF NOT EXISTS psyche_idempotency (
+                idempotency_key TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                completed_ts REAL
+            )
+            """
+        )
+        prior = fetch_one(
+            "SELECT completed_ts FROM psyche_idempotency WHERE idempotency_key=?",
+            (idempotency_key,),
+        )
+        if prior is not None:
+            return self.ensure_user(user_id)
+        inserted = exec_one_rowcount(
+            """
+            INSERT INTO psyche_idempotency(idempotency_key,user_id,role,completed_ts)
+            VALUES(?,?,?,?)
+            ON CONFLICT(idempotency_key) DO NOTHING
+            """,
+            (idempotency_key, user_id, role, now_ts()),
+        )
+        if inserted == 0:
+            return self.ensure_user(user_id)
+        return self.evolve(user_id, text, role)
+
     def reflect(self, user_id: str, context: List[Dict[str, Any]]) -> Dict[str, Any]:
         from aihub.psyche_engine import reflect as _reflect
 

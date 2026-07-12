@@ -1,6 +1,4 @@
-import { clearApiKeyOverrideAfterHubAuthFailure } from "@/lib/api/api-key-override-recovery";
 import { buildAihubProxyUrl } from "@/lib/api/client";
-import { normalizeOptionalApiKeyOverride } from "@/lib/api/normalize-api-key-override";
 
 export interface ChatSttResponse {
     ok: boolean;
@@ -12,24 +10,16 @@ export interface ChatSttResponse {
 export async function transcribeChatAudio(
     blob: Blob,
     filename: string,
-    apiKeyOverride?: string,
+    _apiKeyOverride?: string,
     signal?: AbortSignal,
 ): Promise<ChatSttResponse> {
     const form = new FormData();
     form.append("file", blob, filename);
 
-    const headers: HeadersInit = {};
-    const trimmed = normalizeOptionalApiKeyOverride(apiKeyOverride);
-    if (trimmed) {
-        (headers as Record<string, string>)["x-aihub-api-key-override"] =
-            trimmed;
-    }
-
     const url = buildAihubProxyUrl("/chat/stt");
     const res = await fetch(url, {
         method: "POST",
         body: form,
-        headers,
         signal,
         cache: "no-store",
     });
@@ -46,15 +36,14 @@ export async function transcribeChatAudio(
                 }
             }
         } catch {
-            if (text) detail = text.slice(0, 400);
+            if (text) detail = text.slice(0, 500);
         }
-        clearApiKeyOverrideAfterHubAuthFailure(res.status, detail);
-        return { ok: false, error: detail, code: `http_${res.status}` };
+        return { ok: false, error: detail, code: String(res.status) };
     }
 
     try {
         return JSON.parse(text) as ChatSttResponse;
     } catch {
-        return { ok: false, error: "Niepoprawna odpowiedź STT", code: "bad_json" };
+        return { ok: false, error: "Nieprawidłowa odpowiedź STT" };
     }
 }

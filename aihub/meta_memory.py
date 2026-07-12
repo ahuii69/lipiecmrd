@@ -69,7 +69,10 @@ class MetaMemory:
             ON CONFLICT(fact_id) DO UPDATE SET
                 access_count = access_count + 1,
                 last_access = excluded.last_access,
-                usage_score = MIN(0.99, usage_score + 0.05)
+                usage_score = CASE
+                    WHEN usage_score + 0.05 >= 0.99 THEN 0.99
+                    ELSE usage_score + 0.05
+                END
             """,
                 (fact_id, 1, now, now, 0.55),
             )
@@ -368,23 +371,26 @@ def touch_nodes(node_ids: List[str]) -> int:
     now = now_ts()
     touched = 0
     for nid in node_ids:
-        try:
-            exec_one(
-                """
-                INSERT INTO memory_meta(fact_id, access_count, last_access, creation_ts,
-                                        usage_score, importance_score, overall_priority)
-                VALUES(?, 1, ?, ?, 0.55, 0.5, 0.5)
-                ON CONFLICT(fact_id) DO UPDATE SET
-                    access_count = access_count + 1,
-                    last_access  = excluded.last_access,
-                    usage_score  = MIN(0.99, usage_score + 0.03),
-                    freshness_score = MIN(0.99, freshness_score + 0.05)
-                """,
-                (nid, now, now),
-            )
-            touched += 1
-        except Exception:
-            logger.debug("touch_nodes: skip %s", nid)
+        exec_one(
+            """
+            INSERT INTO memory_meta(fact_id, access_count, last_access, creation_ts,
+                                    usage_score, importance_score, overall_priority)
+            VALUES(?, 1, ?, ?, 0.55, 0.5, 0.5)
+            ON CONFLICT(fact_id) DO UPDATE SET
+                access_count = access_count + 1,
+                last_access  = excluded.last_access,
+                usage_score  = CASE
+                    WHEN usage_score + 0.03 >= 0.99 THEN 0.99
+                    ELSE usage_score + 0.03
+                END,
+                freshness_score = CASE
+                    WHEN freshness_score + 0.05 >= 0.99 THEN 0.99
+                    ELSE freshness_score + 0.05
+                END
+            """,
+            (nid, now, now),
+        )
+        touched += 1
     return touched
 
 

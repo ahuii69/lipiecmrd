@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # Import after logging is configured
 from aihub.admin_api import router as admin_router
 from aihub.agent_api import router as agent_router
+from aihub.auth_api import router as auth_router
+from aihub.auth_middleware import auth_middleware
 from aihub.agent_http_surface import (
     stamp_cognitive_debug_decide,
     stamp_cognitive_observability_health,
@@ -138,6 +140,9 @@ async def lifespan(app: FastAPI):
     try:
         logger.info("Starting %s...", APP_NAME)
         init_db()
+        from aihub.local_auth import ensure_auth_schema
+
+        ensure_auth_schema()
         logger.info("Database initialized")
         load_from_db()
         logger.info("Knowledge graph loaded from DB")
@@ -164,6 +169,18 @@ async def lifespan(app: FastAPI):
     # Shutdown
     try:
         logger.info("Shutting down %s...", APP_NAME)
+        try:
+            from aihub.agent_worker import stop_worker
+
+            stop_worker()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning("Agent worker shutdown: %s", exc)
+        try:
+            from aihub.core.background import stop_background
+
+            stop_background()
+        except Exception as exc:  # pylint: disable=broad-exception-caught
+            logger.warning("Background worker shutdown: %s", exc)
         logger.info("Shutdown complete")
     except Exception as e:  # pylint: disable=broad-exception-caught
         logger.error("Shutdown error: %s", e, exc_info=True)
@@ -174,31 +191,11 @@ app = FastAPI(title=APP_NAME, version="1.0.0", lifespan=lifespan)
 
 @app.middleware("http")
 async def _auth_middleware(request, call_next):
-    """Enforce API key on all non-public paths.
-
-    Trusted Cockpit proxy may send ``X-AIHub-Proxy-Token`` matching
-    ``AIHUB_PROXY_TOKEN`` or (if unset) the coalesced hub key
-    (``AIHUB_API_KEY`` / ``HUB_API_KEY`` / ``API_KEY`` / ``AIHUB_PROXY_TOKEN``),
-    aligned with the Next.js BFF.
-    """
-    secrets = collect_hub_auth_secrets()
-    if secrets and not starts_with_any(request.url.path, NO_AUTH_PATHS):
-        proxy_expected = hub_proxy_token_expected()
-        req_proxy = (request.headers.get("x-aihub-proxy-token") or "").strip()
-        if proxy_expected and req_proxy and req_proxy == proxy_expected:
-            return await call_next(request)
-        try:
-            safe_check_api_key(request)
-        except HTTPException as exc:
-            if int(getattr(exc, "status_code", 0)) == 401:
-                return JSONResponse(
-                    status_code=401,
-                    content={"detail": "invalid api key"},
-                )
-            raise
-    return await call_next(request)
+    """Session, signed principal, and ownership enforcement."""
+    return await auth_middleware(request, call_next)
 
 
+app.include_router(auth_router)
 app.include_router(admin_router)
 app.include_router(agent_router)
 app.include_router(chat_router)

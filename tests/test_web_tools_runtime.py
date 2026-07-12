@@ -23,16 +23,42 @@ class _FakeResponse:
         headers: Dict[str, str],
         content: bytes,
         raise_exc: Exception | None = None,
+        chunks: list[bytes] | None = None,
     ):
         self.url = url
         self.status_code = status_code
         self.headers = headers
         self.content = content
         self._raise_exc = raise_exc
+        self._chunks = chunks or [content]
+        self.chunks_read = 0
 
     def raise_for_status(self) -> None:
         if self._raise_exc is not None:
             raise self._raise_exc
+
+    async def aiter_bytes(self):
+        for chunk in self._chunks:
+            self.chunks_read += 1
+            yield chunk
+
+
+class _FakeStream:
+    def __init__(
+        self,
+        response: _FakeResponse | None,
+        exc: Exception | None,
+    ):
+        self._response = response
+        self._exc = exc
+
+    async def __aenter__(self):
+        if self._exc is not None:
+            raise self._exc
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
 
 
 class _FakeAsyncClient:
@@ -46,13 +72,11 @@ class _FakeAsyncClient:
     async def __aexit__(self, exc_type, exc, tb):
         return False
 
-    async def get(self, _url: str):
-        if self._exc is not None:
-            raise self._exc
-        return self._response
+    def stream(self, _method: str, _url: str, **_kwargs):
+        return _FakeStream(self._response, self._exc)
 
 
-def test_fetch_url_success_truncates_and_logs_event(monkeypatch):
+def test_fetch_url_success_at_hard_limit_and_logs_event(monkeypatch):
     user_id = "web_tools_success"
     ensure_user(user_id)
 
@@ -64,7 +88,7 @@ def test_fetch_url_success_truncates_and_logs_event(monkeypatch):
         url="https://example.com/final",
         status_code=200,
         headers={"content-type": "text/plain"},
-        content=b"abcdef",
+        content=b"abcde",
     )
 
     monkeypatch.setattr(
@@ -87,6 +111,69 @@ def test_fetch_url_success_truncates_and_logs_event(monkeypatch):
         (user_id,),
     )
     assert len(events) >= 1
+
+
+def test_fetch_url_stops_stream_before_full_large_or_decoded_gzip_body(monkeypatch):
+    import aihub.web_tools as wt
+
+    monkeypatch.setattr(wt, "HTTP_MAX_BYTES", 5)
+    response = _FakeResponse(
+        url="https://example.com/large",
+        status_code=200,
+        headers={"content-type": "text/plain", "content-encoding": "gzip"},
+        content=b"",
+        chunks=[b"abc", b"def", b"body-that-must-not-be-read"],
+    )
+    monkeypatch.setattr(
+        wt.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _FakeAsyncClient(response=response),
+    )
+
+    with pytest.raises(wt.WebResponseTooLarge, match="decoded response"):
+        asyncio.get_event_loop().run_until_complete(
+            wt.fetch_url("web_tools_large", "https://example.com")
+        )
+    assert response.chunks_read == 2
+
+
+def test_fetch_url_pins_validated_ip_against_dns_rebinding(monkeypatch):
+    import aihub.web_tools as wt
+
+    resolutions = 0
+    captured: Dict[str, Any] = {}
+
+    def controlled_resolver(_hostname: str):
+        nonlocal resolutions
+        resolutions += 1
+        return ["93.184.216.34"] if resolutions == 1 else ["127.0.0.1"]
+
+    class _PinnedClient(_FakeAsyncClient):
+        def stream(self, method: str, url: str, **kwargs):
+            captured.update(method=method, url=url, kwargs=kwargs)
+            return super().stream(method, url, **kwargs)
+
+    response = _FakeResponse(
+        url="https://93.184.216.34/page",
+        status_code=200,
+        headers={"content-type": "text/plain"},
+        content=b"safe",
+    )
+    monkeypatch.setattr(wt, "_resolve_host_ips", controlled_resolver)
+    monkeypatch.setattr(
+        wt.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _PinnedClient(response=response),
+    )
+
+    out = asyncio.get_event_loop().run_until_complete(
+        wt.fetch_url("web_tools_rebinding", "https://example.com/page")
+    )
+    assert out["url"] == "https://example.com/page"
+    assert captured["url"] == "https://93.184.216.34/page"
+    assert captured["kwargs"]["headers"]["Host"] == "example.com"
+    assert captured["kwargs"]["extensions"]["sni_hostname"] == "example.com"
+    assert resolutions == 1
 
 
 def test_fetch_url_rejects_invalid_scheme():

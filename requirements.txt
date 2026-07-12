@@ -22,6 +22,9 @@ numpy==2.0.1
 # User vault (Fernet)
 cryptography==43.0.3
 
+# Local account authentication (Argon2id)
+argon2-cffi==25.1.0
+
 # Vector engine (required — full memory/search runtime)
 sentence-transformers==5.2.3
 faiss-cpu==1.13.2

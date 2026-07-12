@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 from collections.abc import AsyncIterator
 from io import BytesIO
@@ -32,6 +33,15 @@ from aihub.tools.router import ToolRouter
 from aihub.tools.types import ToolExecutionContext, ToolMode
 
 router = APIRouter(prefix="/chat", tags=["chat"])
+logger = logging.getLogger(__name__)
+
+
+class ToolPolicyOverridesInput(BaseModel):
+    """Explicit, validated policy switches accepted by the operator API."""
+
+    allow_sensitive_mutations: bool = False
+
+    model_config = {"extra": "forbid"}
 
 
 class CapabilityExecuteInput(BaseModel):
@@ -42,7 +52,11 @@ class CapabilityExecuteInput(BaseModel):
     tool_name: str = Field(min_length=1, max_length=200)
     arguments: Dict[str, Any] = Field(default_factory=dict)
     confirmed: bool = False
-    policy_overrides: Dict[str, Any] = Field(default_factory=dict)
+    tool_policy_overrides: ToolPolicyOverridesInput = Field(
+        default_factory=ToolPolicyOverridesInput
+    )
+
+    model_config = {"extra": "forbid"}
 
 
 def _sse_data_line(obj: dict[str, Any]) -> bytes:
@@ -131,7 +145,10 @@ async def _sse_chat_turn(
             except asyncio.CancelledError:
                 logger.debug("Chat stream producer task cancelled during cleanup")
         else:
-            _ = task.exception()
+            try:
+                _ = task.exception()
+            except asyncio.CancelledError:
+                logger.debug("Chat stream producer task was already cancelled")
         CHAT_STREAM_SESSION.reset(token)
 
     exc = error.get("e")
@@ -299,16 +316,33 @@ async def chat_capabilities_execute(payload: CapabilityExecuteInput) -> Dict[str
         session_id=payload.session_id,
         mode=payload.mode,
         include_debug=payload.include_debug,
-        policy_overrides=dict(payload.tool_policy_overrides or {}),
+        policy_overrides=payload.tool_policy_overrides.model_dump(),
     )
 
-    try:
-        result = await tool_router.execute(call, ctx)
-        return {
-            "ok": result.ok,
-            "mode": payload.mode,
-            "tool_name": payload.tool_name,
-            "tool_result": result.model_dump(),
-        }
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+    result = await tool_router.execute(call, ctx)
+    if not result.ok:
+        error = str(result.error or "capability execution failed")
+        if error.startswith("policy_blocked:"):
+            status_code = 403
+        elif error.startswith("input_validation_error:"):
+            status_code = 422
+        elif error.startswith("tool_timeout"):
+            status_code = 504
+        elif "not registered" in error.lower() or "unknown tool" in error.lower():
+            status_code = 404
+        else:
+            status_code = 502
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error": error,
+                "tool_name": payload.tool_name,
+                "tool_call_id": result.tool_call_id,
+            },
+        )
+    return {
+        "ok": True,
+        "mode": payload.mode,
+        "tool_name": payload.tool_name,
+        "tool_result": result.model_dump(),
+    }

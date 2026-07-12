@@ -151,4 +151,13 @@ describe("cockpit-store — server-backed transcript", () => {
         expect(after[0].userId).toBe(scoped);
         expect(after[0].title).toBe("Nowa rozmowa");
     });
+
+    it("nie przyjmuje ani nie utrwala klucza API w przeglądarce", async () => {
+        useCockpitStore.getState().setApiKeyOverride("browser-secret");
+        await Promise.resolve();
+        expect(useCockpitStore.getState().apiKeyOverride).toBe("");
+        expect(
+            localStorage.getItem("aihub-cockpit-store") ?? "",
+        ).not.toContain("browser-secret");
+    });
 });

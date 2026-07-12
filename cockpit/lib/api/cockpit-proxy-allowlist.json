@@ -7,6 +7,18 @@
       "path": "/system/ping"
     },
     {
+      "method": "POST",
+      "path": "/auth/login"
+    },
+    {
+      "method": "GET",
+      "path": "/auth/me"
+    },
+    {
+      "method": "POST",
+      "path": "/auth/logout"
+    },
+    {
       "method": "GET",
       "path": "/ops/health"
     },
@@ -197,6 +209,10 @@
     {
       "method": "POST",
       "path": "/memory/v2/index-jobs/process"
+    },
+    {
+      "method": "GET",
+      "path": "/psyche/{user_id}"
     },
     {
       "method": "GET",

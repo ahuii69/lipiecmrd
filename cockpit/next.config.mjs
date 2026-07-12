@@ -70,13 +70,6 @@ const nextConfig = {
                     key: "Referrer-Policy",
                     value: "strict-origin-when-cross-origin",
                 },
-                {
-                    key: "Cache-Control",
-                    value:
-                        process.env.NODE_ENV === "production"
-                            ? "public, max-age=31536000, immutable"
-                            : "no-cache, no-store, must-revalidate",
-                },
             ],
         },
     ],

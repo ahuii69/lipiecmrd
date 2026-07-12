@@ -1,5 +1,3 @@
-import { clearApiKeyOverrideAfterHubAuthFailure } from "@/lib/api/api-key-override-recovery";
-import { normalizeOptionalApiKeyOverride } from "@/lib/api/normalize-api-key-override";
 import { unwrapCapabilityResult } from "@/lib/api/tool-result";
 import type {
     AgentCycleResponse,
@@ -78,10 +76,6 @@ async function hubRequest(
     if (opts?.body !== undefined) {
         headers["content-type"] = "application/json";
     }
-    const trimmed = normalizeOptionalApiKeyOverride(opts?.apiKeyOverride);
-    if (trimmed) {
-        headers["x-aihub-api-key-override"] = trimmed;
-    }
     const url = buildAihubProxyUrl(path);
     return fetch(url, {
         method,
@@ -113,7 +107,6 @@ async function hubJson<T>(
         } catch {
             if (text) detail = text.slice(0, 500);
         }
-        clearApiKeyOverrideAfterHubAuthFailure(res.status, detail);
         throw new ApiClientError(detail, res.status, text);
     }
     return (text ? (JSON.parse(text) as T) : ({} as T)) as T;
@@ -297,6 +290,9 @@ export const apiClient = {
             tool_name: string;
             arguments?: Record<string, unknown>;
             confirmed?: boolean;
+            tool_policy_overrides?: {
+                allow_sensitive_mutations?: boolean;
+            };
         },
         apiKeyOverride?: string,
     ) {
@@ -312,6 +308,8 @@ export const apiClient = {
                     tool_name: payload.tool_name,
                     arguments: payload.arguments ?? {},
                     confirmed: payload.confirmed ?? false,
+                    tool_policy_overrides:
+                        payload.tool_policy_overrides ?? {},
                 },
                 apiKeyOverride,
             },

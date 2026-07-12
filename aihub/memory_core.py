@@ -63,12 +63,12 @@ class MemoryCanonicalCore:
         intent: str,
         meta: Dict[str, Any],
     ) -> Dict[str, Any]:
-        """HTTP ``POST /memory/add`` and tool ``memory.process_turn``: psyche + graph turn."""
-        from aihub.memory_engine import process_turn
-        from aihub.psyche_core import get_psyche_core
+        """Persist one graph-memory turn.
 
-        get_psyche_core().evolve(user_id, user_msg, "user")
-        get_psyche_core().evolve(user_id, assistant_msg, "assistant")
+        Psyche mutation is intentionally not owned here.  A completed chat turn
+        fans out Memory and Psyche as separate idempotent durable handlers.
+        """
+        from aihub.memory_engine import process_turn
         return process_turn(user_id, user_msg, assistant_msg, intent, meta)
 
     def ingest_fact(

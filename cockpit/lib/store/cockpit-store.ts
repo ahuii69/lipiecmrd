@@ -582,10 +582,7 @@ export const useCockpitStore = create<CockpitState>()(
 
                 setInspectorOpen: (open) => set({ inspectorOpen: open }),
 
-                setApiKeyOverride: (value) =>
-                    set({
-                        apiKeyOverride: value.trim() === "" ? "" : value,
-                    }),
+                setApiKeyOverride: () => set({ apiKeyOverride: "" }),
 
                 ensureUserScope: () => {
                     const scoped = resolveScopedUserIdFromStorage();
@@ -617,7 +614,7 @@ export const useCockpitStore = create<CockpitState>()(
         },
         {
             name: "aihub-cockpit-store",
-            version: 5,
+            version: 6,
             skipHydration: true,
             storage: createJSONStorage(() => localStorage),
             /** Transkrypt czatu = backend (GET history); tu tylko metadane sesji — brak „fanfiku” w localStorage. */
@@ -628,7 +625,6 @@ export const useCockpitStore = create<CockpitState>()(
                     messages: [],
                 })),
                 activeSessionId: state.activeSessionId,
-                apiKeyOverride: state.apiKeyOverride,
             }),
             migrate: (persistedState, oldVersion) => {
                 const state = persistedState as
@@ -659,6 +655,7 @@ export const useCockpitStore = create<CockpitState>()(
                     ...state,
                     sessions,
                     activeSessionId,
+                    apiKeyOverride: "",
                 };
             },
             merge: (persistedState, currentState) => {

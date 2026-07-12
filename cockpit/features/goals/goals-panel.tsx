@@ -154,7 +154,7 @@ export function GoalsPanel() {
     });
 
     // Derived state
-    const goals = goalsQuery.data ?? [];
+    const goals = useMemo(() => goalsQuery.data ?? [], [goalsQuery.data]);
     const selected = useMemo(
         () => goals.find((g) => g.goal_id === selectedGoalId) ?? null,
         [goals, selectedGoalId],

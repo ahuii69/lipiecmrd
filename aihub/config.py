@@ -19,6 +19,8 @@ import os
 import re
 from pathlib import Path
 
+from aihub.secret_resolver import resolve_llm_api_key, validate_vault_secret_material
+
 
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
@@ -115,16 +117,22 @@ def _validate_production_secrets() -> None:
         return
 
     required_secrets = {
-        "DEEPINFRA_API_KEY": "LLM API key (DeepInfra/Claude)",
         "BRAVE_API_KEY": "Search API key (Brave Search)",
         "VOYAGE_API_KEY": "Embeddings API key (Voyage)",
         "AIHUB_USER_VAULT_KEY": "User vault encryption key (aihub.user_vault) - no dev fallback in production",
     }
 
     missing = []
+    if not resolve_llm_api_key():
+        missing.append(
+            "LLM_API_KEY / DEEPINFRA_API_KEY: one LLM provider credential is required"
+        )
     for key, description in required_secrets.items():
-        if not os.getenv(key, "").strip():
+        value = os.getenv(key, "").strip()
+        if not value:
             missing.append(f"{key}: {description}")
+        elif key == "AIHUB_USER_VAULT_KEY":
+            validate_vault_secret_material(value)
 
     # Import kept local: aihub.auth_patch has no dependency back on aihub.config, but this
     # keeps the dependency direction explicit and avoids import-order surprises at module load.
@@ -206,7 +214,7 @@ HTTP_TRUST_ENV = _env_bool("HTTP_TRUST_ENV", "0")
 # LLM provider/runtime
 LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER_NAME", "deepinfra")
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "openai/gpt-oss-120b")
-LLM_API_KEY = os.getenv("LLM_API_KEY", os.getenv("DEEPINFRA_API_KEY", ""))
+LLM_API_KEY = resolve_llm_api_key()
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepinfra.com/v1/openai")
 LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "45"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))

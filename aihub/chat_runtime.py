@@ -1851,8 +1851,7 @@ class ChatRuntime:
             logger.debug(
                 "web_required_ungrounded: psyche behavior fields skipped: %s", exc
             )
-            trace.setdefault("final_behavior_profile", {})
-            trace.setdefault("psyche_v2_style_mode", "neutral")
+            trace.update(self._final_behavior_trace_fields(None))
 
         self._write_back_experience(
             turn=turn,
@@ -2095,26 +2094,43 @@ class ChatRuntime:
         trace.setdefault("psyche_state_before", {})
         trace.setdefault("psyche_state_after", {})
 
+        turn_id = str(uuid.uuid4())
+        reflection_payload = {
+            "action_type": "chat_turn",
+            "parameters": {
+                "grounding_mode": grounding_mode,
+                "tool_calls": len(tool_calls),
+            },
+            "confidence": 1.0 if len(errors) == 0 else 0.5,
+            "execution_result": {"ok": len(errors) == 0, "response_len": len(response_text or "")},
+            "decision_reasoning": "TurnCompleted",
+            "context": {"turn_id": turn_id, "intent": intent},
+        }
+
         try:
-            write_result = self._memory_process_fn(
-                turn.user_id,
-                turn.message,
-                response_text or "",
-                intent,
-                metadata,
+            from aihub.durable_jobs import execute_turn_completed_inline
+
+            completed = execute_turn_completed_inline(
+                turn_id=turn_id,
+                user_id=turn.user_id,
+                user_message=turn.message,
+                assistant_message=response_text or "",
+                intent=intent,
+                metadata=metadata,
+                reflection=reflection_payload,
             )
+            write_result = completed.get("handlers", {}).get("memory") or {}
+            psyche_result = completed.get("handlers", {}).get("psyche") or {}
             trace["experience_write_back_attempted"] = True
             trace["experience_write_back_succeeded"] = True
             trace["experience_episode_id"] = write_result.get("episode_id")
             trace["experience_fact_ids"] = write_result.get("fact_ids", [])
             trace["experience_stm_ids"] = write_result.get("stm_ids", [])
+            trace["turn_completed_job_id"] = completed.get("job_id")
+            trace["reflection_outcome_id"] = (
+                (completed.get("handlers", {}).get("reflection") or {}).get("reflection_id")
+            )
 
-            # Wire KG: apply consistency verdict to newly stored facts.
-            # When a pre-exec conflict/revision was detected, the new facts written
-            # above are semantically related to the contradicting prior knowledge.
-            # apply_consistency_verdict() creates the appropriate KG edge
-            # (contradicts / supersedes / related_to) between the new node and
-            # the matched prior node, keeping the knowledge graph consistent.
             _consistency_class = _dc.get("consistency_classification")
             _fact_ids = write_result.get("fact_ids", [])
             if _consistency_class in ("conflict", "revision") and _fact_ids:
@@ -2131,31 +2147,23 @@ class ChatRuntime:
                     logger.debug(
                         "Consistency apply_verdict on new facts failed", exc_info=True
                     )
+
+            trace["psyche_snapshot_happened"] = True
+            trace["psyche_state_before"] = self._compact_psyche_state(psyche_snapshot)
+            trace["psyche_state_after"] = self._compact_psyche_state(psyche_result)
         except Exception as exc:  # noqa: BLE001
             trace["experience_write_back_attempted"] = True
             trace["experience_write_back_succeeded"] = False
+            if psyche_snapshot:
+                trace["psyche_state_before"] = self._compact_psyche_state(
+                    psyche_snapshot
+                )
             errors.append(
                 {
                     "type": "memory_write_back_error",
                     "error": str(exc),
                 }
             )
-
-        try:
-            after_state = self._psyche_evolve_fn(turn.user_id, turn.message, "user")
-            after_state = self._psyche_evolve_fn(
-                turn.user_id,
-                response_text or "",
-                "assistant",
-            )
-            trace["psyche_snapshot_happened"] = True
-            trace["psyche_state_before"] = self._compact_psyche_state(psyche_snapshot)
-            trace["psyche_state_after"] = self._compact_psyche_state(after_state)
-        except Exception as exc:  # noqa: BLE001
-            if psyche_snapshot:
-                trace["psyche_state_before"] = self._compact_psyche_state(
-                    psyche_snapshot
-                )
             errors.append(
                 {
                     "type": "psyche_update_error",
@@ -4761,11 +4769,29 @@ class ChatRuntime:
             reporting_mode=reporting_mode,
         )
 
+    @staticmethod
+    def _neutral_final_behavior_profile(*, mode: str = "neutral") -> dict[str, Any]:
+        return {
+            "mode": mode,
+            "directness": 0.5,
+            "verbosity": 0.5,
+            "caution": 0.5,
+            "pressure": 0.5,
+            "trust": 0.5,
+            "friction": 0.5,
+            "warmth": 0.5,
+            "autonomy": 0.5,
+            "structuredness": 0.5,
+            "tool_bias": 0.5,
+            "web_bias": 0.5,
+            "reassurance": 0.5,
+        }
+
     def _final_behavior_trace_fields(
         self, psyche_v2_behavior_ctx: Any
     ) -> dict[str, Any]:
         """Spójne z główną ścieżką LLM: ``final_behavior_profile`` + ``psyche_v2_style_mode``."""
-        final_behavior_profile: dict[str, Any] = {}
+        final_behavior_profile = self._neutral_final_behavior_profile()
         psyche_v2_style_mode = "neutral"
         if psyche_v2_behavior_ctx and getattr(psyche_v2_behavior_ctx, "loaded", False):
             psyche_v2_style_mode = psyche_v2_behavior_ctx.mode
@@ -4901,8 +4927,7 @@ class ChatRuntime:
                 logger.debug(
                     "deterministic trace: psyche behavior fields skipped: %s", exc
                 )
-                det.trace.setdefault("final_behavior_profile", {})
-                det.trace.setdefault("psyche_v2_style_mode", "neutral")
+                det.trace.update(self._final_behavior_trace_fields(None))
             det.trace.update(
                 self._correction_trace_flat(correction_turn_trace, hints_chars=0)
             )
@@ -4939,8 +4964,7 @@ class ChatRuntime:
                 logger.debug(
                     "memory_fact trace: psyche behavior fields skipped: %s", exc
                 )
-                mem_fact.trace.setdefault("final_behavior_profile", {})
-                mem_fact.trace.setdefault("psyche_v2_style_mode", "neutral")
+                mem_fact.trace.update(self._final_behavior_trace_fields(None))
             mem_fact.trace.update(
                 self._correction_trace_flat(correction_turn_trace, hints_chars=0)
             )
@@ -6018,7 +6042,9 @@ class ChatRuntime:
             )
         )
 
-        final_behavior_profile = {}
+        final_behavior_profile = self._neutral_final_behavior_profile(
+            mode=psyche_v2_style_mode
+        )
         if psyche_v2_behavior_ctx and psyche_v2_behavior_ctx.loaded:
             final_behavior_profile = {
                 "mode": psyche_v2_style_mode,

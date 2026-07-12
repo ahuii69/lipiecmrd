@@ -1,4 +1,4 @@
-"""Tests for LLM provider configuration — canonical LLM_API_KEY only."""
+"""Tests for canonical LLM credential resolution."""
 
 from __future__ import annotations
 
@@ -35,23 +35,21 @@ def test_llm_api_key_whitespace_stripped() -> None:
         assert key == "sk-padded"
 
 
-def test_no_deepinfra_alias_in_config() -> None:
-    """Config should NOT fall back to DEEPINFRA_API_KEY or DEEPINFRA_TOKEN."""
-    import importlib
+def test_deepinfra_alias_uses_canonical_resolver() -> None:
+    """Supported alias resolves identically; undocumented token names do not."""
+    from aihub.secret_resolver import resolve_llm_api_key
 
-    with patch.dict(
-        "os.environ",
-        {
-            "LLM_API_KEY": "",
-            "DEEPINFRA_API_KEY": "sk-legacy",
-            "DEEPINFRA_TOKEN": "sk-legacy2",
-        },
-        clear=False,
-    ):
-        import aihub.config as cfg
-
-        importlib.reload(cfg)
-        assert cfg.LLM_API_KEY == ""
+    assert (
+        resolve_llm_api_key(
+            {
+                "LLM_API_KEY": "",
+                "DEEPINFRA_API_KEY": "sk-legacy",
+                "DEEPINFRA_TOKEN": "sk-unsupported",
+            }
+        )
+        == "sk-legacy"
+    )
+    assert resolve_llm_api_key({"DEEPINFRA_TOKEN": "sk-unsupported"}) == ""
 
 
 @pytest.mark.anyio

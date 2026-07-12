@@ -1,0 +1,35 @@
+[Unit]
+Description=AIHub Cockpit frontend
+After=network-online.target aihub-backend.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=aihub
+Group=aihub
+WorkingDirectory=/opt/aihub/cockpit
+EnvironmentFile=/etc/aihub/cockpit.env
+Environment=NODE_ENV=production
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3001
+ExecStart=/usr/bin/npm run start
+Restart=on-failure
+RestartSec=5s
+TimeoutStopSec=30s
+KillSignal=SIGTERM
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+ReadWritePaths=/var/lib/aihub
+StateDirectory=aihub
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

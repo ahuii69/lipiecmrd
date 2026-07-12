@@ -68,7 +68,7 @@ export function GoalUpdateForm({
     useEffect(() => {
         setForm(toState(goal));
         setError(null);
-    }, [goal.goalId]);
+    }, [goal]);
 
     const submit = async (e: FormEvent) => {
         e.preventDefault();

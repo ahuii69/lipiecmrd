@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import logging
+import os
 import re
 import time
 from typing import Optional
@@ -17,6 +18,7 @@ from typing import Optional
 from cryptography.fernet import Fernet, InvalidToken
 
 from aihub.db import exec_one, fetch_all, fetch_one
+from aihub.secret_resolver import validate_vault_secret_material
 
 logger = logging.getLogger(__name__)
 
@@ -30,14 +32,12 @@ def _fernet() -> Fernet:
     Key resolution order:
     1. ``AIHUB_USER_VAULT_KEY`` from the environment (raw 44-char urlsafe-base64 Fernet key,
        or arbitrary secret material that gets SHA-256-derived into a Fernet key).
-    2. In ``ENV=production`` a missing key is a hard failure — there is NO fallback in
-       production, because a derivable/deterministic key would make every vault secret
-       recoverable by anyone who reads this source file.
-    3. Outside production (dev/test), a deterministic key derived from ``DB_PATH`` is used
-       as an explicit, logged, non-production convenience fallback only.
+    2. A deterministic fallback exists only under the explicit
+       ``AIHUB_LOCAL_TEST_PROFILE=1`` test profile.
     """
-    raw = __import__("os").environ.get("AIHUB_USER_VAULT_KEY", "").strip()
+    raw = os.environ.get("AIHUB_USER_VAULT_KEY", "").strip()
     if raw:
+        validate_vault_secret_material(raw)
         try:
             b = raw.encode("ascii", errors="strict")
             if len(b) == 44:
@@ -47,23 +47,21 @@ def _fernet() -> Fernet:
         key_mat = hashlib.sha256(raw.encode("utf-8")).digest()
         return Fernet(base64.urlsafe_b64encode(key_mat))
 
-    env_mode = __import__("os").environ.get("ENV", "development").strip().lower()
-    if env_mode == "production":
+    env_mode = os.environ.get("ENV", "development").strip().lower()
+    local_test_profile = (
+        os.environ.get("AIHUB_LOCAL_TEST_PROFILE", "").strip() == "1"
+        and env_mode in {"development", "dev", "test", "testing"}
+    )
+    if not local_test_profile:
         raise RuntimeError(
-            "AIHUB_USER_VAULT_KEY is not set. In ENV=production the user vault requires an "
-            "explicit encryption key — there is no dev fallback in production. Generate one with "
-            "`python -c \"from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())\"` "
-            "and set it as AIHUB_USER_VAULT_KEY before starting the process."
+            "AIHUB_USER_VAULT_KEY is required outside the explicit local test profile"
         )
 
     from aihub.config import DB_PATH
 
     if not _dev_fallback_warned[0]:
         logger.warning(
-            "AIHUB_USER_VAULT_KEY is not set - using a NON-PRODUCTION deterministic dev/test "
-            "fallback key derived from DB_PATH. This key is derivable from public source code and "
-            "MUST NOT be relied on outside local dev/test. Set AIHUB_USER_VAULT_KEY for any shared "
-            "or persistent environment."
+            "Using deterministic vault key under explicit AIHUB_LOCAL_TEST_PROFILE"
         )
         _dev_fallback_warned[0] = True
 
@@ -111,7 +109,7 @@ class UserVault:
         try:
             return _fernet().decrypt(bytes(row["ciphertext"])).decode("utf-8")
         except InvalidToken:
-            logger.warning("user_vault decrypt failed user=%s alias=%s", uid, key)
+            logger.warning("user_vault decrypt failed")
             return None
 
     def delete(self, user_id: str, alias: str) -> bool:

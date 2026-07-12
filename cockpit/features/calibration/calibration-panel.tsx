@@ -55,23 +55,25 @@ interface CalibrationData {
 export function CalibrationPanel({ userId }: { userId: string }) {
     const [data, setData] = useState<CalibrationData | null>(null);
     const [loading, setLoading] = useState(true);
-    const [query, setQuery] = useState("");
 
     useEffect(() => {
-        fetchCalibration();
+        let active = true;
+        const fetchCalibration = async () => {
+            try {
+                setLoading(true);
+                const result = await apiClient.cockpitCalibration(userId, "");
+                if (active) setData(result);
+            } catch (err) {
+                console.error("Failed to fetch calibration:", err);
+            } finally {
+                if (active) setLoading(false);
+            }
+        };
+        void fetchCalibration();
+        return () => {
+            active = false;
+        };
     }, [userId]);
-
-    const fetchCalibration = async () => {
-        try {
-            setLoading(true);
-            const result = await apiClient.cockpitCalibration(userId, query);
-            setData(result);
-        } catch (err) {
-            console.error("Failed to fetch calibration:", err);
-        } finally {
-            setLoading(false);
-        }
-    };
 
     if (loading) {
         return (

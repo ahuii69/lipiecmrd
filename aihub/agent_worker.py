@@ -74,13 +74,14 @@ def _run_loop() -> None:
 
     tick_event = _worker_tick_input_event()
 
-    while True:
+    while not _stop_worker.is_set():
         try:
             if not BACKGROUND_AGENT_LOOP_ENABLED:
                 logger.debug(
                     "AIHUB_BACKGROUND_AGENT_LOOP_ENABLED=0 — skipping tick batch"
                 )
-                time.sleep(AGENT_INTERVAL_S)
+                if _stop_worker.wait(AGENT_INTERVAL_S):
+                    break
                 continue
 
             for uid in _iter_background_user_ids():
@@ -222,11 +223,12 @@ def _run_loop() -> None:
                     {"reason": "too_many_errors", "errors": consecutive_errors},
                 )
                 # Pause ale nie wyłączaj
-                time.sleep(AGENT_INTERVAL_S * 10)
+                if _stop_worker.wait(AGENT_INTERVAL_S * 10):
+                    break
                 consecutive_errors = 0
 
-            # Normal sleep
-            time.sleep(AGENT_INTERVAL_S)
+            if _stop_worker.wait(AGENT_INTERVAL_S):
+                break
 
         except KeyboardInterrupt:
             logger.info("Agent worker interrupted by KeyboardInterrupt")
@@ -234,11 +236,13 @@ def _run_loop() -> None:
         except Exception as e:
             logger.error(f"Unexpected error in agent worker loop: {e}", exc_info=True)
             consecutive_errors += 1
-            time.sleep(AGENT_INTERVAL_S * 2)
+            if _stop_worker.wait(AGENT_INTERVAL_S * 2):
+                break
 
 
 _worker_started = False
 _worker_thread: Optional[threading.Thread] = None
+_stop_worker = threading.Event()
 
 
 def start_worker_once() -> None:
@@ -269,6 +273,7 @@ def start_worker_once() -> None:
             ",".join(_iter_background_user_ids()),
             AGENT_INTERVAL_S,
         )
+        _stop_worker.clear()
         _worker_thread = threading.Thread(
             target=_run_loop, daemon=True, name="aihub-agent-worker"
         )
@@ -286,7 +291,9 @@ def stop_worker() -> None:
     """
     global _worker_started, _worker_thread
 
-    if not _worker_started or _worker_thread is None:
+    _stop_worker.set()
+    if _worker_thread is None:
+        _worker_started = False
         logger.debug("Agent worker not running")
         return
 
@@ -294,10 +301,10 @@ def stop_worker() -> None:
     _worker_thread.join(timeout=5.0)
 
     if _worker_thread.is_alive():
-        logger.warning("Agent worker did not stop within timeout")
-    else:
-        logger.info("Agent worker stopped successfully")
-        _worker_started = False
+        raise RuntimeError("Agent worker did not stop within timeout")
+    logger.info("Agent worker stopped successfully")
+    _worker_started = False
+    _worker_thread = None
 
 
 def is_running() -> bool:

@@ -1,6 +1,4 @@
-import { clearApiKeyOverrideAfterHubAuthFailure } from "@/lib/api/api-key-override-recovery";
 import { buildAihubProxyUrl } from "@/lib/api/client";
-import { normalizeOptionalApiKeyOverride } from "@/lib/api/normalize-api-key-override";
 import { ChatTurnRequest, ChatTurnResponse } from "@/lib/api/types";
 
 export interface ChatTurnStreamHandlers {
@@ -70,17 +68,12 @@ export async function streamChatTurn(
     payload: ChatTurnRequest,
     signal: AbortSignal,
     handlers: StreamChatTurnOptions,
-    apiKeyOverride?: string,
+    _apiKeyOverride?: string,
 ): Promise<void> {
     const headers: HeadersInit = {
         "content-type": "application/json",
         accept: "text/event-stream",
     };
-    const trimmedOverride = normalizeOptionalApiKeyOverride(apiKeyOverride);
-    if (trimmedOverride) {
-        (headers as Record<string, string>)["x-aihub-api-key-override"] =
-            trimmedOverride;
-    }
 
     const url = buildAihubProxyUrl("/chat/turn", {
         stream: true,
@@ -109,7 +102,6 @@ export async function streamChatTurn(
         } catch {
             if (text) detail = text.slice(0, 500);
         }
-        clearApiKeyOverrideAfterHubAuthFailure(res.status, detail);
         throw new Error(detail);
     }
 

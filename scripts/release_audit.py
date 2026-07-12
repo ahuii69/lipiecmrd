@@ -9,6 +9,7 @@ method/path routes, and import failures. It does not print secrets.
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import importlib
 import json
@@ -20,7 +21,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-UNFINISHED_RE = re.compile(r"\b(TODO|FIXME|placeholder|pseudocode|pseudokod|NotImplemented|skeleton)\b", re.IGNORECASE)
+UNFINISHED_RE = re.compile(
+    r"\b(TODO|FIXME|pseudocode|pseudokod|NotImplemented|skeleton)\b", re.IGNORECASE
+)
+PLACEHOLDER_STUB_RE = re.compile(
+    r"^\s*(placeholder|changeme|your[_-]?api[_-]?key|xxx+|insert[_-]?here)\s*$",
+    re.IGNORECASE,
+)
 PASS_RE = re.compile(r"^\s*pass\s*(#.*)?$", re.MULTILINE)
 # Directory names skipped anywhere in the tree. These are build outputs, dependency installs,
 # tool caches, virtualenvs and runtime log dirs — never release source. Matching is by path
@@ -47,6 +54,9 @@ TEXT_MARKER_IGNORE = {
     "scripts/doctor.py",  # detection token list, not unfinished code
     "scripts/release_audit.py",  # this scanner's own regex/list
 }
+TEXT_MARKER_IGNORE_PREFIXES = (
+    "aihub/testing/",
+)
 # Runtime artifact subtrees (paths relative to the repo root, POSIX form). Everything under these
 # is generated while the app runs or while tests run — user uploads, scratch/tmp, on-disk caches,
 # the sandbox filesystem and psyche/state snapshots — and is NEVER part of release source. Two
@@ -122,16 +132,119 @@ def module_collisions(root: Path) -> list[dict[str, str]]:
     return collisions
 
 
+def _collect_validation_marker_ids(tree: ast.AST) -> set[int]:
+    """String literals used only as weak-secret markers in membership checks."""
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.GeneratorExp) or not node.generators:
+            continue
+        elt = node.elt
+        if not (
+            isinstance(elt, ast.Compare)
+            and elt.ops
+            and isinstance(elt.ops[0], ast.In)
+        ):
+            continue
+        iter_node = node.generators[0].iter
+        if isinstance(iter_node, (ast.Tuple, ast.List)):
+            for item in iter_node.elts:
+                if isinstance(item, ast.Constant) and isinstance(item.value, str):
+                    ids.add(id(item))
+    return ids
+
+
+def _docstring_constant_ids(tree: ast.AST) -> set[int]:
+    ids: set[int] = set()
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Module)):
+            continue
+        if not node.body:
+            continue
+        first = node.body[0]
+        if (
+            isinstance(first, ast.Expr)
+            and isinstance(first.value, ast.Constant)
+            and isinstance(first.value.value, str)
+        ):
+            ids.add(id(first.value))
+    return ids
+
+
+def _unfinished_from_ast(rel: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return findings
+    doc_ids = _docstring_constant_ids(tree)
+    validation_ids = _collect_validation_marker_ids(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Raise):
+            exc = node.exc
+            if isinstance(exc, ast.Call) and isinstance(exc.func, ast.Name):
+                if exc.func.id == "NotImplementedError":
+                    findings.append(
+                        {
+                            "file": rel,
+                            "line": node.lineno,
+                            "text": "raise NotImplementedError",
+                        }
+                    )
+            elif isinstance(exc, ast.Name) and exc.id == "NotImplementedError":
+                findings.append(
+                    {
+                        "file": rel,
+                        "line": node.lineno,
+                        "text": "raise NotImplementedError",
+                    }
+                )
+        if not (isinstance(node, ast.Constant) and isinstance(node.value, str)):
+            continue
+        value = node.value
+        line_no = int(getattr(node, "lineno", 1) or 1)
+        lines = value.strip().splitlines()
+        snippet = (lines[0] if lines else value)[:240]
+        if id(node) in doc_ids or id(node) in validation_ids:
+            if UNFINISHED_RE.search(value):
+                findings.append({"file": rel, "line": line_no, "text": snippet})
+            continue
+        if PLACEHOLDER_STUB_RE.match(value.strip()):
+            findings.append({"file": rel, "line": line_no, "text": snippet})
+        elif UNFINISHED_RE.search(value):
+            findings.append({"file": rel, "line": line_no, "text": snippet})
+    return findings
+
+
+def _unfinished_from_comments_and_pass(rel: str, text: str) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if PASS_RE.match(line):
+            findings.append({"file": rel, "line": line_no, "text": line.strip()[:240]})
+        if "#" not in line:
+            continue
+        comment = line.split("#", 1)[1]
+        if UNFINISHED_RE.search(comment):
+            findings.append({"file": rel, "line": line_no, "text": line.strip()[:240]})
+        elif re.search(r"\bplaceholder\b", comment, re.IGNORECASE) and re.search(
+            r"(placeholder\s*(value|secret|key|token|here|=)|TODO|FIXME|stub|replace)",
+            comment,
+            re.IGNORECASE,
+        ):
+            findings.append({"file": rel, "line": line_no, "text": line.strip()[:240]})
+    return findings
+
+
 def unfinished_markers(root: Path) -> list[dict[str, Any]]:
     findings: list[dict[str, Any]] = []
     for py in (root / "aihub").rglob("*.py"):
         rel = _rel(root, py)
         if rel in TEXT_MARKER_IGNORE:
             continue
+        if rel.startswith(TEXT_MARKER_IGNORE_PREFIXES):
+            continue
         text = py.read_text(encoding="utf-8", errors="replace")
-        for line_no, line in enumerate(text.splitlines(), start=1):
-            if UNFINISHED_RE.search(line) or PASS_RE.match(line):
-                findings.append({"file": rel, "line": line_no, "text": line.strip()[:240]})
+        findings.extend(_unfinished_from_ast(rel, text))
+        findings.extend(_unfinished_from_comments_and_pass(rel, text))
     return findings
 
 

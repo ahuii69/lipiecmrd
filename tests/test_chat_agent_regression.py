@@ -5,6 +5,7 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+import pytest
 from fastapi.testclient import TestClient
 
 from aihub.auth_patch import HUB_KEY_ENV_NAMES
@@ -57,6 +58,7 @@ def test_main_module_uses_package_qualified_uvicorn_target():
     assert re.search(r'uvicorn\.run\(\s*"aihub\.main:app"', source, re.DOTALL)
 
 
+@pytest.mark.no_auth_injection
 def test_auth_missing_or_invalid_key_returns_401_json(monkeypatch):
     from aihub import main
 
@@ -67,22 +69,18 @@ def test_auth_missing_or_invalid_key_returns_401_json(monkeypatch):
     with TestClient(main.app) as client:
         missing = client.get("/system/health/auth_user")
         assert missing.status_code == 401
-        assert missing.json() == {"detail": "invalid api key"}
+        assert missing.json()["detail"] == "authentication required"
 
-        invalid = client.get(
-            "/system/health/auth_user", headers={"x-api-key": "wrong-key"}
-        )
-        assert invalid.status_code == 401
-        assert invalid.json() == {"detail": "invalid api key"}
-
-        valid = client.get(
+        api_key_only = client.get(
             "/system/health/auth_user", headers={"x-api-key": "expected-key"}
         )
-        assert valid.status_code == 200
+        assert api_key_only.status_code == 401
+        assert api_key_only.json()["detail"] == "authentication required"
 
 
+@pytest.mark.no_auth_injection
 def test_auth_accepts_aihub_api_key_alias_without_api_key(monkeypatch):
-    """Hub auth works when only AIHUB_API_KEY is set (no API_KEY)."""
+    """Service API key alone no longer grants user-scoped access."""
     from aihub import main
 
     _isolate_hub_auth_env(monkeypatch)
@@ -92,12 +90,13 @@ def test_auth_accepts_aihub_api_key_alias_without_api_key(monkeypatch):
     with TestClient(main.app) as client:
         bad = client.get("/system/health/auth_user")
         assert bad.status_code == 401
-        ok = client.get(
+        alias_only = client.get(
             "/system/health/auth_user", headers={"x-api-key": "alias-secret"}
         )
-        assert ok.status_code == 200
+        assert alias_only.status_code == 401
 
 
+@pytest.mark.no_auth_injection
 def test_chat_turn_auth_401_without_key_200_with_key(monkeypatch):
     import aihub.chat_api as chat_api
     from aihub import main
@@ -129,9 +128,9 @@ def test_chat_turn_auth_401_without_key_200_with_key(monkeypatch):
             },
         )
         assert missing.status_code == 401
-        assert missing.json() == {"detail": "invalid api key"}
+        assert missing.json()["detail"] == "authentication required"
 
-        ok = client.post(
+        api_key_only = client.post(
             "/chat/turn",
             json={
                 "user_id": "u",
@@ -141,11 +140,9 @@ def test_chat_turn_auth_401_without_key_200_with_key(monkeypatch):
             },
             headers={"x-api-key": "hub-turn-secret"},
         )
-        assert ok.status_code == 200
-        assert ok.json()["ok"] is True
-        assert ok.json()["response_text"] == "ok"
+        assert api_key_only.status_code == 401
 
-        ok_bearer = client.post(
+        bearer_only = client.post(
             "/chat/turn",
             json={
                 "user_id": "u",
@@ -155,12 +152,12 @@ def test_chat_turn_auth_401_without_key_200_with_key(monkeypatch):
             },
             headers={"authorization": "Bearer hub-turn-secret"},
         )
-        assert ok_bearer.status_code == 200
-        assert ok_bearer.json()["ok"] is True
+        assert bearer_only.status_code == 401
 
 
+@pytest.mark.no_auth_injection
 def test_chat_turn_accepts_x_aihub_proxy_token_without_x_api_key(monkeypatch):
-    """BFF may authenticate with X-AIHub-Proxy-Token (same as API_KEY when AIHUB_PROXY_TOKEN unset)."""
+    """Proxy token without signed principal must not unlock user-scoped routes."""
     import aihub.chat_api as chat_api
     from aihub import main
 
@@ -193,7 +190,7 @@ def test_chat_turn_accepts_x_aihub_proxy_token_without_x_api_key(monkeypatch):
         )
         assert bad.status_code == 401
 
-        ok = client.post(
+        proxy_only = client.post(
             "/chat/turn",
             json={
                 "user_id": "u",
@@ -203,12 +200,12 @@ def test_chat_turn_accepts_x_aihub_proxy_token_without_x_api_key(monkeypatch):
             },
             headers={"x-aihub-proxy-token": "shared-hub-secret"},
         )
-        assert ok.status_code == 200
-        assert ok.json()["response_text"] == "proxy-ok"
+        assert proxy_only.status_code == 401
 
 
+@pytest.mark.no_auth_injection
 def test_chat_turn_proxy_token_prefers_aihub_proxy_token_env(monkeypatch):
-    """When AIHUB_PROXY_TOKEN is set, it is the expected proxy header value (not API_KEY)."""
+    """Even valid proxy token cannot substitute session/principal on user routes."""
     import aihub.chat_api as chat_api
     from aihub import main
 
@@ -242,7 +239,7 @@ def test_chat_turn_proxy_token_prefers_aihub_proxy_token_env(monkeypatch):
         )
         assert api_key_as_proxy.status_code == 401
 
-        ok = client.post(
+        proxy_token = client.post(
             "/chat/turn",
             json={
                 "user_id": "u",
@@ -252,4 +249,4 @@ def test_chat_turn_proxy_token_prefers_aihub_proxy_token_env(monkeypatch):
             },
             headers={"x-aihub-proxy-token": "bff-only-secret"},
         )
-        assert ok.status_code == 200
+        assert proxy_token.status_code == 401
