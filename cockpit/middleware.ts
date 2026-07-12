@@ -7,10 +7,11 @@ const PUBLIC_PATHS = new Set(["/login"]);
 const PUBLIC_API_PREFIXES = ["/api/aihub/system/ping", "/api/aihub/auth/login"];
 
 export function buildContentSecurityPolicy(nonce: string): string {
-    return [
+    const isDev = process.env.NODE_ENV === "development";
+    const directives = [
         "default-src 'self'",
-        `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'`,
-        "style-src 'self' 'unsafe-inline'",
+        `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ""}`,
+        `style-src 'self' 'nonce-${nonce}' 'unsafe-inline'`,
         "img-src 'self' data: blob:",
         "media-src 'self' blob:",
         "font-src 'self' data:",
@@ -19,8 +20,14 @@ export function buildContentSecurityPolicy(nonce: string): string {
         "base-uri 'self'",
         "form-action 'self'",
         "frame-ancestors 'none'",
-        "upgrade-insecure-requests",
-    ].join("; ");
+    ];
+    // Opt-in only: on plain HTTP, upgrade-insecure-requests rewrites asset URLs to
+    // https:// while the app serves no TLS — browsers block CSS/JS and /login renders
+    // as unstyled HTML (or a black screen with default black text).
+    if (process.env.AIHUB_CSP_UPGRADE_INSECURE === "1") {
+        directives.push("upgrade-insecure-requests");
+    }
+    return directives.join("; ");
 }
 
 function isPublicPath(pathname: string): boolean {

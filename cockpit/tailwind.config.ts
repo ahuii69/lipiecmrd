@@ -7,6 +7,7 @@ const config: Config = {
         "./components/**/*.{ts,tsx}",
         "./features/**/*.{ts,tsx}",
         "./lib/**/*.{ts,tsx}",
+        "./styles/**/*.{css,ts,tsx}",
     ],
     theme: {
         extend: {
@@ -36,6 +37,20 @@ const config: Config = {
                     DEFAULT: "hsl(var(--destructive))",
                     foreground: "hsl(var(--destructive-foreground))",
                 },
+            },
+            fontFamily: {
+                sans: [
+                    "var(--font-sans)",
+                    "ui-sans-serif",
+                    "system-ui",
+                    "-apple-system",
+                    "BlinkMacSystemFont",
+                    "Segoe UI",
+                    "Roboto",
+                    "Helvetica Neue",
+                    "Arial",
+                    "sans-serif",
+                ],
             },
             borderRadius: {
                 lg: "0.75rem",

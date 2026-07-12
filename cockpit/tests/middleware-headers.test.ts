@@ -7,9 +7,11 @@ describe("dynamic response security headers", () => {
     it("uses a nonce CSP without unsafe-eval", () => {
         const csp = buildContentSecurityPolicy("test-nonce");
         expect(csp).toContain("script-src 'self' 'nonce-test-nonce'");
+        expect(csp).toContain("style-src 'self' 'nonce-test-nonce'");
         expect(csp).toContain("frame-ancestors 'none'");
         expect(csp).toContain("object-src 'none'");
         expect(csp).not.toContain("unsafe-eval");
+        expect(csp).not.toContain("upgrade-insecure-requests");
     });
 
     it.each(["/login"])("marks public %s private and non-cacheable", async (path) => {
