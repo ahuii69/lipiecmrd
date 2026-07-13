@@ -3,8 +3,8 @@
 """TurnOps — composition of stage mixins + turn orchestration."""
 
 from __future__ import annotations
-import json
 
+import json
 from typing import Any
 
 from aihub.chat_contracts import ChatTurnInput, ChatTurnResult
