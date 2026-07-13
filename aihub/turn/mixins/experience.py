@@ -4,7 +4,7 @@ from __future__ import annotations
 import aihub.turn._ops_ns as _ops_ns
 
 # Method bodies resolve names via this module's globals (incl. _names).
-globals().update({k: v for k, v in vars(_ops_ns).items() if k != '__name__'})
+globals().update({k: v for k, v in vars(_ops_ns).items() if not k.startswith('__')})
 TurnOps = None  # late-bound by aihub.turn.ops
 
 class ExperienceMixin:

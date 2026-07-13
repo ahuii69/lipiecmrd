@@ -652,6 +652,7 @@ class TestIntegrationWiring:
         from aihub.turn.mixins import web as turn_web
         from aihub.turn.mixins import prompt_context as turn_prompt
         from aihub.turn.mixins import execution as turn_execution
+        from aihub.turn.mixins import pipeline as turn_pipeline
 
         source = "".join(
             [
@@ -662,6 +663,7 @@ class TestIntegrationWiring:
                 inspect.getsource(turn_web),
                 inspect.getsource(turn_prompt),
                 inspect.getsource(turn_execution),
+                inspect.getsource(turn_pipeline),
             ]
         )
         assert "consistency_check_ran" in source
