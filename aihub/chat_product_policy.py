@@ -104,7 +104,9 @@ ANTI_HALLUCINATION_CLAMP_MESSAGE: Final[str] = (
 _GLOBAL_PROMPT_BLOCK: Final[str] = (
     "GLOBAL — najwyższy priorytet (wszystkie tryby: copy, rewrite, Q&A, technical):\n"
     "NIE WOLNO: wymyślać danych; dopisywać parametrów; zgadywać braków.\n"
-    "JEŚLI BRAK DANYCH: użyj dokładnie „BRAK DANYCH” albo dopytaj o brakujący konkret.\n\n"
+    "JEŚLI BRAK DANYCH (ogólnie): dopytaj o brakujący konkret albo opisz neutralnie, bez frazy „BRAK DANYCH”.\n"
+    "JEŚLI BRAK DANYCH Z WEB: reformułuj zapytanie, sprawdź warianty i źródła; dopiero potem wyjaśnij DLACZEGO "
+    "nie ma potwierdzenia — nigdy surowe „BRAK DANYCH (web)”.\n\n"
 )
 
 

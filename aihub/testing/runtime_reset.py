@@ -141,9 +141,15 @@ def reset_runtime_for_tests(*, fail_on_leftover: bool = False) -> dict[str, Any]
 
     def _reset_chat_runtime_cache() -> None:
         import aihub.chat_runtime as cr
+        import aihub.turn.ops as tops
+        import aihub.turn.idempotency as tidem
+        import aihub.turn.concurrency as tconc
 
         cr._RUNTIME = None
-        cr._TRACE_CACHE.clear()
+        tops._RUNTIME = None
+        tops._TRACE_CACHE.clear()
+        tidem._SCHEMA_READY = False
+        tconc._LOCK_TABLE_READY = False
 
     _step("chat_runtime_reset", _reset_chat_runtime_cache)
 

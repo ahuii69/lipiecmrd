@@ -18,6 +18,7 @@ import { useMemo } from "react";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Progress } from "@/components/ui/progress";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
 import { EmptyState } from "@/features/shared/empty-state";
@@ -405,14 +406,12 @@ export function OverviewPanel() {
                                             )}
                                         </div>
                                         {vm.selectedGoalProgress != null && (
-                                            <div className="h-1.5 w-full rounded-full bg-muted">
-                                                <div
-                                                    className="h-full rounded-full bg-emerald-500"
-                                                    style={{
-                                                        width: `${Math.round(vm.selectedGoalProgress * 100)}%`,
-                                                    }}
-                                                />
-                                            </div>
+                                            <Progress
+                                                value={Math.round(
+                                                    vm.selectedGoalProgress * 100,
+                                                )}
+                                                className="h-1.5"
+                                            />
                                         )}
                                     </div>
                                 ) : (

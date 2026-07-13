@@ -131,25 +131,57 @@ describe("cockpit-store — server-backed transcript", () => {
         expect(n1).toBe(n0 + 1);
     });
 
-    it("ensureUserScope czyści legacy default-user cache", () => {
-        localStorage.removeItem("aihub-cockpit-user-scope-v1");
+    it("bindAuthPrincipal ustawia principal.user_id i czyści legacy random scope", () => {
+        localStorage.setItem("aihub-cockpit-user-scope-v1", "u_deadbeef_old");
         useCockpitStore.setState((st) => ({
+            authUserId: null,
             sessions: st.sessions.map((s, i) =>
                 i === 0
                     ? {
                           ...s,
-                          userId: "default",
-                          title: "Stara sesja globalna",
+                          userId: "u_deadbeef_old",
+                          title: "Stara sesja",
                       }
                     : s,
             ),
         }));
-        const scoped = useCockpitStore.getState().ensureUserScope();
-        expect(scoped).not.toBe("default");
+        const principalId = "afec6ec8-a1d6-40a3-b28d-90fad20aadc8";
+        const bound = useCockpitStore.getState().bindAuthPrincipal(principalId);
+        expect(bound).toBe(principalId);
+        expect(useCockpitStore.getState().authUserId).toBe(principalId);
         const after = useCockpitStore.getState().sessions;
-        expect(after).toHaveLength(1);
-        expect(after[0].userId).toBe(scoped);
-        expect(after[0].title).toBe("Nowa rozmowa");
+        expect(after.every((s) => s.userId === principalId)).toBe(true);
+        expect(localStorage.getItem("aihub-cockpit-user-scope-v1")).toBeNull();
+    });
+
+    it("ensureUserScope bez authUserId nie generuje losowego user_id", () => {
+        useCockpitStore.setState({ authUserId: null });
+        localStorage.removeItem("aihub-cockpit-user-scope-v1");
+        const scoped = useCockpitStore.getState().ensureUserScope();
+        expect(scoped).toBe("default");
+        expect(localStorage.getItem("aihub-cockpit-user-scope-v1")).toBeNull();
+    });
+
+    it("createSession dziedziczy authUserId, nie localStorage", () => {
+        const principalId = "11111111-2222-3333-4444-555555555555";
+        useCockpitStore.getState().bindAuthPrincipal(principalId);
+        useCockpitStore.setState((st) => ({
+            sessions: st.sessions.map((s) => ({
+                ...s,
+                messages: [
+                    {
+                        id: "u1",
+                        role: "user",
+                        content: "hi",
+                        createdAt: 1,
+                    },
+                ],
+                title: "Zajęta",
+            })),
+        }));
+        useCockpitStore.getState().createSession();
+        const sessions = useCockpitStore.getState().sessions;
+        expect(sessions.every((s) => s.userId === principalId)).toBe(true);
     });
 
     it("nie przyjmuje ani nie utrwala klucza API w przeglądarce", async () => {

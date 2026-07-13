@@ -1566,6 +1566,18 @@ def init_db() -> None:
         _log_active_stack_migration(apply_active_stack_migrations_to_connection(con))
         con.commit()
 
+    # Turn execution / idempotency / outbox (always ensure after core schema)
+    try:
+        from aihub.turn.idempotency import ensure_turn_schema
+        from aihub.turn.concurrency import ensure_lock_schema
+        from aihub.durable_jobs import ensure_schema as ensure_durable_jobs_schema
+
+        ensure_turn_schema()
+        ensure_lock_schema()
+        ensure_durable_jobs_schema()
+    except Exception:
+        logger.exception("turn/durable schema ensure failed")
+
 
 def now_ts() -> float:
     return time.time()

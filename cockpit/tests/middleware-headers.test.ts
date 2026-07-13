@@ -7,7 +7,9 @@ describe("dynamic response security headers", () => {
     it("uses a nonce CSP without unsafe-eval", () => {
         const csp = buildContentSecurityPolicy("test-nonce");
         expect(csp).toContain("script-src 'self' 'nonce-test-nonce'");
-        expect(csp).toContain("style-src 'self' 'nonce-test-nonce'");
+        expect(csp).toContain("strict-dynamic");
+        expect(csp).toContain("style-src 'self' 'unsafe-inline'");
+        expect(csp).not.toMatch(/style-src[^;]*'nonce-/);
         expect(csp).toContain("frame-ancestors 'none'");
         expect(csp).toContain("object-src 'none'");
         expect(csp).not.toContain("unsafe-eval");

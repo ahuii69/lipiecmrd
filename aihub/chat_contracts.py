@@ -74,6 +74,17 @@ class ChatTurnInput(BaseModel):
         default=False,
         description="True gdy treść usera weszła z dyktowania (STT) — chip stt-input.",
     )
+    # Canonical turn identity / idempotency (optional; server generates when absent)
+    turn_id: Optional[str] = Field(default=None, max_length=128)
+    idempotency_key: Optional[str] = Field(default=None, max_length=256)
+    request_id: Optional[str] = Field(default=None, max_length=128)
+    correlation_id: Optional[str] = Field(default=None, max_length=128)
+    # Trusted runtime mode — NEVER derived from user_id/message.
+    # Distinct from decision_core["execution_mode"] (direct/planner/agentic).
+    runtime_mode: Optional[Literal["production", "test", "audit"]] = Field(
+        default=None,
+        description="Trusted runtime mode; audit disables write-backs.",
+    )
 
 
 class ChatTurnContext(BaseModel):

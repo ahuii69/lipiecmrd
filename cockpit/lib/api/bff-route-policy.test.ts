@@ -28,4 +28,9 @@ describe("bff route policy", () => {
     it("classifies admin schema health as admin-scoped", () => {
         expect(classifyBffRoute("GET", "/cockpit/schema-health")).toBe("admin");
     });
+
+    it("allows bootstrap register and registration-status anonymously", () => {
+        expect(classifyBffRoute("POST", "/auth/register")).toBe("public");
+        expect(classifyBffRoute("GET", "/auth/registration-status")).toBe("public");
+    });
 });

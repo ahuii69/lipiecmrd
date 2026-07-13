@@ -646,8 +646,24 @@ class TestIntegrationWiring:
         import inspect
 
         from aihub import chat_runtime
+        from aihub.turn import ops as turn_ops
+        from aihub.turn.mixins import decision as turn_decision
+        from aihub.turn.mixins import experience as turn_experience
+        from aihub.turn.mixins import web as turn_web
+        from aihub.turn.mixins import prompt_context as turn_prompt
+        from aihub.turn.mixins import execution as turn_execution
 
-        source = inspect.getsource(chat_runtime)
+        source = "".join(
+            [
+                inspect.getsource(chat_runtime),
+                inspect.getsource(turn_ops),
+                inspect.getsource(turn_decision),
+                inspect.getsource(turn_experience),
+                inspect.getsource(turn_web),
+                inspect.getsource(turn_prompt),
+                inspect.getsource(turn_execution),
+            ]
+        )
         assert "consistency_check_ran" in source
         assert "reflection_ran" in source
         assert "policy_hints_loaded" in source

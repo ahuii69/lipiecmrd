@@ -4,7 +4,7 @@ import {
     clearDraftAttachments,
     readyDraftFileIds,
 } from "@/lib/chat/draft-attachments";
-import type { UserDraftAttachment } from "@/features/user-chat/user-message-composer";
+import type { ChatDraftAttachment as UserDraftAttachment } from "@/features/chat/ChatComposer";
 import { resolveAttachedFileIdsForSend } from "@/lib/chat/resolve-attached-file-ids";
 
 function draft(

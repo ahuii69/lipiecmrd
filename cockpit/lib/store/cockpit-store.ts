@@ -72,6 +72,8 @@ interface CockpitState {
     selectedMessageId?: string;
     inspectorOpen: boolean;
     apiKeyOverride: string;
+    /** Authenticated principal.user_id — sole identity source after login. */
+    authUserId: string | null;
 
     setSection: (section: CockpitSection) => void;
     createSession: () => void;
@@ -116,6 +118,12 @@ interface CockpitState {
     selectMessage: (id?: string) => void;
     setInspectorOpen: (open: boolean) => void;
     setApiKeyOverride: (value: string) => void;
+    /**
+     * Bind all session scopes to principal.user_id from GET /auth/me.
+     * Clears legacy random localStorage user ids that caused ownership 403.
+     */
+    bindAuthPrincipal: (userId: string) => string;
+    /** @deprecated Use bindAuthPrincipal — kept as alias for gradual migration. */
     ensureUserScope: () => string;
     retryPayloadForLastFailedMessage: (sessionId: string) => string | null;
 }
@@ -152,21 +160,25 @@ const sections: CockpitSection[] = [
  * processes (Node vs browser) and cause hydration mismatches.
  */
 const INITIAL_SESSION_ID = "s_initial";
-const USER_SCOPE_KEY = "aihub-cockpit-user-scope-v1";
+/** Legacy key that generated random u_* ids — causes ownership 403 vs auth principal. */
+const LEGACY_USER_SCOPE_KEY = "aihub-cockpit-user-scope-v1";
 
-function resolveScopedUserIdFromStorage(): string {
+function clearLegacyUserScopeStorage(): void {
     const g = globalThis as unknown as { localStorage?: Storage };
     const ls = g.localStorage;
-    if (!ls) return "default";
+    if (!ls) return;
     try {
-        const existing = (ls.getItem(USER_SCOPE_KEY) || "").trim();
-        if (existing.length >= 8) return existing;
-        const next = `u_${Math.random().toString(16).slice(2, 10)}_${Date.now().toString(36)}`;
-        ls.setItem(USER_SCOPE_KEY, next);
-        return next;
+        ls.removeItem(LEGACY_USER_SCOPE_KEY);
     } catch {
-        return "default";
+        // ignore quota / private mode
     }
+}
+
+function isPlaceholderUserId(userId: string | null | undefined): boolean {
+    const value = (userId || "").trim();
+    if (!value || value === "default" || value === "test-user") return true;
+    if (value.startsWith("u_") && value.includes("_")) return true;
+    return false;
 }
 
 function createInitialSession(idx = 1, userId = "default"): SessionState {
@@ -229,6 +241,7 @@ export const useCockpitStore = create<CockpitState>()(
                 activeSessionId: initial.id,
                 inspectorOpen: false,
                 apiKeyOverride: "",
+                authUserId: null,
 
                 setSection: (section) => set({ currentSection: section }),
 
@@ -248,8 +261,11 @@ export const useCockpitStore = create<CockpitState>()(
                             };
                         }
                         const uid =
+                            state.authUserId ||
                             state.sessions.find((s) => s.id === state.activeSessionId)
-                                ?.userId || state.sessions[0]?.userId || "default";
+                                ?.userId ||
+                            state.sessions[0]?.userId ||
+                            "default";
                         const next = createInitialSession(state.sessions.length + 1, uid);
                         return {
                             sessions: [next, ...state.sessions],
@@ -584,23 +600,48 @@ export const useCockpitStore = create<CockpitState>()(
 
                 setApiKeyOverride: () => set({ apiKeyOverride: "" }),
 
-                ensureUserScope: () => {
-                    const scoped = resolveScopedUserIdFromStorage();
-                    if (scoped === "default") return "default";
+                bindAuthPrincipal: (userId) => {
+                    const principalId = (userId || "").trim();
+                    if (!principalId || isPlaceholderUserId(principalId)) {
+                        throw new Error("bindAuthPrincipal requires principal.user_id");
+                    }
+                    clearLegacyUserScopeStorage();
                     set((state) => {
-                        const hasLegacy = state.sessions.some(
-                            (s) => (s.userId || "default") === "default",
+                        const mismatched = state.sessions.some(
+                            (s) => (s.userId || "").trim() !== principalId,
                         );
-                        if (!hasLegacy) return {};
-                        // Security-first: clear potentially contaminated "default" cache.
-                        const seed = createInitialSession(1, scoped);
+                        if (!mismatched && state.authUserId === principalId) {
+                            return {};
+                        }
+                        // Drop foreign/legacy scoped sessions — ownership would 403.
+                        const owned = state.sessions.filter(
+                            (s) => (s.userId || "").trim() === principalId,
+                        );
+                        const sessions =
+                            owned.length > 0
+                                ? owned.map((s) => ({ ...s, userId: principalId }))
+                                : [createInitialSession(1, principalId)];
+                        const activeSessionId = sessions.some(
+                            (s) => s.id === state.activeSessionId,
+                        )
+                            ? state.activeSessionId
+                            : sessions[0].id;
                         return {
-                            sessions: [seed],
-                            activeSessionId: seed.id,
+                            authUserId: principalId,
+                            sessions,
+                            activeSessionId,
                             selectedMessageId: undefined,
                         };
                     });
-                    return scoped;
+                    return principalId;
+                },
+
+                ensureUserScope: () => {
+                    const authUserId = get().authUserId;
+                    if (authUserId && !isPlaceholderUserId(authUserId)) {
+                        return get().bindAuthPrincipal(authUserId);
+                    }
+                    return "default";
                 },
 
                 retryPayloadForLastFailedMessage: (sessionId) => {
@@ -614,7 +655,7 @@ export const useCockpitStore = create<CockpitState>()(
         },
         {
             name: "aihub-cockpit-store",
-            version: 6,
+            version: 7,
             skipHydration: true,
             storage: createJSONStorage(() => localStorage),
             /** Transkrypt czatu = backend (GET history); tu tylko metadane sesji — brak „fanfiku” w localStorage. */
@@ -625,6 +666,7 @@ export const useCockpitStore = create<CockpitState>()(
                     messages: [],
                 })),
                 activeSessionId: state.activeSessionId,
+                authUserId: state.authUserId,
             }),
             migrate: (persistedState, oldVersion) => {
                 const state = persistedState as
@@ -645,6 +687,12 @@ export const useCockpitStore = create<CockpitState>()(
                     sessions = sessions.map((s) => ({ ...s, messages: [] }));
                 }
 
+                // v7: drop random localStorage user scopes — wait for auth/me bind.
+                if (oldVersion < 7) {
+                    clearLegacyUserScopeStorage();
+                    sessions = [createInitialSession(1, "default")];
+                }
+
                 const activeSessionId = sessions.some(
                     (s) => s.id === state.activeSessionId,
                 )
@@ -656,6 +704,12 @@ export const useCockpitStore = create<CockpitState>()(
                     sessions,
                     activeSessionId,
                     apiKeyOverride: "",
+                    authUserId:
+                        oldVersion < 7
+                            ? null
+                            : typeof state.authUserId === "string"
+                              ? state.authUserId
+                              : null,
                 };
             },
             merge: (persistedState, currentState) => {
@@ -678,12 +732,11 @@ export const useCockpitStore = create<CockpitState>()(
                     ? (persisted.activeSessionId as string)
                     : sessions[0].id;
 
-                const rawOverride = persisted.apiKeyOverride;
-                const apiKeyOverride =
-                    typeof rawOverride === "string" &&
-                    rawOverride.trim().length > 0
-                        ? rawOverride.trim()
-                        : "";
+                const authUserId =
+                    typeof persisted.authUserId === "string" &&
+                    !isPlaceholderUserId(persisted.authUserId)
+                        ? persisted.authUserId.trim()
+                        : null;
 
                 return {
                     ...currentState,
@@ -691,7 +744,8 @@ export const useCockpitStore = create<CockpitState>()(
                     sessions,
                     activeSessionId,
                     selectedMessageId: undefined,
-                    apiKeyOverride,
+                    apiKeyOverride: "",
+                    authUserId,
                 };
             },
         },

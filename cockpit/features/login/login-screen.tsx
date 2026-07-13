@@ -47,7 +47,7 @@ export function LoginScreen() {
                             <p className="text-sm font-black tracking-tight text-neutral-50">
                                 AI-Hub
                             </p>
-                            <p className="text-xs text-neutral-500">Cockpit · Memory V2</p>
+                            <p className="text-xs text-neutral-500">AI operating system</p>
                         </div>
                     </div>
 

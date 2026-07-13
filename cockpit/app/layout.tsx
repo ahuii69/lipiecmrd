@@ -4,6 +4,7 @@ import { Inter } from "next/font/google";
 import { headers } from "next/headers";
 
 import { AppQueryProvider } from "@/lib/query/query-provider";
+import { StoreRehydrator } from "@/components/layout/store-rehydrator";
 import "@/styles/globals.css";
 
 const inter = Inter({
@@ -45,7 +46,9 @@ export default async function RootLayout({
     return (
         <html lang="pl" className={`dark ${inter.variable}`}>
             <body className="min-h-[100dvh] font-sans antialiased">
-                <AppQueryProvider>{children}</AppQueryProvider>
+                <AppQueryProvider>
+                    <StoreRehydrator>{children}</StoreRehydrator>
+                </AppQueryProvider>
             </body>
         </html>
     );

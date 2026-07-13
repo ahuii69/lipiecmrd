@@ -21,7 +21,7 @@ def persist_chat_turn_messages(
 ) -> None:
     """Zapisz parę user+asystent po turze (gdy jest treść usera)."""
     uid = (turn.user_id or "").strip() or "default"
-    if uid.startswith("audit_"):
+    if str(getattr(turn, "runtime_mode", "") or "").lower() == "audit":
         return
     sid = (turn.session_id or "").strip() or "default"
     user_text = (turn.message or "").strip()

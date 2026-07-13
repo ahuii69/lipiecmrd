@@ -509,14 +509,16 @@ def test_build_system_prompt_first_turn_vs_continuation():
     assert "kontynuacja" in cont
     assert "nie otwieraj od nowego przywitania" in cont.lower()
     assert "mordzix" in first.lower()
-    # 06.07 response-quality fix: persona is a rzeczowy assistant, NOT a personified "ziomek".
+    # Conversation-layer persona: intelligent partner, not helpdesk / not fake-human "ziomek".
     assert "rozgarnięty ziomek" not in first.lower()
-    assert "rzeczowy asystent" in first.lower()
-    assert "nie udajesz człowieka" in first.lower()
-    # Hard anti-personification contract must be present.
+    assert "inteligentny partner" in first.lower()
+    assert "nie udajesz człowieka" in first.lower() or "bez udawania człowieka" in first.lower() or "nie udawaj człowieka" in first.lower()
     low_first = first.lower()
     assert "kontrakt persony" in low_first
     assert "zakaz fałszywej biografii" in low_first
+    assert "zakaz helpdesk" in low_first or "zakaz fraz helpdesk" in low_first
+    assert "w czym mogę pomóc" in low_first  # banned phrase must be listed
+    assert "proaktywny" in low_first
 
 
 def test_build_system_prompt_listing_sales_has_no_hallucination_guard():
@@ -686,18 +688,19 @@ def test_local_guardrail_image_attachment_suppresses_web_forcing() -> None:
     assert dc["web_decision"] == "off"
 
 
-def test_web_required_ungrounded_message_is_brak_danych_web() -> None:
+def test_web_required_ungrounded_message_is_explanatory_not_brak_danych_web() -> None:
     from aihub.chat_runtime import ChatRuntime
 
     rt = ChatRuntime()
-    assert (
-        rt._web_required_ungrounded_user_message(
-            outcome="empty_results",
-            controlled_web={"tool_name": "research.query"},
-            errors=[],
-        )
-        == "BRAK DANYCH (web)"
+    msg = rt._web_required_ungrounded_user_message(
+        outcome="empty_results",
+        controlled_web={"tool_name": "research.query", "query": "Francja Belgia wynik"},
+        errors=[],
     )
+    low = msg.lower()
+    assert "brak danych" not in low
+    assert "przeszukałem" in low or "źródł" in low
+    assert "francja belgia" in low or "ponownie" in low
 
 
 def test_chat_runtime_count_web_sources_unwraps_fetch_tool_envelope():
@@ -1028,7 +1031,10 @@ async def test_chat_runtime_web_required_fails_explicitly_when_results_empty(
     assert out.trace.get("web_prefetch_executed") is True
     assert out.trace.get("web_continued_after_required_without_prefetch") is False
     assert "prefetch_triggered_no_verified" in (out.trace.get("route_reason") or "")
-    assert out.response_text == "BRAK DANYCH (web)"
+    assert "brak danych" not in (out.response_text or "").lower()
+    assert "przeszukałem" in (out.response_text or "").lower() or "źródł" in (
+        out.response_text or ""
+    ).lower()
     assert out.trace.get("web_used") is False
     assert int(out.trace.get("sources_count") or 0) == 0
     assert "0 wyników" in (out.trace.get("web_fail_detail") or "")

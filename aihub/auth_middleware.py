@@ -38,7 +38,7 @@ _ADMIN_PREFIXES = (
 
 
 def _is_public_path(path: str) -> bool:
-    if path in {"/auth/login"}:
+    if path in {"/auth/login", "/auth/register", "/auth/registration-status"}:
         return True
     return starts_with_any(path, NO_AUTH_PATHS)
 

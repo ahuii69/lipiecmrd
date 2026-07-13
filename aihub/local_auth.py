@@ -10,6 +10,7 @@ import re
 import secrets
 import time
 import uuid
+from contextlib import suppress
 from dataclasses import dataclass
 from typing import Any
 
@@ -140,10 +141,27 @@ def ensure_auth_schema() -> None:
     )
 
 
+class RegistrationClosedError(RuntimeError):
+    """Raised when bootstrap registration is no longer available."""
+
+
+class UsernameTakenError(RuntimeError):
+    """Raised when the requested username already exists."""
+
+
+class WeakPasswordError(ValueError):
+    """Raised when a password fails local policy checks."""
+
+
 def account_count() -> int:
     ensure_auth_schema()
     row = fetch_one("SELECT COUNT(*) AS n FROM auth_accounts")
     return int(row["n"] if row else 0)
+
+
+def registration_open() -> bool:
+    """Bootstrap registration is open only while no local accounts exist."""
+    return account_count() == 0
 
 
 def auth_required() -> bool:
@@ -151,6 +169,11 @@ def auth_required() -> bool:
     if configured:
         return configured in {"1", "true", "yes", "on"}
     return is_production() or account_count() > 0
+
+
+def _validate_password(password: str) -> None:
+    if len(password or "") < 12:
+        raise WeakPasswordError("password must contain at least 12 characters")
 
 
 def create_account(
@@ -165,8 +188,7 @@ def create_account(
     """Create one local account; there is deliberately no implicit default user."""
     ensure_auth_schema()
     normalized = _normalize_username(username)
-    if len(password or "") < 12:
-        raise ValueError("password must contain at least 12 characters")
+    _validate_password(password)
     if role not in ACCOUNT_ROLES:
         raise ValueError(f"unsupported role: {role}")
     if status not in ACCOUNT_STATUSES:
@@ -177,23 +199,29 @@ def create_account(
     if not aid or not tid:
         raise ValueError("account_id and tenant_id must not be empty")
     now = time.time()
-    exec_one(
-        """
-        INSERT INTO auth_accounts(
-            id, username, password_hash, tenant_id, role, status, created_at, updated_at
-        ) VALUES(?,?,?,?,?,?,?,?)
-        """,
-        (
-            aid,
-            normalized,
-            _PASSWORD_HASHER.hash(password),
-            tid,
-            role,
-            status,
-            now,
-            now,
-        ),
-    )
+    try:
+        exec_one(
+            """
+            INSERT INTO auth_accounts(
+                id, username, password_hash, tenant_id, role, status, created_at, updated_at
+            ) VALUES(?,?,?,?,?,?,?,?)
+            """,
+            (
+                aid,
+                normalized,
+                _PASSWORD_HASHER.hash(password),
+                tid,
+                role,
+                status,
+                now,
+                now,
+            ),
+        )
+    except Exception as exc:
+        message = str(exc).lower()
+        if "unique" in message or "duplicate" in message:
+            raise UsernameTakenError("username already exists") from exc
+        raise
     return {
         "id": aid,
         "user_id": aid,
@@ -201,6 +229,72 @@ def create_account(
         "tenant_id": tid,
         "role": role,
         "status": status,
+    }
+
+
+def create_bootstrap_admin(*, username: str, password: str) -> dict[str, Any]:
+    """Create the first local admin account while the auth store is empty.
+
+    Atomic under the DB lock: concurrent callers lose with RegistrationClosedError
+    once any account exists. There is no ENV auto-seed; this is the intentional
+    single-operator bootstrap path.
+    """
+    from aihub.db import _DB_LOCK, _conn
+
+    ensure_auth_schema()
+    normalized = _normalize_username(username)
+    _validate_password(password)
+    aid = str(uuid.uuid4())
+    now = time.time()
+    password_hash = _PASSWORD_HASHER.hash(password)
+
+    with _DB_LOCK, _conn() as con:
+        row = con.execute("SELECT COUNT(*) AS n FROM auth_accounts").fetchone()
+        if row is None:
+            count = 0
+        elif isinstance(row, dict):
+            count = int(row.get("n") or 0)
+        else:
+            try:
+                count = int(row["n"])
+            except (KeyError, TypeError, IndexError):
+                count = int(row[0])
+        if count > 0:
+            raise RegistrationClosedError("registration closed")
+        try:
+            con.execute(
+                """
+                INSERT INTO auth_accounts(
+                    id, username, password_hash, tenant_id, role, status, created_at, updated_at
+                ) VALUES(?,?,?,?,?,?,?,?)
+                """,
+                (
+                    aid,
+                    normalized,
+                    password_hash,
+                    aid,
+                    "admin",
+                    "active",
+                    now,
+                    now,
+                ),
+            )
+            con.commit()
+        except Exception as exc:
+            with suppress(Exception):
+                con.rollback()
+            message = str(exc).lower()
+            if "unique" in message or "duplicate" in message:
+                raise UsernameTakenError("username already exists") from exc
+            raise
+
+    return {
+        "id": aid,
+        "user_id": aid,
+        "username": normalized,
+        "tenant_id": aid,
+        "role": "admin",
+        "status": "active",
     }
 
 
@@ -351,6 +445,8 @@ _RESERVED_PATH_USER_SEGMENTS = frozenset(
         "ready",
         "login",
         "logout",
+        "register",
+        "registration-status",
         "me",
         "item",
         "index-jobs",

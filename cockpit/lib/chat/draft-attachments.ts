@@ -6,12 +6,23 @@
  * from message history (see resolve-attached-file-ids.ts).
  */
 
-import type { UserDraftAttachment } from "@/features/user-chat/user-message-composer";
+export interface DraftAttachment {
+    key: string;
+    fileId?: string;
+    filename: string;
+    status: "uploading" | "ready" | "error";
+    error?: string;
+    kind?: "text" | "image";
+    previewUrl?: string;
+}
+
+/** @deprecated Prefer DraftAttachment — kept for existing imports. */
+export type UserDraftAttachment = DraftAttachment;
 
 /** Revoke preview object URLs and return an empty draft list. */
 export function clearDraftAttachments(
-    draft: UserDraftAttachment[],
-): UserDraftAttachment[] {
+    draft: DraftAttachment[],
+): DraftAttachment[] {
     for (const f of draft) {
         if (f.previewUrl) {
             URL.revokeObjectURL(f.previewUrl);
@@ -21,7 +32,7 @@ export function clearDraftAttachments(
 }
 
 /** Ready file ids from the current draft (upload finished, has server file_id). */
-export function readyDraftFileIds(draft: UserDraftAttachment[]): string[] {
+export function readyDraftFileIds(draft: DraftAttachment[]): string[] {
     return draft
         .filter(
             (f) =>

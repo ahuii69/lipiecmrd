@@ -11,6 +11,14 @@
       "path": "/auth/login"
     },
     {
+      "method": "POST",
+      "path": "/auth/register"
+    },
+    {
+      "method": "GET",
+      "path": "/auth/registration-status"
+    },
+    {
       "method": "GET",
       "path": "/auth/me"
     },

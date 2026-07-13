@@ -13,6 +13,8 @@ export type BffRouteClass = "public" | "user" | "admin" | "deny";
 const PUBLIC_EXACT = new Set<string>([
     "GET /system/ping",
     "POST /auth/login",
+    "POST /auth/register",
+    "GET /auth/registration-status",
     "GET /ops/ready",
     "GET /ops/health",
 ]);

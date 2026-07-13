@@ -81,7 +81,7 @@ def record_user_correction_turn(turn: Any) -> dict[str, Any]:
 
     out: dict[str, Any] = {"recorded": False, "kind": None, "durable": False}
 
-    if uid.startswith("audit_"):
+    if str(getattr(turn, "runtime_mode", "") or "").lower() == "audit":
         return out
 
     det = detect_user_correction(msg)
@@ -114,7 +114,9 @@ def build_correction_hints_for_prompt(user_id: str, session_id: str) -> str:
     """Skrót korekt do sekcji system (sesja + trwałe)."""
     uid = str(user_id or "")
     sid = str(session_id or "")
-    if uid.startswith("audit_"):
+    # Audit mode is explicit on the turn; this helper has no turn object — never
+    # skip by user_id prefix (removed audit_* production hook).
+    if not uid:
         return ""
 
     rows = fetch_recent_events_by_type(uid, EVENT_TYPE, limit=48)

@@ -1,3 +1,4 @@
+import { Progress } from "@/components/ui/progress";
 import { cn } from "@/lib/utils";
 
 export function GoalProgress({
@@ -14,12 +15,7 @@ export function GoalProgress({
 
     return (
         <div className={cn("space-y-1", className)}>
-            <div className="h-2 w-full overflow-hidden rounded bg-muted">
-                <div
-                    className="h-full bg-primary transition-all"
-                    style={{ width: `${clamped * 100}%` }}
-                />
-            </div>
+            <Progress value={clamped * 100} />
             <p className="text-[11px] text-muted-foreground">
                 progress {(clamped * 100).toFixed(0)}%
             </p>

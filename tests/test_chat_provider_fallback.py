@@ -76,7 +76,8 @@ async def test_chat_runtime_provider_failure_uses_canonical_fallback(monkeypatch
     )
 
     assert out.response_text == dry_fallback_response(user_message="hej")
-    assert "nie mam teraz pełnej odpowiedzi z modelu" in out.response_text
+    assert "konkret" in out.response_text.lower()
+    assert "w czym mogę pomóc" not in out.response_text.lower()
     assert not contains_persona_leakage(out.response_text)
     for token in ("kawa", "kawą", "żyję", "poezj", "nudę"):
         assert token not in out.response_text.lower()

@@ -923,7 +923,9 @@ def select_strategy(
     }
 
     uid_clean = (user_id or "").strip()
-    if not uid_clean or uid_clean.startswith("audit_"):
+    # Bias skip for empty user only — audit mode is handled by TurnApplicationService
+    # via execution_mode, never via user_id prefix.
+    if not uid_clean:
         bias_map = dict(_ZERO_CONFIDENCE_BIAS)
         bias_load_source = "default"
     else:

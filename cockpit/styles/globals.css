@@ -4,24 +4,61 @@
 
 @layer base {
     :root {
-        --background: 0 0% 4%;
-        --foreground: 0 0% 96%;
-        --card: 0 0% 7%;
-        --card-foreground: 0 0% 96%;
-        --muted: 0 0% 12%;
-        --muted-foreground: 0 0% 56%;
+        /* AI-OS surfaces */
+        --aios-bg: #07090c;
+        --aios-bg-elevated: #0c1016;
+        --aios-surface: rgba(16, 22, 30, 0.72);
+        --aios-surface-strong: rgba(18, 26, 36, 0.92);
+        --aios-border: rgba(255, 255, 255, 0.08);
+        --aios-border-strong: rgba(255, 255, 255, 0.14);
+        --aios-text: #f3f6fa;
+        --aios-text-muted: #8b97a8;
+        --aios-text-dim: #5c6878;
+        --aios-emerald: #34d399;
+        --aios-emerald-soft: rgba(52, 211, 153, 0.14);
+        --aios-cyan: #22d3ee;
+        --aios-cyan-soft: rgba(34, 211, 238, 0.12);
+        --aios-violet: #a78bfa;
+        --aios-violet-soft: rgba(167, 139, 250, 0.12);
+        --aios-glass: blur(18px);
+        --aios-radius-composer: 1.75rem;
+        --aios-stage-max: 46rem;
+        --aios-stage-gutter: clamp(1rem, 4vw, 3.5rem);
+        --aios-rail: 16rem;
+        --aios-rail-collapsed: 3.75rem;
+        --aios-font-display: var(--font-sans), ui-sans-serif, system-ui, sans-serif;
+        --aios-font-mono: ui-monospace, "SF Mono", "Cascadia Code", "Segoe UI Mono", monospace;
+        --aios-msg-user-bg: rgba(255, 255, 255, 0.06);
+        --aios-msg-assistant-hover: rgba(255, 255, 255, 0.025);
+        --aios-glow-emerald: rgba(52, 211, 153, 0.35);
+        --aios-glow-cyan: rgba(34, 211, 238, 0.2);
+
+        --background: 220 20% 4%;
+        --foreground: 210 20% 96%;
+        --card: 215 18% 7%;
+        --card-foreground: 210 20% 96%;
+        --muted: 215 14% 12%;
+        --muted-foreground: 215 10% 56%;
         --accent: 156 66% 14%;
         --accent-foreground: 156 72% 86%;
-        --border: 0 0% 18%;
-        --input: 0 0% 18%;
+        --border: 215 12% 16%;
+        --input: 215 12% 16%;
         --ring: 156 72% 54%;
-        --primary: 0 0% 96%;
-        --primary-foreground: 0 0% 5%;
+        --primary: 210 20% 96%;
+        --primary-foreground: 220 20% 5%;
         --destructive: 0 72% 50%;
         --destructive-foreground: 0 0% 98%;
+
+        /* Chat V3 — spec 13.07 */
+        --chat-bg: #090A0C;
+        --chat-text: #F4F4F5;
+        --chat-text-muted: #A1A1AA;
+        --chat-border: rgba(255, 255, 255, 0.08);
+        --chat-accent: #22C55E;
+        --chat-accent-alt: #2DD4BF;
     }
     * { box-sizing: border-box; }
-    html, body { height: 100%; min-height: 100%; background: #0a0a0a; color: #f5f5f5; }
+    html, body { height: 100%; min-height: 100%; background: var(--aios-bg); color: var(--aios-text); }
     html { overflow: hidden; }
     body {
         margin: 0;
@@ -35,7 +72,139 @@
     textarea, input, select { font-size: 16px; }
     ::selection { background: rgba(110, 231, 183, 0.28); color: #ffffff; }
 }
-@layer utilities { .text-balance { text-wrap: balance; } .text-pretty { text-wrap: pretty; } }
+
+@layer utilities {
+    .text-balance { text-wrap: balance; }
+    .text-pretty { text-wrap: pretty; }
+    .aios-glass {
+        background: var(--aios-surface);
+        backdrop-filter: var(--aios-glass);
+        -webkit-backdrop-filter: var(--aios-glass);
+        border: 1px solid var(--aios-border);
+    }
+    .aios-ambient {
+        background:
+            radial-gradient(ellipse 90% 55% at 50% -20%, rgba(52, 211, 153, 0.09), transparent 55%),
+            radial-gradient(ellipse 50% 35% at 100% 0%, rgba(34, 211, 238, 0.06), transparent 50%),
+            radial-gradient(ellipse 45% 30% at 0% 100%, rgba(167, 139, 250, 0.05), transparent 45%),
+            var(--aios-bg);
+    }
+    .aios-stage-gutter {
+        padding-left: var(--aios-stage-gutter);
+        padding-right: var(--aios-stage-gutter);
+    }
+    .aios-composer-shell {
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(12, 16, 22, 0.88);
+        backdrop-filter: blur(24px);
+        -webkit-backdrop-filter: blur(24px);
+        box-shadow:
+            0 0 0 1px rgba(255, 255, 255, 0.03) inset,
+            0 20px 50px rgba(0, 0, 0, 0.45),
+            0 0 80px rgba(52, 211, 153, 0.04);
+        transition: border-color 0.2s ease, box-shadow 0.25s ease;
+    }
+    .aios-composer-shell:focus-within {
+        border-color: rgba(52, 211, 153, 0.35);
+        box-shadow:
+            0 0 0 1px rgba(52, 211, 153, 0.12) inset,
+            0 20px 50px rgba(0, 0, 0, 0.5),
+            0 0 60px rgba(52, 211, 153, 0.08);
+    }
+    .aios-msg-assistant {
+        border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+    }
+    .aios-msg-assistant:hover {
+        background: var(--aios-msg-assistant-hover);
+    }
+    .aios-prose {
+        font-size: 1.0625rem;
+        line-height: 1.75;
+        letter-spacing: -0.011em;
+        color: var(--aios-text);
+    }
+    .aios-prose p { margin: 0.85em 0; }
+    .aios-prose h1, .aios-prose h2, .aios-prose h3 {
+        font-weight: 650;
+        letter-spacing: -0.02em;
+        margin-top: 1.4em;
+        margin-bottom: 0.5em;
+    }
+    .aios-prose blockquote {
+        margin: 1em 0;
+        padding: 0.65em 1em;
+        border-left: 3px solid rgba(52, 211, 153, 0.45);
+        background: rgba(255, 255, 255, 0.03);
+        border-radius: 0 0.5rem 0.5rem 0;
+        color: var(--aios-text-muted);
+    }
+    .aios-prose table {
+        width: 100%;
+        border-collapse: collapse;
+        font-size: 0.92em;
+        margin: 1em 0;
+    }
+    .aios-prose th, .aios-prose td {
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        padding: 0.55em 0.75em;
+        text-align: left;
+    }
+    .aios-prose th {
+        background: rgba(255, 255, 255, 0.05);
+        font-weight: 600;
+    }
+    .aios-prose :not(pre) > code {
+        font-family: var(--aios-font-mono);
+        font-size: 0.88em;
+        padding: 0.15em 0.4em;
+        border-radius: 0.35rem;
+        background: rgba(255, 255, 255, 0.08);
+    }
+    .aios-code-block {
+        position: relative;
+        margin: 1em 0;
+        border-radius: 0.75rem;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(0, 0, 0, 0.45);
+        overflow: hidden;
+    }
+    .aios-code-block pre {
+        margin: 0;
+        padding: 1rem 1.1rem;
+        overflow-x: auto;
+        font-family: var(--aios-font-mono);
+        font-size: 0.85em;
+        line-height: 1.6;
+    }
+    .aios-callout {
+        margin: 1em 0;
+        padding: 0.85em 1em;
+        border-radius: 0.65rem;
+        border: 1px solid rgba(255, 255, 255, 0.1);
+        background: rgba(255, 255, 255, 0.03);
+    }
+    .aios-callout-note { border-color: rgba(34, 211, 238, 0.25); background: rgba(34, 211, 238, 0.06); }
+    .aios-callout-warn { border-color: rgba(251, 191, 36, 0.3); background: rgba(251, 191, 36, 0.08); }
+    .aios-callout-tip { border-color: rgba(52, 211, 153, 0.3); background: rgba(52, 211, 153, 0.08); }
+    .aios-brand-orb {
+        background:
+            radial-gradient(circle at 35% 35%, rgba(52, 211, 153, 0.55), transparent 55%),
+            radial-gradient(circle at 65% 65%, rgba(34, 211, 238, 0.35), transparent 50%),
+            radial-gradient(circle at 50% 50%, rgba(167, 139, 250, 0.2), transparent 60%);
+        box-shadow: 0 0 80px rgba(52, 211, 153, 0.15);
+    }
+    .aios-thinking-dots span {
+        display: inline-block;
+        width: 5px;
+        height: 5px;
+        margin: 0 2px;
+        border-radius: 50%;
+        background: var(--aios-text-dim);
+        animation: aios-thinking 1.2s ease-in-out infinite;
+    }
+    .aios-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+    .aios-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+}
 
 @keyframes login-page-in {
     from { opacity: 0; }
@@ -53,6 +222,37 @@
     }
 }
 
+@keyframes aios-fade-up {
+    from {
+        opacity: 0;
+        transform: translateY(8px);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0);
+    }
+}
+
+@keyframes aios-stream-cursor {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.25; }
+}
+
+@keyframes aios-skeleton {
+    0% { background-position: 100% 0; }
+    100% { background-position: -100% 0; }
+}
+
+@keyframes aios-thinking {
+    0%, 80%, 100% { opacity: 0.25; transform: translateY(0); }
+    40% { opacity: 1; transform: translateY(-3px); }
+}
+
+@keyframes aios-placeholder-fade {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
 .login-animate-page {
     opacity: 1;
     animation: login-page-in 0.45s ease-out both;
@@ -63,9 +263,276 @@
     animation: login-card-in 0.55s ease-out 0.06s both;
 }
 
+.aios-fade-up {
+    animation: aios-fade-up 0.35s ease-out both;
+}
+
+.aios-stream-cursor {
+    display: inline-block;
+    width: 2px;
+    height: 1.05em;
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    border-radius: 1px;
+    background: var(--aios-emerald);
+    animation: aios-stream-cursor 1s ease-in-out infinite;
+}
+
+.aios-skeleton {
+    background: linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.04) 0%,
+        rgba(255, 255, 255, 0.09) 40%,
+        rgba(255, 255, 255, 0.04) 80%
+    );
+    background-size: 200% 100%;
+    animation: aios-skeleton 1.4s ease-in-out infinite;
+}
+
+@media (max-width: 639px) {
+    :root {
+        --aios-stage-gutter: 1rem;
+        --aios-stage-max: 100%;
+        --aios-radius-composer: 1.35rem;
+    }
+    .aios-prose {
+        font-size: 1rem;
+        line-height: 1.7;
+    }
+}
+
+@media (min-width: 640px) and (max-width: 1023px) {
+    :root {
+        --aios-stage-gutter: 1.75rem;
+    }
+}
+
+@media (min-width: 1280px) {
+    :root {
+        --aios-stage-max: 48rem;
+        --aios-stage-gutter: 3rem;
+    }
+}
+
 @media (prefers-reduced-motion: reduce) {
     .login-animate-page,
-    .login-animate-card {
+    .login-animate-card,
+    .aios-fade-up,
+    .aios-stream-cursor,
+    .aios-skeleton {
         animation: none;
+    }
+}
+
+/* Auto-grow composer (field-sizing). */
+.composer-textarea {
+    field-sizing: content;
+    overflow-y: auto;
+}
+
+/* ========== Chat V3 ========== */
+.chat-shell {
+    background: var(--chat-bg);
+    color: var(--chat-text);
+}
+
+.chat-stage-inner {
+    max-width: 860px;
+    margin-inline: auto;
+    padding-inline: 32px;
+}
+
+.chat-stage-messages {
+    padding-inline: 32px;
+}
+
+.chat-stage-scroll {
+    scrollbar-color: rgba(255, 255, 255, 0.08) transparent;
+}
+
+.chat-composer-bar {
+    background: linear-gradient(
+        to top,
+        var(--chat-bg) 70%,
+        rgba(9, 10, 12, 0.92) 88%,
+        transparent
+    );
+}
+
+.chat-composer-wrap {
+    width: 100%;
+}
+
+.chat-composer-field {
+    min-height: 56px;
+    padding: 6px 8px 6px 4px;
+    border-radius: 24px;
+    background: #15181D;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    transition: border-color 0.15s ease;
+}
+
+.chat-composer-field:focus-within {
+    border-color: rgba(34, 197, 94, 0.55);
+}
+
+.chat-composer-icon-btn {
+    display: flex;
+    height: 44px;
+    width: 44px;
+    shrink: 0;
+    align-items: center;
+    justify-content: center;
+    color: var(--chat-text-muted);
+    transition: color 0.15s;
+}
+
+.chat-composer-icon-btn:hover:not(:disabled) {
+    color: var(--chat-text);
+}
+
+.chat-composer-icon-btn:disabled {
+    opacity: 0.4;
+}
+
+.chat-composer-send {
+    display: flex;
+    height: 40px;
+    width: 40px;
+    shrink: 0;
+    align-items: center;
+    justify-content: center;
+    border-radius: 9999px;
+    background: rgba(255, 255, 255, 0.08);
+    color: var(--chat-text-muted);
+    transition: background 0.15s, color 0.15s;
+}
+
+.chat-composer-send--active {
+    background: var(--chat-accent);
+    color: #090A0C;
+}
+
+.chat-composer-send--stop {
+    background: rgba(239, 68, 68, 0.85);
+    color: white;
+}
+
+.chat-composer-send:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.chat-stream-cursor {
+    display: inline-block;
+    width: 2px;
+    height: 1em;
+    margin-left: 2px;
+    vertical-align: text-bottom;
+    background: var(--chat-accent);
+    animation: aios-stream-cursor 1s ease-in-out infinite;
+}
+
+.chat-thinking-dots span {
+    display: inline-block;
+    width: 4px;
+    height: 4px;
+    margin: 0 2px;
+    border-radius: 50%;
+    background: var(--chat-text-muted);
+    animation: aios-thinking 1.2s ease-in-out infinite;
+}
+
+.chat-thinking-dots span:nth-child(2) { animation-delay: 0.15s; }
+.chat-thinking-dots span:nth-child(3) { animation-delay: 0.3s; }
+
+.chat-md {
+    font-size: 16px;
+    line-height: 1.65;
+    color: var(--chat-text);
+}
+
+.chat-md h1 { font-size: 28px; font-weight: 650; margin: 1em 0 0.5em; }
+.chat-md h2 { font-size: 22px; font-weight: 650; margin: 1em 0 0.5em; }
+.chat-md h3 { font-size: 18px; font-weight: 600; margin: 0.85em 0 0.4em; }
+.chat-md p { margin: 12px 0; }
+.chat-md ul, .chat-md ol { margin: 12px 0; padding-left: 1.4em; }
+.chat-md blockquote {
+    margin: 12px 0;
+    padding-left: 12px;
+    border-left: 3px solid rgba(34, 197, 94, 0.4);
+    color: var(--chat-text-muted);
+}
+.chat-md :not(pre) > code {
+    font-family: ui-monospace, monospace;
+    font-size: 0.9em;
+    padding: 0.12em 0.35em;
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.35);
+}
+.chat-md-link {
+    color: var(--chat-accent-alt);
+    text-decoration: none;
+}
+.chat-md-link:hover {
+    text-decoration: underline;
+}
+.chat-code-block pre {
+    margin: 0;
+    overflow-x: auto;
+}
+.chat-code-block code {
+    font-family: ui-monospace, monospace;
+    font-size: 0.85em;
+}
+.chat-table-wrap table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.92em;
+}
+.chat-table-wrap th,
+.chat-table-wrap td {
+    border: 1px solid var(--chat-border);
+    padding: 8px 10px;
+    text-align: left;
+}
+.chat-table-wrap th {
+    background: rgba(255, 255, 255, 0.04);
+}
+.chat-skeleton {
+    background: linear-gradient(
+        90deg,
+        rgba(255, 255, 255, 0.03) 0%,
+        rgba(255, 255, 255, 0.07) 50%,
+        rgba(255, 255, 255, 0.03) 100%
+    );
+    background-size: 200% 100%;
+    animation: aios-skeleton 1.4s ease-in-out infinite;
+}
+
+@media (max-width: 767px) {
+    .chat-stage-inner,
+    .chat-stage-messages {
+        padding-inline: 16px;
+    }
+    .chat-composer-inner {
+        width: calc(100% - 24px);
+        margin-inline: 12px;
+    }
+    .chat-composer-icon-btn {
+        height: 44px;
+        width: 44px;
+    }
+    .chat-drawer {
+        width: 100% !important;
+        max-width: 100% !important;
+    }
+}
+
+@media (min-width: 768px) {
+    .chat-sidebar {
+        position: static !important;
+        transform: none !important;
+        pointer-events: auto !important;
     }
 }

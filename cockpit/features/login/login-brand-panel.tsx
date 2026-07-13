@@ -22,7 +22,7 @@ export function LoginBrandPanel() {
     return (
         <aside className="relative hidden min-h-[100dvh] flex-col justify-between overflow-hidden border-r border-white/[0.06] bg-neutral-950 p-10 xl:p-14 lg:flex lg:w-[min(52%,720px)]">
             <div
-                className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_8%,rgba(16,185,129,0.18),transparent_42rem),radial-gradient(circle_at_88%_18%,rgba(59,130,246,0.12),transparent_36rem),radial-gradient(circle_at_50%_100%,rgba(16,185,129,0.08),transparent_30rem)]"
+                className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_12%_8%,rgba(16,185,129,0.18),transparent_42rem),radial-gradient(circle_at_88%_18%,rgba(34,211,238,0.12),transparent_36rem),radial-gradient(circle_at_50%_100%,rgba(167,139,250,0.10),transparent_30rem)]"
                 aria-hidden
             />
             <div
@@ -43,7 +43,7 @@ export function LoginBrandPanel() {
                         <p className="text-sm font-black tracking-[0.18em] text-emerald-300/90 uppercase">
                             AI-Hub
                         </p>
-                        <p className="text-xs text-neutral-500">Cockpit · Memory V2</p>
+                        <p className="text-xs text-neutral-500">AI operating system</p>
                     </div>
                 </div>
             </div>

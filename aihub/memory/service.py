@@ -155,13 +155,13 @@ def touch(mid: str) -> None:
     tm = _T("memory")
     if _db_backend() == "postgres":
         exec_one(
-            f"UPDATE {tm} SET last_access=?, access_count=access_count+1 WHERE id=?",
+            f"UPDATE {tm} AS m SET last_access=?, access_count=m.access_count+1 WHERE m.id=?",
             (ts, mid),
         )
     else:
         c = db()
         c.execute(
-            "UPDATE memory SET last_access=?, access_count=access_count+1 WHERE id=?",
+            "UPDATE memory AS m SET last_access=?, access_count=m.access_count+1 WHERE m.id=?",
             (ts, mid),
         )
         c.commit()

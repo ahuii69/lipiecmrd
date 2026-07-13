@@ -1,7 +1,8 @@
 "use client";
 
 import { Loader2, Lock, User } from "lucide-react";
-import { FormEvent, useState } from "react";
+import Link from "next/link";
+import { FormEvent, useEffect, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 
 import { Button } from "@/components/ui/button";
@@ -17,6 +18,31 @@ export function LoginForm() {
     const [password, setPassword] = useState("");
     const [error, setError] = useState<string | null>(null);
     const [pending, setPending] = useState(false);
+    const [registrationOpen, setRegistrationOpen] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        (async () => {
+            try {
+                const response = await fetch("/api/aihub/auth/registration-status", {
+                    headers: { accept: "application/json" },
+                    cache: "no-store",
+                });
+                if (!response.ok) return;
+                const body = (await response.json().catch(() => null)) as
+                    | { open?: boolean }
+                    | null;
+                if (!cancelled && body?.open) {
+                    setRegistrationOpen(true);
+                }
+            } catch {
+                // Login remains usable even if status probe fails.
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, []);
 
     async function onSubmit(event: FormEvent) {
         event.preventDefault();
@@ -151,6 +177,17 @@ export function LoginForm() {
                         "Zaloguj się"
                     )}
                 </Button>
+                {registrationOpen ? (
+                    <p className="text-center text-sm text-neutral-500">
+                        Nie masz jeszcze konta?{" "}
+                        <Link
+                            href="/register"
+                            className="font-medium text-emerald-300 hover:text-emerald-200"
+                        >
+                            Utwórz konto
+                        </Link>
+                    </p>
+                ) : null}
                 <LoginBackendStatus />
             </div>
         </form>

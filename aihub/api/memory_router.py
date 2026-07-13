@@ -112,7 +112,7 @@ def get(id: str):
         FROM compat_router.mem WHERE id=? AND deleted=0
         """
         upd = """
-        UPDATE compat_router.mem SET access_count=access_count+1, last_access_ts=? WHERE id=?
+        UPDATE compat_router.mem AS m SET access_count=m.access_count+1, last_access_ts=? WHERE m.id=?
         """
     else:
         sel = """
@@ -120,7 +120,7 @@ def get(id: str):
         FROM memory WHERE id=? AND deleted=0
         """
         upd = """
-        UPDATE memory SET access_count=access_count+1, last_access_ts=? WHERE id=?
+        UPDATE memory AS m SET access_count=m.access_count+1, last_access_ts=? WHERE m.id=?
         """
 
     with db() as c:

@@ -100,7 +100,7 @@ class MemoryIntel:
         with self.lock:
             conn = self._connect()
             conn.execute(
-                "UPDATE memory_items SET access_count=access_count+1, last_access_ts=? WHERE id=?",
+                "UPDATE memory_items AS mi SET access_count=mi.access_count+1, last_access_ts=? WHERE mi.id=?",
                 (now, item_id),
             )
             conn.commit()

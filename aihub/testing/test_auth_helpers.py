@@ -19,6 +19,8 @@ PUBLIC_PATHS = {
     "/ops/ready",
     "/ops/capabilities",
     "/auth/login",
+    "/auth/register",
+    "/auth/registration-status",
 }
 
 ADMIN_PATHS = {

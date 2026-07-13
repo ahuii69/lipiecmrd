@@ -3,15 +3,21 @@ import { NextRequest, NextResponse } from "next/server";
 import { validateSessionFromRequest } from "@/lib/api/bff-session-auth";
 
 const PRIVATE_NO_STORE = "private, no-store, max-age=0";
-const PUBLIC_PATHS = new Set(["/login"]);
-const PUBLIC_API_PREFIXES = ["/api/aihub/system/ping", "/api/aihub/auth/login"];
+const PUBLIC_PATHS = new Set(["/login", "/register"]);
+const PUBLIC_API_PREFIXES = [
+    "/api/aihub/system/ping",
+    "/api/aihub/auth/login",
+    "/api/aihub/auth/register",
+    "/api/aihub/auth/registration-status",
+];
 
 export function buildContentSecurityPolicy(nonce: string): string {
     const isDev = process.env.NODE_ENV === "development";
     const directives = [
         "default-src 'self'",
         `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ""}`,
-        `style-src 'self' 'nonce-${nonce}' 'unsafe-inline'`,
+        // Framer Motion / KaTeX need inline styles; nonce on style-src defeats 'unsafe-inline'.
+        "style-src 'self' 'unsafe-inline'",
         "img-src 'self' data: blob:",
         "media-src 'self' blob:",
         "font-src 'self' data:",

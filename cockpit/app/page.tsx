@@ -1,10 +1,10 @@
 import { ErrorBoundary } from "@/components/layout/error-boundary";
-import { UserShell } from "@/features/user-chat/user-shell";
+import { ChatShell } from "@/features/chat/ChatShell";
 
 export default function Page() {
     return (
         <ErrorBoundary>
-            <UserShell />
+            <ChatShell />
         </ErrorBoundary>
     );
 }

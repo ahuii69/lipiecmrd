@@ -115,6 +115,14 @@ CANONICAL_HTTP_ROUTES: Tuple[Tuple[str, str, str, str, str], ...] = (
     ("GET", "/admin/ping", "aihub/admin_api.py", "NIE", "BRAK DANYCH"),
     ("GET", "/auth/me", "aihub/auth_api.py", "TAK", "tests/test_auth_ownership.py"),
     ("POST", "/auth/login", "aihub/auth_api.py", "TAK", "tests/test_auth_ownership.py"),
+    ("POST", "/auth/register", "aihub/auth_api.py", "TAK", "tests/test_auth_bootstrap_register.py"),
+    (
+        "GET",
+        "/auth/registration-status",
+        "aihub/auth_api.py",
+        "TAK",
+        "tests/test_auth_bootstrap_register.py",
+    ),
     ("POST", "/auth/logout", "aihub/auth_api.py", "TAK", "tests/test_auth_ownership.py"),
     (
         "GET",

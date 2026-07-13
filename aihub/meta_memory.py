@@ -64,14 +64,14 @@ class MetaMemory:
             now = now_ts()
             exec_one(
                 """
-            INSERT INTO memory_meta(fact_id, access_count, last_access, creation_ts, usage_score)
+            INSERT INTO memory_meta AS mm(fact_id, access_count, last_access, creation_ts, usage_score)
             VALUES(?,?,?,?,?)
             ON CONFLICT(fact_id) DO UPDATE SET
-                access_count = access_count + 1,
+                access_count = mm.access_count + 1,
                 last_access = excluded.last_access,
                 usage_score = CASE
-                    WHEN usage_score + 0.05 >= 0.99 THEN 0.99
-                    ELSE usage_score + 0.05
+                    WHEN mm.usage_score + 0.05 >= 0.99 THEN 0.99
+                    ELSE mm.usage_score + 0.05
                 END
             """,
                 (fact_id, 1, now, now, 0.55),
@@ -373,19 +373,19 @@ def touch_nodes(node_ids: List[str]) -> int:
     for nid in node_ids:
         exec_one(
             """
-            INSERT INTO memory_meta(fact_id, access_count, last_access, creation_ts,
+            INSERT INTO memory_meta AS mm(fact_id, access_count, last_access, creation_ts,
                                     usage_score, importance_score, overall_priority)
             VALUES(?, 1, ?, ?, 0.55, 0.5, 0.5)
             ON CONFLICT(fact_id) DO UPDATE SET
-                access_count = access_count + 1,
+                access_count = mm.access_count + 1,
                 last_access  = excluded.last_access,
                 usage_score  = CASE
-                    WHEN usage_score + 0.03 >= 0.99 THEN 0.99
-                    ELSE usage_score + 0.03
+                    WHEN mm.usage_score + 0.03 >= 0.99 THEN 0.99
+                    ELSE mm.usage_score + 0.03
                 END,
                 freshness_score = CASE
-                    WHEN freshness_score + 0.05 >= 0.99 THEN 0.99
-                    ELSE freshness_score + 0.05
+                    WHEN mm.freshness_score + 0.05 >= 0.99 THEN 0.99
+                    ELSE mm.freshness_score + 0.05
                 END
             """,
             (nid, now, now),

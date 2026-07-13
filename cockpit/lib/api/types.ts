@@ -19,6 +19,11 @@ export interface ChatTurnRequest {
     tool_policy_overrides?: Record<string, unknown>;
     attached_file_ids?: string[];
     input_via_stt?: boolean;
+    /** Stable per send; retry must reuse the same key to avoid duplicate write-backs. */
+    idempotency_key?: string;
+    request_id?: string;
+    correlation_id?: string;
+    turn_id?: string;
 }
 
 export interface ProviderUsage {
