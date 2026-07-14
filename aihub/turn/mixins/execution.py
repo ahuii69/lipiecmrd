@@ -195,38 +195,14 @@ class ExecutionMixin:
         reason: str,
         decision_core: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, Any]]:
-        # Dry, neutral fallback — never a personified "I'm alive / coffee" line (06.07 quality fix).
+        """Dry technical fallback only — never executive controller on provider failure."""
         fallback_text = dry_fallback_response(user_message=turn.message)
-
-        try:
-            controller = _cr_hook("get_executive_controller", get_executive_controller)()
-            dc = decision_core if isinstance(decision_core, dict) else {}
-            fstr, freason = map_chat_execution_mode_to_force_strategy(dc)
-            cycle = await controller.run_cycle(
-                {
-                    "text": turn.message,
-                    "max_steps": 4,
-                    "timeout_seconds": 12.0,
-                    "force_strategy": fstr,
-                    "force_strategy_reason": f"{freason};chat_runtime:provider_fallback",
-                },
-                mode="run",
-                user_id=turn.user_id,
-            )
-            normalized = _cr_hook("build_agent_cycle_response", build_agent_cycle_response)(
-                cycle, include_debug=turn.include_debug
-            )
-            return fallback_text, {"reason": reason, "fallback_cycle": normalized}
-        except Exception as exc:  # noqa: BLE001
-            return (
-                fallback_text,
-                {
-                    "reason": reason,
-                    "fallback_cycle": None,
-                    "fallback_error": str(exc),
-                    "degraded": True,
-                },
-            )
+        return fallback_text, {
+            "reason": reason,
+            "fallback_cycle": None,
+            "executive_skipped": True,
+            "degraded": True,
+        }
 
     @staticmethod
     def _safe_preview(obj: Any, max_chars: int = 600) -> str:

@@ -18,7 +18,12 @@ from .executive_controller import (
 logger = logging.getLogger(__name__)
 
 AGENT_INTERVAL_S = float(os.getenv("AGENT_INTERVAL_S", "3.5"))
-AGENT_USER_ID = os.getenv("AGENT_USER_ID", "default")
+# System/maintenance scope for background ticks — NOT a request-scoped user identity.
+# Override with AIHUB_BACKGROUND_AGENT_USER_IDS for real per-user maintenance only.
+AGENT_USER_ID = os.getenv("AGENT_USER_ID", "system:maintenance")
+if AGENT_USER_ID.strip() == "default":
+    # Avoid colliding maintenance writes with a human/shared "default" memory space.
+    AGENT_USER_ID = "system:maintenance"
 AGENT_AUTOSTART = os.getenv("AGENT_AUTOSTART", "1") == "1"
 AGENT_MAX_RETRIES = int(os.getenv("AGENT_MAX_RETRIES", "3"))
 AGENT_RETRY_DELAY_S = float(os.getenv("AGENT_RETRY_DELAY_S", "1.0"))

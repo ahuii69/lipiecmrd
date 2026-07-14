@@ -109,6 +109,66 @@ def _clip(text: str, limit: int = 900) -> str:
     return clean[: limit - 1].rstrip() + "…"
 
 
+_JUNK_MEMORY_MARKERS = (
+    "memory-guided response",
+    "context from ",
+    "memories helped",
+    "brak danych (web)",
+    "brak danych",
+    "działa. gotowy",
+    "dziala. gotowy",
+    "fallback",
+    "helpdesk",
+    "smoke ok",
+    "test ping",
+)
+
+_SPORT_NOISE = (
+    "wynik meczu",
+    "liga mistrzów",
+    "liga mistrzow",
+    "mecz ",
+    " gol ",
+    "gole ",
+    "tabela ligowa",
+)
+
+
+def is_junk_memory_content(text: str, *, query: str = "") -> bool:
+    """Reject meta-memory, fallback leftovers, and off-topic sport noise."""
+    raw = (text or "").strip()
+    if not raw or len(raw) < 3:
+        return True
+    low = raw.lower()
+    if any(m in low for m in _JUNK_MEMORY_MARKERS):
+        return True
+    # Single-token shout / nonverbal noise
+    if len(raw.split()) <= 2 and low in {"elo", "gówno", "gowno", "ok", "działa", "dziala", "siema", "hej"}:
+        return True
+    q = (query or "").lower()
+    # For identity/meta asks, drop sport chatter entirely
+    try:
+        from aihub.strategy_selector import is_assistant_meta_ask
+
+        meta = is_assistant_meta_ask(query)
+    except Exception:
+        meta = False
+    if meta and any(s in low for s in _SPORT_NOISE):
+        return True
+    if meta and ("wynik" in low or "mecz" in low) and "system" not in low:
+        return True
+    return False
+
+
+def _normalize_memory_key(text: str) -> str:
+    import hashlib
+    import re
+
+    norm = re.sub(r"\s+", " ", (text or "").strip().lower())
+    norm = re.sub(r"[^\w\s]", "", norm, flags=re.UNICODE)
+    return hashlib.sha1(norm.encode("utf-8", errors="replace")).hexdigest()
+
+
 def _v2_reason_codes(item: MemoryV2Item) -> list[str]:
     codes: list[str] = []
     if item.is_pinned:
@@ -220,16 +280,26 @@ def _graph_items(graph: dict[str, Any] | None) -> list[MemoryContextPackItem]:
 def build_memory_context_pack(
     outcome: MemoryReadOutcome,
     *,
-    max_chars: int = 8000,
-    max_items: int = 24,
+    max_chars: int = 2400,
+    max_items: int = 8,
 ) -> MemoryContextPack:
     """Build one deterministic budgeted context pack from canonical memory read outcome."""
-    max_chars = max(1000, int(max_chars or 8000))
-    max_items = max(1, int(max_items or 24))
+    max_chars = max(600, min(4000, int(max_chars or 2400)))
+    max_items = max(1, min(12, int(max_items or 8)))
     selected: list[MemoryContextPackItem] = []
     excluded: list[str] = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_content: set[str] = set()
     used = 0
+    per_source_caps = {
+        "memory_v2": 4,
+        "procedure": 2,
+        "contradiction": 2,
+        "graph_stm": 2,
+        "graph_episodic": 2,
+        "graph_semantic": 3,
+    }
+    per_source_counts: dict[str, int] = {}
 
     candidates: list[MemoryContextPackItem] = []
     candidates.extend(_from_v2(item) for item in outcome.v2.items)
@@ -265,8 +335,26 @@ def build_memory_context_pack(
         }.get(item.memory_type, 0.0)
         return (item.score + item.salience * 0.35 + item.confidence * 0.20 + type_boost, item.salience, item.confidence)
 
+    query = str(outcome.query or "")
     for item in sorted(candidates, key=candidate_score, reverse=True):
-        if item.id in seen:
+        if item.id in seen_ids:
+            excluded.append(item.id)
+            continue
+        if is_junk_memory_content(item.content, query=query) or is_junk_memory_content(
+            item.title, query=query
+        ):
+            excluded.append(item.id)
+            continue
+        # Relevance gate: keep preferences always; others need minimal score
+        if item.memory_type != "preference" and item.score < 0.12 and item.salience < 0.2:
+            excluded.append(item.id)
+            continue
+        content_key = _normalize_memory_key(f"{item.title}|{item.content}")
+        if content_key in seen_content:
+            excluded.append(item.id)
+            continue
+        src_cap = per_source_caps.get(item.source, 3)
+        if per_source_counts.get(item.source, 0) >= src_cap:
             excluded.append(item.id)
             continue
         size = len(item.content) + len(item.title) + 32
@@ -274,7 +362,9 @@ def build_memory_context_pack(
             excluded.append(item.id)
             continue
         selected.append(item)
-        seen.add(item.id)
+        seen_ids.add(item.id)
+        seen_content.add(content_key)
+        per_source_counts[item.source] = per_source_counts.get(item.source, 0) + 1
         used += size
 
     pack = MemoryContextPack(
@@ -291,6 +381,8 @@ def build_memory_context_pack(
             "procedure_count": len(outcome.v2.related_procedures),
             "contradiction_count": len(outcome.v2.contradictions),
             "candidate_count": len(candidates),
+            "junk_or_dup_excluded": len(excluded),
+            "per_source_counts": dict(per_source_counts),
         },
     )
     dist: dict[str, int] = {}

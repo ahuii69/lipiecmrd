@@ -90,13 +90,15 @@ class TurnOps(
     ExecutionMixin,
 ):
     def __init__(self) -> None:
-        self._provider = get_default_provider()
+        from aihub.llm.provider_registry import build_provider_execution_service, get_primary_provider
+
         self._tool_registry = get_tool_registry()
         self._tool_router = ToolRouter(self._tool_registry)
-        from aihub.turn.provider_service import ProviderExecutionService
         from aihub.turn.tool_service import ToolExecutionService
         from aihub.turn.completion import TurnCompletionService
-        self._provider_service = ProviderExecutionService(self._provider)
+
+        primary = get_primary_provider()
+        self._provider_service = build_provider_execution_service(primary=primary)
         self._tool_service = ToolExecutionService(self._tool_router)
         self._completion_service = TurnCompletionService()
         self._active_turn_ctx = None
@@ -104,6 +106,16 @@ class TurnOps(
         # Managed hooks kept as attributes so runtime wiring is explicit and testable.
         self._memory_process_fn = get_memory_core().ingest_turn
         self._psyche_evolve_fn = get_psyche_core().evolve
+
+    @property
+    def _provider(self):
+        """Primary LLM adapter — same object used by ProviderExecutionService."""
+        return self._provider_service._primary
+
+    @_provider.setter
+    def _provider(self, value) -> None:
+        self._provider_service._primary = value
+        self._provider_service._provider = value
 
     async def run_turn(self, turn: ChatTurnInput) -> ChatTurnResult:
         res: ChatTurnResult | None = None
@@ -159,7 +171,9 @@ def get_turn_ops() -> TurnOps:
         _RUNTIME = TurnOps()
     else:
         try:
-            fresh_provider = get_default_provider()
+            from aihub.llm.provider_registry import build_provider_execution_service, get_primary_provider
+
+            fresh_provider = get_primary_provider()
         except Exception:
             fresh_provider = None
         if fresh_provider is not None:
@@ -168,6 +182,7 @@ def get_turn_ops() -> TurnOps:
             fresh_key = (type(fresh_provider), getattr(fresh_provider, "provider_name", None), getattr(fresh_provider, "name", None))
             if current is None or current_key != fresh_key:
                 _RUNTIME._provider = fresh_provider
+                _RUNTIME._provider_service = build_provider_execution_service(primary=fresh_provider)
     return _RUNTIME
 
 

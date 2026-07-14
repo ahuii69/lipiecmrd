@@ -367,6 +367,30 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
     except Exception:
         logger.debug('Decision core: world knowledge apply failed', exc_info=True)
     self._local_non_research_guardrails(turn, result)
+    # 20.07: hard clamp — identity/meta asks never leave as agentic after overlays
+    try:
+        from aihub.strategy_selector import is_assistant_meta_ask
+
+        if is_assistant_meta_ask(turn.message or "") and result.get("selected_strategy") == "agentic":
+            old = result["selected_strategy"]
+            result["selected_strategy"] = "contextual"
+            result["planner_recommended"] = False
+            result["reason_codes"] = list(result.get("reason_codes") or []) + [
+                "META_ASK_BLOCKED_AGENTIC"
+            ]
+            log = list(result.get("strategy_adjustment_log") or [])
+            log.append(
+                {
+                    "source": "meta_ask_guard",
+                    "reason_code": "META_ASK_BLOCKED_AGENTIC",
+                    "old_value": old,
+                    "new_value": "contextual",
+                    "confidence_delta": 0.0,
+                }
+            )
+            result["strategy_adjustment_log"] = log
+    except Exception:
+        logger.debug("meta ask strategy clamp skipped", exc_info=True)
     self._finalize_escalation(result)
     result['user_turn_text'] = turn.message or ''
     # 19.07: one controlled adjustment trail — base → adjustments → final

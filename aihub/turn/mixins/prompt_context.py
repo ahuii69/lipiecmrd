@@ -102,6 +102,13 @@ class PromptContextMixin:
             t = (text or "").strip()
             if not t:
                 return
+            try:
+                from aihub.memory_context_pack import is_junk_memory_content
+
+                if is_junk_memory_content(t):
+                    return
+            except Exception as junk_exc:
+                logger.debug("junk memory filter skipped: %s", junk_exc)
             key = (source, mid)
             if key in seen:
                 return
@@ -119,7 +126,7 @@ class PromptContextMixin:
         if not isinstance(memory_context, dict):
             return out
 
-        for m in (memory_context.get("stm") or [])[:15] if include_stm else []:
+        for m in (memory_context.get("stm") or [])[:6] if include_stm else []:
             if not isinstance(m, dict):
                 continue
             raw_id = str(m.get("id") or "").strip()
@@ -128,34 +135,34 @@ class PromptContextMixin:
             role = str(m.get("role") or "")
             _add("stm", mid, f"[{role}] {content}" if role else content)
 
-        for m in (memory_context.get("semantic") or [])[:12]:
+        for m in (memory_context.get("semantic") or [])[:6]:
             if not isinstance(m, dict):
                 continue
             content = str(m.get("content") or "")
             mid = str(m.get("id") or "").strip() or _sha1_text(content)
             _add("L2", mid, content)
 
-        for m in (memory_context.get("dense_hits") or [])[:8]:
+        for m in (memory_context.get("dense_hits") or [])[:4]:
             if not isinstance(m, dict):
                 continue
             text = str(m.get("text") or "")
             _add("vector", _sha1_text(text), text)
 
-        for m in (memory_context.get("episodic") or [])[:12]:
+        for m in (memory_context.get("episodic") or [])[:6]:
             if not isinstance(m, dict):
                 continue
             content = str(m.get("content") or "")
             mid = str(m.get("id") or "").strip() or _sha1_text(content)
             _add("L1", mid, content)
 
-        for m in (memory_context.get("graph_hits") or [])[:12]:
+        for m in (memory_context.get("graph_hits") or [])[:4]:
             if not isinstance(m, dict):
                 continue
             content = str(m.get("content") or "")
             mid = str(m.get("node_id") or "").strip() or _sha1_text(content)
             _add("graph", mid, content)
 
-        for m in (memory_context.get("memory_v2_items") or [])[:20]:
+        for m in (memory_context.get("memory_v2_items") or [])[:8]:
             if not isinstance(m, dict):
                 continue
             title = str(m.get("title") or "")
@@ -168,7 +175,7 @@ class PromptContextMixin:
                     extra_v2[fk] = bool(m.get(fk))
             _add("memory_v2", mid, combined, extra_v2 if extra_v2 else None)
 
-        return out
+        return out[:12]
 
     @staticmethod
     def _augment_memory_observability(
@@ -476,7 +483,7 @@ class PromptContextMixin:
     ) -> ChatTurnContext:
         mode = turn.mode or CHAT_DEFAULT_MODE
         hints = build_correction_hints_for_prompt(turn.user_id, turn.session_id)
-        mem_ctx = retrieve_context(turn.user_id, turn.message, limit=8)
+        mem_ctx = retrieve_context(turn.user_id, turn.message, limit=6)
         system_context: dict[str, Any] = {
             "tool_calling_enabled": LLM_TOOL_CALLING_ENABLED,
             "streaming_enabled": LLM_STREAMING_ENABLED,
@@ -485,16 +492,20 @@ class PromptContextMixin:
         }
         try:
             from aihub.memory_core import get_memory_core
+            from aihub.strategy_selector import is_assistant_meta_ask
 
+            meta_ask = is_assistant_meta_ask(turn.message or "")
+            pack_limit = 4 if meta_ask else 8
+            pack_chars = 1200 if meta_ask else 2400
             pack = get_memory_core().build_context_pack(
                 turn.user_id,
                 turn.message,
-                limit=18,
-                max_chars=6500,
-                include_graph=True,
+                limit=pack_limit,
+                max_chars=pack_chars,
+                include_graph=not meta_ask,
             )
             pack_dump = pack.model_dump(mode="json")
-            pack_prompt = pack.to_prompt_text(max_chars=6500)
+            pack_prompt = pack.to_prompt_text(max_chars=pack_chars)
             system_context["memory_context_pack"] = pack_dump
             system_context["memory_context_pack_prompt"] = pack_prompt
             system_context["memory_context_pack_trace"] = pack.to_trace_summary()
@@ -503,6 +514,20 @@ class PromptContextMixin:
                 mem_ctx["context_pack_selected_ids"] = list(pack.selected_ids)
                 mem_ctx["context_pack_source_distribution"] = dict(pack.source_distribution)
                 mem_ctx["context_pack_used_chars"] = int(pack.used_chars)
+                # Cap raw retrieve buckets so memory_hits cannot explode with STM dumps.
+                for key, lim in (
+                    ("stm", 4 if meta_ask else 6),
+                    ("semantic", 4),
+                    ("episodic", 4),
+                    ("dense_hits", 3),
+                    ("graph_hits", 0 if meta_ask else 4),
+                    ("memory_v2_items", 4 if meta_ask else 6),
+                ):
+                    bucket = mem_ctx.get(key)
+                    if isinstance(bucket, list) and len(bucket) > lim:
+                        mem_ctx[key] = bucket[:lim]
+                if meta_ask:
+                    mem_ctx["stm"] = []
         except Exception as exc:  # noqa: BLE001
             logger.warning("memory_context_pack_build_failed: %s", exc, exc_info=True)
             if isinstance(mem_ctx, dict):

@@ -53,6 +53,26 @@ function dispatchEvent(
         const contextChips = Array.isArray(ev.context_chips)
             ? (ev.context_chips as string[])
             : undefined;
+        // HTTP 200 + ok=false is a runtime failure — raise so ChatShell shows error.
+        const okFlag = ev.ok;
+        if (okFlag === false) {
+            const detail =
+                typeof ev.error === "string" && ev.error
+                    ? ev.error
+                    : "turn_failed";
+            throw new Error(
+                `Chat turn failed (${detail}). Odpowiedź nie została uznana za sukces.`,
+            );
+        }
+        if (
+            r &&
+            typeof r === "object" &&
+            (r as { ok?: unknown }).ok === false
+        ) {
+            throw new Error(
+                "Chat turn failed (ok=false). Odpowiedź nie została uznana za sukces.",
+            );
+        }
         handlers.onDone(
             r && typeof r === "object"
                 ? (r as ChatTurnResponse)

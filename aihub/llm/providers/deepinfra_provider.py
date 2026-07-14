@@ -34,7 +34,7 @@ def _build_ssl_context() -> ssl.SSLContext:
 
 
 class DeepInfraProvider(BaseProvider):
-    """Production provider adapter for DeepInfra OpenAI-compatible API."""
+    """OpenAI-compatible chat completions adapter (DeepInfra, Groq, etc.)."""
 
     def __init__(
         self,
@@ -48,6 +48,8 @@ class DeepInfraProvider(BaseProvider):
         tool_calling_enabled: bool,
         streaming_enabled: bool,
         client: Optional[httpx.AsyncClient] = None,
+        provider_name: str = "deepinfra",
+        use_max_completion_tokens: bool = False,
     ) -> None:
         self._api_key = api_key.strip()
         self._base_url = base_url.rstrip("/")
@@ -58,10 +60,12 @@ class DeepInfraProvider(BaseProvider):
         self._tool_calling_enabled = bool(tool_calling_enabled)
         self._streaming_enabled = bool(streaming_enabled)
         self._client = client
+        self._provider_name = str(provider_name or "deepinfra").strip().lower()
+        self._use_max_completion_tokens = bool(use_max_completion_tokens)
 
     @property
     def provider_name(self) -> str:
-        return "deepinfra"
+        return self._provider_name
 
     def _build_messages(self, request: ProviderChatRequest) -> List[Dict[str, Any]]:
         out: List[Dict[str, Any]] = []
@@ -131,6 +135,9 @@ class DeepInfraProvider(BaseProvider):
         code = str(err_obj.get("code") or default_code)
 
         retryable = status in {408, 409, 425, 429} or status >= 500
+        if status == 402:
+            retryable = False
+            code = code if code and code != "http_error" else "insufficient_balance"
 
         return ProviderError(
             provider=self.provider_name,
@@ -442,7 +449,13 @@ class DeepInfraProvider(BaseProvider):
             "stream": stream,
         }
         if request.max_tokens is not None:
-            payload["max_tokens"] = int(request.max_tokens)
+            if self._use_max_completion_tokens:
+                payload["max_completion_tokens"] = int(request.max_tokens)
+            else:
+                payload["max_tokens"] = int(request.max_tokens)
+        elif self._use_max_completion_tokens:
+            # gpt-oss on Groq uses reasoning tokens; ensure room for visible content.
+            payload["max_completion_tokens"] = 1024
 
         tools_payload = self._build_tools(request)
         if tools_payload:
@@ -475,11 +488,20 @@ class DeepInfraProvider(BaseProvider):
                     timeout_seconds=timeout_seconds,
                 )
                 latency_ms = (time.monotonic() - start) * 1000.0
-                return self._parse_model_response(
+                parsed = self._parse_model_response(
                     data=data,
                     model_name=model_name,
                     latency_ms=latency_ms,
                 )
+                if not (parsed.content or "").strip() and not parsed.tool_calls:
+                    raise ProviderError(
+                        provider=self.provider_name,
+                        code="empty_response",
+                        message="provider returned empty content",
+                        retryable=False,
+                        details={"response": data},
+                    )
+                return parsed
             except ProviderError as exc:
                 last_error = exc
                 if (not exc.retryable) or attempt >= attempts:

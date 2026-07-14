@@ -19,7 +19,7 @@ import os
 import re
 from pathlib import Path
 
-from aihub.secret_resolver import resolve_llm_api_key, validate_vault_secret_material
+from aihub.secret_resolver import resolve_groq_api_key, resolve_llm_api_key, validate_vault_secret_material
 
 
 def _env_bool(name: str, default: str = "0") -> bool:
@@ -212,15 +212,22 @@ HTTP_CA_BUNDLE = os.getenv(
 HTTP_TRUST_ENV = _env_bool("HTTP_TRUST_ENV", "0")
 
 # LLM provider/runtime
-LLM_PROVIDER_NAME = os.getenv("LLM_PROVIDER_NAME", "deepinfra")
+LLM_PRIMARY_PROVIDER = os.getenv("LLM_PRIMARY_PROVIDER", os.getenv("LLM_PROVIDER_NAME", "deepinfra")).strip().lower()
+LLM_RESERVE_PROVIDER = os.getenv("LLM_RESERVE_PROVIDER", "groq").strip().lower()
+LLM_PROVIDER_NAME = LLM_PRIMARY_PROVIDER
 LLM_MODEL_NAME = os.getenv("LLM_MODEL_NAME", "openai/gpt-oss-120b")
 LLM_API_KEY = resolve_llm_api_key()
+GROQ_API_KEY = resolve_groq_api_key()
+GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1").rstrip("/")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "https://api.deepinfra.com/v1/openai")
 LLM_TIMEOUT_S = float(os.getenv("LLM_TIMEOUT_S", "45"))
 LLM_MAX_RETRIES = int(os.getenv("LLM_MAX_RETRIES", "2"))
 LLM_DEFAULT_TEMPERATURE = float(os.getenv("LLM_DEFAULT_TEMPERATURE", "0.35"))
 LLM_TOOL_CALLING_ENABLED = _env_bool("LLM_TOOL_CALLING_ENABLED", "1")
 LLM_STREAMING_ENABLED = _env_bool("LLM_STREAMING_ENABLED", "0")
+# Internal provider retries disabled when reserve failover is configured (orchestrated in provider_service).
+LLM_PROVIDER_INTERNAL_RETRIES = int(os.getenv("LLM_PROVIDER_INTERNAL_RETRIES", "0"))
 
 # Chat runtime
 CHAT_DEFAULT_MODE = os.getenv("CHAT_DEFAULT_MODE", "chat")

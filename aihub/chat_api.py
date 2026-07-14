@@ -176,7 +176,30 @@ async def _sse_chat_turn(
             return
         yield _sse_data_line({"type": "replace", "content": r.response_text or ""})
 
-    done_payload: dict[str, Any] = {"type": "done"}
+    done_payload: dict[str, Any] = {
+        "type": "done",
+        "ok": bool(getattr(r, "ok", False)),
+    }
+    if not bool(getattr(r, "ok", False)):
+        # Always surface failure so clients cannot treat HTTP 200 as success.
+        done_payload["error"] = "turn_failed"
+        errs = list(getattr(r, "errors", None) or [])
+        if errs:
+            done_payload["errors"] = errs[:5]
+        tr = r.trace if isinstance(r.trace, dict) else {}
+        if tr.get("effective_runtime_path"):
+            done_payload["effective_runtime_path"] = tr.get("effective_runtime_path")
+        # Lightweight result for UI even when include_turn_result=false
+        done_payload["result"] = {
+            "ok": False,
+            "response_text": r.response_text or "",
+            "trace": {
+                "selected_strategy": tr.get("selected_strategy"),
+                "effective_runtime_path": tr.get("effective_runtime_path"),
+                "agent_handoff_error": tr.get("agent_handoff_error"),
+            },
+            "errors": errs[:5],
+        }
     chips = derive_context_chips_from_trace(
         r.trace if isinstance(r.trace, dict) else {},
         input_via_stt=bool(payload.input_via_stt),
@@ -243,6 +266,12 @@ async def chat_turn(
     ),
 ) -> Union[ChatTurnResult, StreamingResponse]:
     runtime = get_chat_runtime()
+    # Bound turn identity to authenticated principal (never silent default fallback).
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and getattr(principal, "user_id", None):
+        payload = payload.model_copy(
+            update={"user_id": str(principal.user_id).strip()}
+        )
     if stream:
         return StreamingResponse(
             _sse_chat_turn(
@@ -265,7 +294,7 @@ async def chat_turn(
             input_via_stt=bool(payload.input_via_stt),
         )
         if chips:
-            return out.model_copy(update={"context_chips": chips})
+            out = out.model_copy(update={"context_chips": chips})
         return out
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc

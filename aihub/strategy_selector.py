@@ -446,6 +446,69 @@ AGENTIC_KEYWORD_TOKENS = (
     "analiza porownawcza",
 )
 
+# Multi-step structural cues — NOT plain "i"/commas (those fire false agentic on chat Q&A).
+AGENTIC_MULTISTEP_MARKERS = (
+    "krok po kroku",
+    "następnie",
+    "nastepnie",
+    "a potem",
+    "potem ",
+    "wieloetap",
+    "step by step",
+    "and then",
+    "then ",
+)
+
+# Identity / meta system questions must stay non-agentic.
+_ASSISTANT_META_ASK_MARKERS = (
+    "kim jesteś",
+    "kim jestes",
+    "kim jesteś",
+    "jak działasz",
+    "jak dzialasz",
+    "jak działacie",
+    "jak dzialacie",
+    "jakie elementy",
+    "jakich elementów",
+    "jakich elementow",
+    "czego użyłeś",
+    "czego uzyles",
+    "wykorzystałeś",
+    "wykorzystales",
+    "przedstaw się",
+    "przedstaw sie",
+    "kim jesteś i",
+    "who are you",
+    "how do you work",
+    "how you work",
+    "what are you",
+)
+
+
+def is_assistant_meta_ask(user_text: str) -> bool:
+    """True for short identity / 'how do you work' / which modules questions."""
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    lower = text.lower()
+    ascii_l = _strip_diacritics(lower)
+    n_words = len([w for w in text.split() if w])
+    if n_words > 40:
+        return False
+    if any(m in lower or _strip_diacritics(m) in ascii_l for m in _ASSISTANT_META_ASK_MARKERS):
+        return True
+    # "powiedz krótko" + self-reference without execute verbs
+    short_ask = "powiedz krotko" in ascii_l or "powiedz krótko" in lower or "napisz krotk" in ascii_l
+    self_ref = any(
+        t in ascii_l
+        for t in ("kim jestes", "jak dzial", "systemu", "modulu", "element", "o sobie")
+    )
+    exec_blocked = any(
+        _keyword_in_text(k, lower, ascii_l)
+        for k in ("zaplanuj", "wykonaj", "przeanalizuj", "krok po kroku")
+    )
+    return bool(short_ask and self_ref and not exec_blocked)
+
 RESEARCH_INTENT_TOKENS = (
     "znajdź",
     "znajdz",
@@ -623,6 +686,17 @@ class StrategySelector:
                 "reason": reason,
             }
 
+        # ── 0) Assistant identity / meta-system Q&A → never agentic ─────
+        if is_assistant_meta_ask(text):
+            return _out(
+                "contextual" if hist >= 1 or mem_rel else "instant",
+                0.88,
+                hist >= 1 or mem_rel,
+                False,
+                False,
+                "Assistant identity/meta ask — contextual/direct, no planner",
+            )
+
         # ── 1) Agentic (highest priority) ─────────────────────────────
         if ag_count > 0 and max_urg >= 0.25:
             return _out(
@@ -634,8 +708,11 @@ class StrategySelector:
                 f"Active goals present (count={ag_count}, max_urgency={max_urg:.2f})",
             )
 
-        complex_task = n_words >= 14 and (
-            lower.count(",") >= 2 or " i " in lower or " następnie " in lower
+        multi_step = _text_has_marker(lower, ascii_l, AGENTIC_MULTISTEP_MARKERS)
+        complex_task = (
+            n_words >= 16
+            and multi_step
+            and (_has_kw(self._AGENTIC_KEYWORDS_PL) or "zaplanuj" in ascii_l)
         )
         if _has_kw(self._AGENTIC_KEYWORDS_PL) or complex_task:
             return _out(

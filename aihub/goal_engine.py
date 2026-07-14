@@ -295,12 +295,14 @@ class GoalEngine:
         title: str,
     ) -> Goal | None:
         fingerprint = _goal_fingerprint(user_id, goal_type, title)
+        from aihub.db.sql_json import json_text_eq
+
         row = fetch_one(
-            """
+            f"""
             SELECT * FROM goals
             WHERE user_id=?
               AND status IN ('proposed','active','blocked','scheduled')
-              AND json_extract(metadata, '$.goal_fingerprint') = ?
+              AND {json_text_eq("metadata", "goal_fingerprint")}
             ORDER BY updated_at DESC
             LIMIT 1
             """,
@@ -348,6 +350,16 @@ class GoalEngine:
 
         text = str(event.get("text") or event.get("message") or "").strip()
         text_l = text.lower()
+
+        skip, _ = self._should_skip_goal_extraction(text)
+        if skip:
+            logger.info(
+                "goal.candidates user=%s extracted=0 text=%s memory_total=%d cognitive_action= skipped=simple_meta",
+                user_id,
+                bool(text),
+                int(dict(memory_context or {}).get("total", 0) or 0),
+            )
+            return []
 
         candidates: list[GoalCandidate] = []
 
@@ -1120,6 +1132,26 @@ class GoalEngine:
         )
         return selected, reason, scores
 
+    @staticmethod
+    def _should_skip_goal_extraction(text: str) -> tuple[bool, str]:
+        """Skip persistent goals for simple meta / greeting turns."""
+        from aihub.strategy_selector import is_assistant_meta_ask
+
+        raw = (text or "").strip()
+        if not raw:
+            return True, "GOAL_SKIPPED_EMPTY"
+        lower = raw.lower()
+        if is_assistant_meta_ask(raw):
+            return True, "GOAL_SKIPPED_SIMPLE_META"
+        n_words = len([w for w in raw.split() if w])
+        if n_words <= 3 and lower in {"hej", "elo", "cześć", "czesc", "hi", "hello", "hey"}:
+            return True, "GOAL_SKIPPED_GREETING"
+        if n_words <= 6 and any(
+            p in lower for p in ("kim jesteś", "kim jestes", "jak działasz", "jak dzialasz", "powiedz krótko")
+        ):
+            return True, "GOAL_SKIPPED_SIMPLE_META"
+        return False, ""
+
     def build_goal_context(
         self,
         user_id: str,
@@ -1129,6 +1161,28 @@ class GoalEngine:
         system_conditions: dict[str, Any] | None = None,
     ) -> GoalContext:
         self.expire_goals(user_id)
+
+        event = dict(input_event or {})
+        text = str(event.get("text") or event.get("message") or "").strip()
+        skip, skip_reason = self._should_skip_goal_extraction(text)
+        if skip:
+            active_goals = self.get_active_goals(user_id)
+            logger.info(
+                "goal.context user=%s active=%d candidates=0 selected= reason=%s",
+                user_id,
+                len(active_goals),
+                skip_reason,
+            )
+            return GoalContext(
+                user_id=user_id,
+                active_goals=active_goals,
+                top_scores=[],
+                selected_goal=None,
+                selected_reason=skip_reason,
+                execution_hint=None,
+                candidates=[],
+                created_goal_ids=[],
+            )
 
         candidates = self.extract_goal_candidates(
             input_event=input_event,

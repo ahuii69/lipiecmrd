@@ -16,9 +16,9 @@ _thread: threading.Thread | None = None
 
 
 def _users_from_env() -> list[str]:
-    raw = os.getenv("AIHUB_CONSOLIDATION_USERS", "default")
-    users = [part.strip() for part in raw.split(",") if part.strip()]
-    return users or ["default"]
+    # Explicit opt-in only — do not silently maintain the legacy "default" namespace.
+    raw = os.getenv("AIHUB_CONSOLIDATION_USERS", "").strip()
+    return [part.strip() for part in raw.split(",") if part.strip()]
 
 
 def _suppress_threshold() -> float:

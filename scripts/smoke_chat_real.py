@@ -79,17 +79,30 @@ def main() -> int:
     if not isinstance(data, dict):
         print("FAIL: /chat/turn response is not JSON object", file=sys.stderr)
         return 1
+    # HTTP 200 alone is NOT success when body.ok is false (agent_handoff_error etc.).
+    if data.get("ok") is False:
+        print("FAIL: /chat/turn HTTP 200 but ok=false", file=sys.stderr)
+        print(json.dumps(data, ensure_ascii=False, indent=2)[:4000], file=sys.stderr)
+        return 1
+    if data.get("ok") is not True:
+        # Missing ok treated as failure for smoke honesty.
+        print("FAIL: /chat/turn missing ok=true", file=sys.stderr)
+        return 1
     text = str(data.get("response_text") or data.get("message") or data.get("text") or "").strip()
     if not text:
         print("FAIL: /chat/turn returned empty response text", file=sys.stderr)
         print(json.dumps(data, ensure_ascii=False, indent=2)[:3000], file=sys.stderr)
         return 1
     trace = data.get("trace") if isinstance(data.get("trace"), dict) else {}
+    if str(trace.get("effective_runtime_path") or "") == "agent_handoff_error":
+        print("FAIL: agent_handoff_error path", file=sys.stderr)
+        return 1
     print(json.dumps({
         "ok": True,
         "http_status": status,
         "response_chars": len(text),
         "session_id": session_id,
+        "selected_strategy": trace.get("selected_strategy"),
         "trace_keys": sorted(list(trace.keys()))[:40],
     }, ensure_ascii=False, indent=2))
     return 0

@@ -518,19 +518,38 @@ def build_cognitive_influence_pack(
                 "Otwarte pytania z rozmowy: " + "; ".join(cs.open_questions[-3:])
             )
 
-        # Low intent confidence → planner/reasoning escalation (nie dla short/greeting)
+        # Low intent confidence → reasoning; planner only for long ambiguous multi-step
         words_n = len([w for w in re.split(r"\s+", str(message or "").strip()) if w])
         low_conf = pack.intent_confidence < 0.55 or pack.ambiguity >= 0.55
-        skip_escalate = pack.primary_intent in (
-            "greeting",
-            "simple_technical_fix",
-            "literal_food_or_recipe",
-        ) or (words_n <= 2 and pack.ambiguity < 0.45 and pack.intent_confidence >= 0.45)
+        try:
+            from aihub.strategy_selector import is_assistant_meta_ask
+
+            meta_ask = is_assistant_meta_ask(message or "")
+        except Exception:
+            meta_ask = False
+        skip_escalate = (
+            pack.primary_intent
+            in (
+                "greeting",
+                "simple_technical_question",
+                "literal_food_or_recipe",
+                "meta_audit_request",
+                "identity_question",
+                "self_description",
+            )
+            or meta_ask
+            or (words_n <= 8 and pack.ambiguity < 0.55)
+            or (words_n <= 2 and pack.ambiguity < 0.45 and pack.intent_confidence >= 0.45)
+        )
         if low_conf and not skip_escalate:
             pack.force_reasoning = True
-            pack.force_planner_analysis = True
+            if words_n >= 18 and pack.ambiguity >= 0.6:
+                pack.force_planner_analysis = True
             pack.strategy_bias_codes.append("COG_LOW_INTENT_CONFIDENCE_ESCALATE")
             pack.influence_reason_codes.append("COG_INTENT_RANKING_ESCALATION")
+        elif meta_ask:
+            pack.force_planner_analysis = False
+            pack.influence_reason_codes.append("COG_META_ASK_NO_PLANNER")
 
         # Research variants from pragmatics rewrite + conversation
         rw = str(getattr(pragmatics, "rewritten_query_for_tools", "") or "")

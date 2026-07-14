@@ -72,11 +72,12 @@ class ChatRuntime(TurnOps):
 
     def __init__(self) -> None:
         super().__init__()
-        # Rebind after TurnOps: honor cr.get_default_provider / registry patches.
+        # Rebind after TurnOps: honor registry patches (primary + reserve failover).
         try:
-            provider = _resolve_default_provider()
-            self._provider = provider
-            self._provider_service = ProviderExecutionService(provider)
+            from aihub.llm import provider_registry
+
+            primary = _resolve_default_provider()
+            self._provider_service = provider_registry.build_provider_execution_service(primary=primary)
         except Exception:
             logger.debug("provider refresh skipped", exc_info=True)
         self._app = ChatTurnApplicationService(self)
@@ -111,10 +112,12 @@ def get_chat_runtime() -> ChatRuntime:
         _RUNTIME = ChatRuntime()
     else:
         try:
+            from aihub.llm import provider_registry
+
             fresh = _resolve_default_provider()
             if fresh is not None:
                 _RUNTIME._provider = fresh
-                _RUNTIME._provider_service = ProviderExecutionService(fresh)
+                _RUNTIME._provider_service = provider_registry.build_provider_execution_service(primary=fresh)
         except Exception:
             logger.debug("provider hot-swap skipped", exc_info=True)
     return _RUNTIME

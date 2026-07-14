@@ -15,6 +15,8 @@ os.environ.setdefault("AIHUB_DISABLE_REMOTE_EMBEDDINGS", "1")
 os.environ.setdefault("AIHUB_DETERMINISTIC_EMBEDDING_FALLBACK", "1")
 os.environ.setdefault("AIHUB_ALLOW_NUMPY_VECTOR_FALLBACK", "1")
 os.environ.setdefault("AIHUB_BFF_PRINCIPAL_SECRET", "test-principal-secret-value-123456")
+# Unit tests use fake LLM providers; never hit live Groq/DeepInfra reserve in pytest.
+os.environ.setdefault("GROQ_API_KEY", "")
 
 import pytest
 from fastapi.testclient import TestClient

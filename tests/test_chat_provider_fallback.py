@@ -58,6 +58,14 @@ async def test_chat_runtime_provider_failure_uses_canonical_fallback(monkeypatch
 
     monkeypatch.setattr(cr, "get_default_provider", _provider_factory)
     monkeypatch.setattr(cr, "get_executive_controller", _controller_factory)
+    from aihub.llm import provider_registry as pr
+    from aihub.turn.provider_service import ProviderExecutionService
+
+    monkeypatch.setattr(
+        pr,
+        "build_provider_execution_service",
+        lambda primary=None: ProviderExecutionService(primary=_FailingProvider(), reserve=None),
+    )
 
     runtime = cr.ChatRuntime()
     out = await runtime.run_turn(
@@ -68,8 +76,6 @@ async def test_chat_runtime_provider_failure_uses_canonical_fallback(monkeypatch
 
     assert out.ok is False
     assert "fallback" in out.trace
-    # 06.07 response-quality fix: the provider-failure fallback is now dry/utilitarian (no
-    # personification, no theatre). It must state system readiness and ask for a concrete next step.
     from aihub.response_persona_guard import (
         contains_persona_leakage,
         dry_fallback_response,
@@ -83,10 +89,4 @@ async def test_chat_runtime_provider_failure_uses_canonical_fallback(monkeypatch
         assert token not in out.response_text.lower()
     assert out.trace.get("used_fallback") is True
     assert out.trace.get("response_grounding_mode") == "fallback"
-    fake_ctrl = ctrl_holder.get("c")
-    assert fake_ctrl is not None
-    assert fake_ctrl.last_event is not None
-    assert fake_ctrl.last_event.get("force_strategy") == "cognitive_direct"
-    assert "chat_runtime:provider_fallback" in str(
-        fake_ctrl.last_event.get("force_strategy_reason") or ""
-    )
+    assert ctrl_holder.get("c") is None
