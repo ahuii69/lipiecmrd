@@ -11,9 +11,18 @@ async def run_execute_agent_handoff(self, *, turn: ChatTurnInput, decision_core:
     try:
         if stream_session_active():
             await emit_status('tools', label_pl='Analizuję…')
+        # 19.07: bind agentic handoff to canonical WK Execution Graph when present
+        _egid = str(decision_core.get('execution_graph_id') or '').strip()
+        if _egid:
+            try:
+                from aihub.world_knowledge.execution import resume_execution
+                _resumed = resume_execution(_egid, owner=f"chat:{turn.user_id}")
+                decision_core['execution_graph_resumed'] = bool(_resumed)
+            except Exception:
+                logger.debug('WK execution resume skipped', exc_info=True)
         controller = _cr_hook('get_executive_controller', get_executive_controller)()
         fstr, freason = map_chat_execution_mode_to_force_strategy(decision_core)
-        cycle = await controller.run_cycle({'text': turn.message, 'max_steps': 8, 'timeout_seconds': 20.0, 'force_strategy': fstr, 'force_strategy_reason': f'{freason};chat_runtime:agent_handoff'}, mode='run', user_id=turn.user_id)
+        cycle = await controller.run_cycle({'text': turn.message, 'max_steps': 8, 'timeout_seconds': 20.0, 'force_strategy': fstr, 'force_strategy_reason': f'{freason};chat_runtime:agent_handoff', 'execution_graph_id': _egid or None, 'long_horizon_task_id': decision_core.get('long_horizon_task_id'), 'session_id': turn.session_id, 'turn_id': getattr(turn, 'turn_id', None) or getattr(ctx, 'turn_id', None) or ''}, mode='run', user_id=turn.user_id)
         agent_response = _cr_hook('build_agent_cycle_response', build_agent_cycle_response)(cycle, include_debug=turn.include_debug)
     except Exception as exc:
         logger.error('Agent handoff failed user=%s error=%s', turn.user_id, exc)
@@ -55,6 +64,17 @@ async def run_execute_agent_handoff(self, *, turn: ChatTurnInput, decision_core:
         _exec_strat = agent_response.get('strategy')
         if _exec_strat is not None and str(_exec_strat).strip():
             trace['executive_strategy'] = str(_exec_strat)
+    if isinstance(cycle, dict):
+        for _gk in (
+            'execution_graph_id',
+            'execution_graph_bound',
+            'execution_graph_created',
+            'execution_graph_resumed',
+            'execution_graph_finalized',
+            'execution_graph_status',
+        ):
+            if _gk in cycle:
+                trace[_gk] = cycle.get(_gk)
     if memory_used_trace:
         trace['memory_used'] = memory_used_trace
     self._augment_memory_observability(trace, memory_used_trace, memory_context)

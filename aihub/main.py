@@ -19,7 +19,7 @@ from contextlib import asynccontextmanager
 from typing import Any
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Query, Response
+from fastapi import FastAPI, HTTPException, Query, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 
 from aihub.config import APP_NAME, HOST, PORT, gpt_openapi_spec_path
@@ -509,37 +509,52 @@ def sse(user_id: str, last_id: int = 0):
 
 
 # ---------------------------
-# FS tools
+# FS tools (admin-only; see auth_middleware._ADMIN_PREFIXES)
 # ---------------------------
+def _principal_user_id(request: Request) -> str:
+    principal = getattr(request.state, "principal", None)
+    uid = str(getattr(principal, "user_id", "") or "").strip()
+    if not uid:
+        raise HTTPException(status_code=401, detail="authentication required")
+    return uid
+
+
 @app.post("/fs/write")
-def fs_write(inp: FSWriteIn, user_id: str = "default") -> dict[str, Any]:
-    """Write file."""
+def fs_write(request: Request, inp: FSWriteIn) -> dict[str, Any]:
+    """Write file (admin)."""
+    user_id = _principal_user_id(request)
     try:
         get_psyche_core().ensure_user(user_id)
         result = write_file(user_id, inp.path, inp.content, overwrite=inp.overwrite)
         logger.info("File written for %s: %s", user_id, inp.path)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error in fs_write: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e)) from e
 
 
 @app.post("/fs/read")
-def fs_read(inp: FSReadIn, user_id: str = "default") -> dict[str, Any]:
-    """Read file."""
+def fs_read(request: Request, inp: FSReadIn) -> dict[str, Any]:
+    """Read file (admin)."""
+    user_id = _principal_user_id(request)
     try:
         get_psyche_core().ensure_user(user_id)
         result = read_file(user_id, inp.path, max_bytes=inp.max_bytes)
         logger.debug("File read for %s: %s", user_id, inp.path)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error in fs_read: %s", e, exc_info=True)
         raise HTTPException(status_code=404, detail=str(e)) from e
 
 
 @app.post("/fs/list")
-def fs_list(inp: FSListIn, user_id: str = "default") -> dict[str, Any]:
-    """List directory."""
+def fs_list(request: Request, inp: FSListIn) -> dict[str, Any]:
+    """List directory (admin)."""
+    user_id = _principal_user_id(request)
     try:
         get_psyche_core().ensure_user(user_id)
         result = list_dir(
@@ -547,6 +562,8 @@ def fs_list(inp: FSListIn, user_id: str = "default") -> dict[str, Any]:
         )
         logger.debug("Directory listed for %s: %s", user_id, inp.path)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error in fs_list: %s", e, exc_info=True)
         raise HTTPException(status_code=404, detail=str(e)) from e
@@ -704,43 +721,50 @@ async def web_ingest(inp: WebIngestIn, user_id: str = "default") -> dict[str, An
 
 
 # ---------------------------
-# Snapshots
+# Snapshots (admin-only)
 # ---------------------------
 @app.post("/system/snapshot/create")
-def snapshot_create(inp: SnapshotCreateIn, user_id: str = "default") -> dict[str, Any]:
-    """Create snapshot."""
+def snapshot_create(request: Request, inp: SnapshotCreateIn) -> dict[str, Any]:
+    """Create snapshot (admin)."""
+    user_id = _principal_user_id(request)
     try:
         get_psyche_core().ensure_user(user_id)
         result = create_snapshot(user_id, inp.reason)
         logger.info("Snapshot created for %s: %s", user_id, inp.reason)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error in snapshot_create: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.get("/system/snapshot/list")
-def snapshot_list() -> dict[str, Any]:
-    """List snapshots."""
+def snapshot_list(request: Request) -> dict[str, Any]:
+    """List snapshots (admin)."""
+    _principal_user_id(request)
     try:
         snapshots = list_snapshots()
         logger.debug("Listed %d snapshots", len(snapshots))
         return {"snapshots": snapshots}
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error in snapshot_list: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
 @app.post("/system/snapshot/restore")
-def snapshot_restore(
-    inp: SnapshotRestoreIn, user_id: str = "default"
-) -> dict[str, Any]:
-    """Restore from snapshot."""
+def snapshot_restore(request: Request, inp: SnapshotRestoreIn) -> dict[str, Any]:
+    """Restore from snapshot (admin)."""
+    user_id = _principal_user_id(request)
     try:
         get_psyche_core().ensure_user(user_id)
         result = restore_snapshot(user_id, inp.snapshot_id)
         logger.info("Snapshot restored for %s: %s", user_id, inp.snapshot_id)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error("Error in snapshot_restore: %s", e, exc_info=True)
         raise HTTPException(status_code=400, detail=str(e)) from e

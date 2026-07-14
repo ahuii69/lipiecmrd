@@ -8,7 +8,8 @@ mordzixai.xyz {
 		-Server
 	}
 
-	reverse_proxy 127.0.0.1:3000 {
+	# Cockpit production bind (aihub-frontend.service): PORT=3001
+	reverse_proxy 127.0.0.1:3001 {
 		header_up X-Forwarded-Proto {scheme}
 		header_up X-Forwarded-Host {host}
 	}

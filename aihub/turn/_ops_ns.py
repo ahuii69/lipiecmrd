@@ -87,11 +87,18 @@ from aihub.llm import provider_registry as _provider_registry
 def get_default_provider():
     """Resolve the default LLM provider at runtime.
 
-    Kept as a module-level hook so older tests/integrations can monkeypatch
-    ``aihub.chat_runtime.get_default_provider``, while newer code can patch
-    ``aihub.llm.provider_registry.get_default_provider`` and still affect fresh
-    ChatRuntime instances.
+    Prefer ``aihub.chat_runtime.get_default_provider`` when that module attribute
+    differs from this function (thin wrapper or test monkeypatch). Otherwise use
+    the registry hook so patches on ``provider_registry.get_default_provider`` apply.
     """
+    try:
+        import aihub.chat_runtime as _cr
+
+        cr_fn = getattr(_cr, "get_default_provider", None)
+        if cr_fn is not None and cr_fn is not get_default_provider:
+            return cr_fn()
+    except Exception:
+        return _provider_registry.get_default_provider()
     return _provider_registry.get_default_provider()
 from aihub.llm.provider_types import (
     ProviderChatRequest,

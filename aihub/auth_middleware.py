@@ -34,6 +34,9 @@ _AUTH_PREFIXES = (
 _ADMIN_PREFIXES = (
     "/admin/",
     "/cockpit/schema-health",
+    # 19.07 consolidation: privileged side-effects require admin role
+    "/fs/",
+    "/system/snapshot/",
 )
 
 

@@ -8,6 +8,9 @@ It keeps a broad firewall allowlist for compatibility but a strict auth allowlis
 
 from typing import Tuple
 
+# 19.07: keep ALWAYS_ALLOW aligned with NO_AUTH (+ docs/self-heal status).
+# Broad legacy prefixes (/memory, /fs, /sse, /psyche/brain) removed — they were
+# only consumed by the archived FirewallMiddleware and invited auth bypass if remounted.
 ALWAYS_ALLOW_PREFIXES: Tuple[str, ...] = (
     "/health",
     "/system/ping",
@@ -19,17 +22,9 @@ ALWAYS_ALLOW_PREFIXES: Tuple[str, ...] = (
     "/gpt-openapi.json",
     "/docs",
     "/redoc",
-    "/ai",
     "/system/self-heal",
     "/system/self-heal-db",
-    "/psyche/brain/live",
-    "/sse",
     "/system/security",
-    "/memory/get",
-    "/memory",
-    "/memory/",
-    "/fs",
-    "/fs/",
 )
 
 NO_AUTH_PATHS: Tuple[str, ...] = (

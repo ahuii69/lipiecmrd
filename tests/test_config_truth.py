@@ -259,22 +259,20 @@ def test_env_example_documents_runtime_flags() -> None:
     assert "SELF_HEAL_WRITE" in ex
 
 
-def test_firewall_and_recorder_middleware_not_registered_on_app() -> None:
-    """06.07 P1: firewall/recorder middleware must not silently start protecting/recording.
+def test_firewall_and_recorder_middleware_archived_outside_package() -> None:
+    """19.07: firewall/recorder archived; must not live under ``aihub.middleware``."""
+    import aihub
 
-    Both classes are LEGACY / NOT REGISTERED (see module docstrings in
-    ``aihub/middleware/firewall.py`` and ``aihub/middleware/recorder.py``). This test locks that
-    decision in: if someone adds ``app.add_middleware(FirewallMiddleware)`` or
-    ``app.add_middleware(EventRecorderMiddleware)`` to ``aihub/main.py``, this test must be
-    updated deliberately (and the recorder's body redaction must be addressed first).
-    """
-    from aihub.main import app
-    from aihub.middleware.firewall import FirewallMiddleware
-    from aihub.middleware.recorder import EventRecorderMiddleware
-
-    registered_middleware_classes = {m.cls for m in app.user_middleware}
-    assert FirewallMiddleware not in registered_middleware_classes
-    assert EventRecorderMiddleware not in registered_middleware_classes
+    aihub_root = Path(aihub.__file__).resolve().parent
+    assert not (aihub_root / "middleware" / "firewall.py").exists()
+    assert not (aihub_root / "middleware" / "recorder.py").exists()
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("aihub.middleware.firewall")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("aihub.middleware.recorder")
+    repo = aihub_root.parent
+    assert (repo / "archive" / "legacy_routers" / "middleware" / "firewall.py").is_file()
+    assert (repo / "archive" / "legacy_routers" / "middleware" / "recorder.py").is_file()
 
 
 def test_admin_router_collision_archived_not_in_aihub_package() -> None:

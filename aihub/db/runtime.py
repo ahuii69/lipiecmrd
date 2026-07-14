@@ -1578,6 +1578,20 @@ def init_db() -> None:
     except Exception:
         logger.exception("turn/durable schema ensure failed")
 
+    try:
+        from aihub.adaptive_learning.schema import ensure_adaptive_learning_schema
+
+        ensure_adaptive_learning_schema()
+    except Exception:
+        logger.exception("adaptive learning schema ensure failed")
+
+    try:
+        from aihub.world_knowledge.schema import ensure_world_knowledge_schema
+
+        ensure_world_knowledge_schema()
+    except Exception:
+        logger.exception("world knowledge schema ensure failed")
+
 
 def now_ts() -> float:
     return time.time()

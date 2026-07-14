@@ -306,9 +306,28 @@ class PromptContextMixin:
         freshness_needed = any(
             _keyword_in_text(tok, lower, ascii_l) for tok in WEB_REQUIRED_QUERY_KEYWORDS
         )
+        # Pragmatics may have demoted false research (deixis like „ten wczorajszy…”) —
+        # do not re-force web via substring freshness keywords.
+        reason_codes = list(decision_core.get("reason_codes") or [])
+        pragmatics_blocks_freshness = (
+            "PRAGMATICS_CONTEXT_REQUIRED" in reason_codes
+            and "PRAGMATICS_WEB_QUERY_REWRITE" not in reason_codes
+            and str(decision_core.get("web_decision_reason") or "").startswith("pragmatics_")
+        ) or (
+            str(decision_core.get("web_decision_reason") or "")
+            == "pragmatics_demote_research_to_contextual"
+        )
+        # Also block when temporal keyword was only a morphological substring
+        # (wczoraj ⊂ wczorajszy) without real sports/news research intent.
+        if freshness_needed and not has_attachments and not pragmatics_blocks_freshness:
+            # Strengthen: if deixis follow-up (“ten/ta/to …”) do not force web.
+            if re.search(r"(?iu)\b(ten|ta|to|tego|tamten)\b", lower) and not re.search(
+                r"(?iu)\b(mecz|wynik|liga|news|cena|kurs)\b", lower
+            ):
+                freshness_needed = False
         # An attached image/file makes the turn about that attachment; do not force web
         # research on top of it (the vision/description path must win).
-        if freshness_needed and not has_attachments:
+        if freshness_needed and not has_attachments and not pragmatics_blocks_freshness:
             decision_core["selected_strategy"] = "research"
             decision_core["web_decision"] = "required"
             decision_core["web_decision_reason"] = "freshness_guardrail"

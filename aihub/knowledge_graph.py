@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
+"""Legacy knowledge graph adapter (19.07).
 
-"""
-Knowledge Graph - Reprezentacja wiedzy i relacji między faktami.
+Canonical SoT for typed claims/entities/evidence is ``aihub.world_knowledge``.
+This module remains for read/traversal compatibility and migration; new writes
+must not dual-write here from the chat turn pipeline.
 
-Odpowiada za:
-- Mapowanie relacji między faktami
-- Semantic reasoning
+Historical responsibilities (read/traversal only going forward):
+- Mapping relations between facts
+- Semantic reasoning helpers
 - Constraint propagation
 - Query resolution
 """

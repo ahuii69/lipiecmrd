@@ -875,6 +875,7 @@ def select_strategy(
     mode: str,
     active_goals_summary: dict[str, Any] | None = None,
     history: list[Any] | None = None,
+    pragmatics: Any | None = None,
 ) -> StrategySelection:
     """
     Bounded-cost classification: memory + psyche snapshots, deterministic rules.
@@ -1098,6 +1099,37 @@ def select_strategy(
         "strategy_confidence_bias": dict(bias_map),
         "strategy_bias_load_source": bias_load_source,
     }
+
+    if pragmatics is not None:
+        try:
+            from aihub.turn.pragmatics import apply_pragmatics_to_strategy
+
+            (
+                selection.selected_strategy,
+                selection.reason_codes,
+                selection.web_decision,
+                selection.web_decision_reason,
+            ) = apply_pragmatics_to_strategy(
+                selected_strategy=selection.selected_strategy,
+                reason_codes=list(selection.reason_codes),
+                web_decision=selection.web_decision,
+                web_decision_reason=selection.web_decision_reason,
+                pragmatics=pragmatics,
+            )
+            selection.research_needed = selection.web_decision == "required" or bool(
+                getattr(pragmatics, "needs_web", False)
+            )
+            if getattr(pragmatics, "needs_planner", False):
+                selection.planner_recommended = True
+            selection.trace_payload["selected_strategy"] = selection.selected_strategy
+            selection.trace_payload["reason_codes"] = list(selection.reason_codes)
+            selection.trace_payload["web_decision"] = selection.web_decision
+            selection.trace_payload["web_decision_reason"] = selection.web_decision_reason
+            selection.trace_payload["pragmatics_applied"] = True
+        except Exception:
+            logger.debug("pragmatics strategy apply failed", exc_info=True)
+            selection.reason_codes.append("PRAGMATICS_DEGRADED_FALLBACK")
+            selection.degraded = True
 
     total_time_ms = (time.time() - start_time) * 1000
     selection.timing["total_ms"] = total_time_ms

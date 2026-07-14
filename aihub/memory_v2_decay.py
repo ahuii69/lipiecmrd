@@ -4,14 +4,9 @@ Memory V2 decay and lifecycle management.
 
 Handles memory freshness decay, bucket transitions, and archival logic.
 
-Runtime wiring status (06.07 repair sprint, P2 decision): this logic is real and covered by
-``tests/test_memory_v2_decay.py``, but ``run_decay_pass`` is **not called by any scheduled
-worker/cron in the active runtime today** — decay buckets are only ever set at write time via
-``aihub.memory_v2_scoring`` in the normal ingest path, not periodically re-decayed in the
-background. Decision: keep as a maintained pillar module (Memory V2 lifecycle), not dead code and
-not archived, but do not describe it in docs as "running" until a scheduler actually calls
-``run_decay_pass`` (e.g. from ``aihub/workers/``). Wiring a new scheduled job is a product/ops
-decision out of scope for this security-focused repair sprint.
+Runtime wiring (19.07): ``run_decay_pass`` is called from
+``aihub.workers.consolidation._run_once`` alongside Memory V2 consolidation and
+forgetting sweep.
 """
 
 import logging

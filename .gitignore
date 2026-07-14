@@ -46,6 +46,12 @@ logs/
 *.sqlite3
 *.db
 
+# --- Ad-hoc diagnostic dumps (not source of truth) ---
+/all-endpoints.txt
+/chat-core-connections.txt
+/chat-pipeline-audit.txt
+/engine-reference-counts.txt
+
 # --- OS / editor ---
 .DS_Store
 Thumbs.db

@@ -30,8 +30,19 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
         except Exception:
             logger.debug('Decision core: active goals lookup failed', exc_info=True)
             _active_goals_summary = None
-        selection = select_strategy(user_id=turn.user_id, user_text=turn.message or '', mode=ctx.mode, active_goals_summary=_active_goals_summary, history=list(turn.history or []))
+        selection = select_strategy(user_id=turn.user_id, user_text=turn.message or '', mode=ctx.mode, active_goals_summary=_active_goals_summary, history=list(turn.history or []), pragmatics=(ctx.system_context.get('pragmatics_obj') if isinstance(ctx.system_context, dict) else None))
+        # If pragmatics came as dict only, rehydrate lightly for strategy apply
+        if selection and isinstance(ctx.system_context, dict) and ctx.system_context.get('pragmatics_obj') is None and isinstance(ctx.system_context.get('pragmatics'), dict):
+            try:
+                from aihub.turn.pragmatics import PragmaticAnalysis, apply_pragmatics_to_strategy
+                _pa = PragmaticAnalysis.model_validate(ctx.system_context['pragmatics'])
+                selection.selected_strategy, selection.reason_codes, selection.web_decision, selection.web_decision_reason = apply_pragmatics_to_strategy(selected_strategy=selection.selected_strategy, reason_codes=list(selection.reason_codes), web_decision=selection.web_decision, web_decision_reason=selection.web_decision_reason, pragmatics=_pa)
+                ctx.system_context['pragmatics_obj'] = _pa
+            except Exception:
+                logger.debug('pragmatics rehydrate failed', exc_info=True)
         result['selected_strategy'] = selection.selected_strategy
+        result['base_strategy'] = selection.selected_strategy
+        result['strategy_adjustment_log'] = []
         result['reason_codes'] = list(selection.reason_codes)
         result['strategy_confidence'] = selection.confidence
         result['strategy_degraded'] = selection.degraded
@@ -101,6 +112,7 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
             psyche_v2_mode = psyche_v2_snapshot.get('mode', 'neutral')
             psyche_v2_relation_trust = psyche_v2_snapshot.get('relation_trust', 0.5)
         memory_influenced_strategy = False
+        # 19.07: Psyche must NOT rewrite selected_strategy (only tone/confidence hints).
         psyche_influenced_strategy = False
         if memory_v2_actionable_contradictions > 0 and result['selected_strategy'] == 'instant':
             result['selected_strategy'] = 'contextual'
@@ -111,19 +123,20 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
             base_conf = float(result.get('strategy_confidence') or 0.7)
             result['strategy_confidence'] = min(0.95, base_conf + 0.1)
             result['reason_codes'].append('MEMORY_V2_CONTEXT_BOOST')
-        if psyche_v2_mode == 'exploratory' and result['selected_strategy'] == 'instant':
-            result['selected_strategy'] = 'contextual'
-            result['reason_codes'].append('PSYCHE_V2_EXPLORATORY')
-            psyche_influenced_strategy = True
-            logger.info(f'V2: exploratory mode → contextual (user={turn.user_id})')
         if psyche_v2_mode == 'cautious':
             base_conf = float(result.get('strategy_confidence') or 0.7)
             result['strategy_confidence'] = max(0.3, base_conf - 0.15)
-            result['reason_codes'].append('PSYCHE_V2_CAUTIOUS')
+            result['reason_codes'].append('PSYCHE_V2_CAUTIOUS_CONF')
+            caution = '[Psyche: ostrożniejszy ton, bez zmiany strategii]'
+            result['strategy_hints'] = (result['strategy_hints'] + ' ' + caution).strip() if result['strategy_hints'] else caution
         if psyche_v2_relation_trust < 0.3:
             base_conf = float(result.get('strategy_confidence') or 0.7)
             result['strategy_confidence'] = max(0.3, base_conf - 0.1)
-            result['reason_codes'].append('PSYCHE_V2_LOW_TRUST')
+            result['reason_codes'].append('PSYCHE_V2_LOW_TRUST_CONF')
+        if psyche_v2_mode == 'exploratory':
+            result['reason_codes'].append('PSYCHE_V2_EXPLORATORY_TONE')
+            hint = '[Psyche: bardziej eksploracyjny ton]'
+            result['strategy_hints'] = (result['strategy_hints'] + ' ' + hint).strip() if result['strategy_hints'] else hint
         if _pctx is not None and getattr(_pctx, 'loaded', False):
             cd = getattr(_pctx, 'consistency_decision', 'allow')
             if cd in ('dampen', 'suppress'):
@@ -244,7 +257,153 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
             result['strategy_confidence'] = round(max(0.4, _conf * 0.93), 3)
     except Exception:
         logger.debug('Decision core: consistency check failed', exc_info=True)
+    # Cognitive Integration V2 — apply cross-module influence to decision
+    try:
+        from aihub.turn.cognitive_integration import (
+            CognitiveInfluencePack,
+            apply_cognitive_to_decision,
+            build_cognitive_influence_pack,
+        )
+        _cog = None
+        if isinstance(ctx.system_context, dict):
+            _cog = ctx.system_context.get('cognitive_obj')
+            if _cog is None and isinstance(ctx.system_context.get('cognitive'), dict):
+                _cog = CognitiveInfluencePack.model_validate(ctx.system_context['cognitive'])
+        # Enrich with decision-time signals (goals + experience)
+        _cog = build_cognitive_influence_pack(
+            user_id=turn.user_id,
+            session_id=turn.session_id,
+            message=turn.message or '',
+            history=list(turn.history or []),
+            pragmatics=(ctx.system_context.get('pragmatics_obj') if isinstance(ctx.system_context, dict) else None),
+            memory_brief=str((ctx.system_context or {}).get('memory_brief') or ''),
+            psyche_brief=str((ctx.system_context or {}).get('psyche_brief') or ''),
+            memory_v2_ctx=memory_v2_runtime_ctx,
+            psyche_v2_ctx=psyche_v2_behavior_ctx,
+            identity_snapshot=(ctx.system_context.get('identity_bridge_snapshot') if isinstance(ctx.system_context, dict) else None),
+            selected_goal=result.get('selected_goal') if isinstance(result.get('selected_goal'), dict) else None,
+            experience_signal_summary=str(result.get('experience_signal_summary') or ''),
+            correction_hints=str((ctx.system_context or {}).get('correction_hints_text') or ''),
+            reflection_summary=str((ctx.system_context or {}).get('reflection_summary_prior') or ''),
+        )
+        apply_cognitive_to_decision(decision_core=result, pack=_cog)
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['cognitive'] = _cog.model_dump()
+            ctx.system_context['cognitive_obj'] = _cog
+    except Exception:
+        logger.debug('Decision core: cognitive apply failed', exc_info=True)
+    _intent = ''
+    if isinstance(ctx.system_context, dict):
+        _cog2 = ctx.system_context.get('cognitive_obj')
+        if _cog2 is not None:
+            _intent = str(getattr(_cog2, 'primary_intent', '') or '')
+        if not _intent:
+            _pr = ctx.system_context.get('pragmatics_obj')
+            if _pr is not None:
+                _intent = str(getattr(_pr, 'primary_intent', '') or '')
+    # Adaptive learning influences (self-model, lessons, failures, calibrated confidence)
+    try:
+        from aihub.adaptive_learning import apply_learning_influences_to_decision
+        result['session_id'] = turn.session_id
+        apply_learning_influences_to_decision(
+            decision_core=result,
+            user_id=turn.user_id,
+            message=turn.message or '',
+            intent=_intent,
+        )
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['learning_decision'] = {
+                'self_model_influenced_strategy': result.get('self_model_influenced_strategy'),
+                'learning_strategy_bias': result.get('learning_strategy_bias'),
+                'long_horizon_task_id': result.get('long_horizon_task_id'),
+                'long_horizon_rejected': result.get('long_horizon_rejected'),
+                'long_horizon_accepted': result.get('long_horizon_accepted'),
+                'blocked_rejected_options': result.get('blocked_rejected_options'),
+                'learning_suppress_options': result.get('learning_suppress_options'),
+                'learning_length_directive': result.get('learning_length_directive'),
+                'learning_machine_actions_applied': result.get('learning_machine_actions_applied'),
+                'user_model_v2': result.get('user_model_v2'),
+                'confidence_calibration_delta': result.get('confidence_calibration_delta'),
+            }
+    except Exception:
+        logger.debug('Decision core: adaptive learning apply failed', exc_info=True)
+    # World knowledge / Evidence+KG influences
+    try:
+        from aihub.world_knowledge import apply_knowledge_influences_to_decision
+        apply_knowledge_influences_to_decision(
+            decision_core=result,
+            user_id=turn.user_id,
+            message=turn.message or '',
+            intent=_intent,
+        )
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['knowledge_decision'] = {
+                'knowledge_context': result.get('knowledge_context'),
+                'execution_graph_id': result.get('execution_graph_id'),
+                'verification_required': result.get('verification_required'),
+                'graph_influenced_strategy': result.get('graph_influenced_strategy'),
+                'graph_influenced_planner': result.get('graph_influenced_planner'),
+            }
+            _cogk = ctx.system_context.get('cognitive_obj')
+            if _cogk is not None:
+                try:
+                    codes_list = list(getattr(_cogk, 'influence_reason_codes', None) or [])
+                    for code in (result.get('knowledge_reason_codes') or [])[:8]:
+                        if code not in codes_list:
+                            codes_list.append(code)
+                    _cogk.influence_reason_codes = codes_list
+                    _cogk.relevant_claims = list(result.get('relevant_claims') or [])[:8]
+                    _cogk.relevant_entities = list(result.get('relevant_entities') or [])[:8]
+                    _cogk.disputed_claims = list(result.get('disputed_claims') or [])[:8]
+                    _cogk.stale_claims = list(result.get('stale_claims') or [])[:8]
+                    _cogk.verification_required = bool(result.get('verification_required'))
+                    _cogk.evidence_quality = float(result.get('evidence_quality_score') or 0.5)
+                    _cogk.knowledge_reason_codes = list(result.get('knowledge_reason_codes') or [])[:12]
+                    kc = result.get('knowledge_context') or {}
+                    _cogk.graph_path_hints = list(kc.get('path_hints') or [])[:6]
+                    _cogk.relevant_relations = list(kc.get('relations') or [])[:8]
+                except Exception:
+                    logger.debug('cognitive kg enrich skipped', exc_info=True)
+    except Exception:
+        logger.debug('Decision core: world knowledge apply failed', exc_info=True)
     self._local_non_research_guardrails(turn, result)
     self._finalize_escalation(result)
     result['user_turn_text'] = turn.message or ''
+    # 19.07: one controlled adjustment trail — base → adjustments → final
+    base = str(result.get('base_strategy') or result.get('selected_strategy') or 'instant')
+    final = str(result.get('selected_strategy') or base)
+    result['base_strategy'] = base
+    result['final_strategy'] = final
+    log_entries = list(result.get('strategy_adjustment_log') or [])
+    if final != base and not any(e.get('new_value') == final for e in log_entries):
+        # Derive source from most specific reason codes (last strategy-changing hint)
+        source = 'policy'
+        for code in reversed(list(result.get('reason_codes') or [])):
+            cu = str(code).upper()
+            if cu.startswith('LEARN_'):
+                source = 'adaptive_learning'
+                break
+            if cu.startswith('WK_') or 'KNOWLEDGE' in cu or 'GRAPH' in cu:
+                source = 'world_knowledge'
+                break
+            if cu.startswith('EXPERIENCE_'):
+                source = 'experience'
+                break
+            if 'COGNITIVE' in cu or 'PRAGMATIC' in cu:
+                source = 'cognitive'
+                break
+            if 'BLOCKER' in cu:
+                source = 'blocker'
+                break
+        log_entries.append(
+            {
+                'source': source,
+                'reason_code': (result.get('reason_codes') or ['STRATEGY_ADJUSTED'])[-1],
+                'old_value': base,
+                'new_value': final,
+                'confidence_delta': 0.0,
+            }
+        )
+    result['strategy_adjustment_log'] = log_entries
+    result['selected_strategy'] = final
     return result

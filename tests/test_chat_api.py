@@ -248,6 +248,7 @@ def test_chat_turn_stream_includes_status_from_runtime(client: TestClient, monke
 def test_legacy_turn_endpoint_is_explicitly_deprecated(monkeypatch):
     from aihub import main
 
+    monkeypatch.setenv("AIHUB_DISABLE_LEGACY_STM_TURN", "0")
     monkeypatch.setenv("API_KEY", "")
     monkeypatch.setattr(main, "start_worker_once", lambda: None)
 

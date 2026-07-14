@@ -79,9 +79,71 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
     ch = str(correction_hints or '').strip()
     if ch:
         correction_layer = f'\n\nKorekta / feedback użytkownika (wiążące w tej turze):\n{ch}\n'
+    pragmatics_layer = ''
+    try:
+        from aihub.turn.pragmatics import pragmatics_prompt_block, PragmaticAnalysis
+        _po = ctx.system_context.get('pragmatics_obj')
+        if _po is None and isinstance(ctx.system_context.get('pragmatics'), dict):
+            _po = PragmaticAnalysis.model_validate(ctx.system_context['pragmatics'])
+        if _po is not None:
+            pragmatics_layer = '\n\n' + pragmatics_prompt_block(_po, psyche_brief=str(psyche_brief or '')) + '\n'
+    except Exception:
+        pragmatics_layer = ''
+    cognitive_layer = ''
+    try:
+        from aihub.turn.cognitive_integration import cognitive_prompt_block, CognitiveInfluencePack
+        _co = ctx.system_context.get('cognitive_obj')
+        if _co is None and isinstance(ctx.system_context.get('cognitive'), dict):
+            _co = CognitiveInfluencePack.model_validate(ctx.system_context['cognitive'])
+        if _co is not None:
+            cognitive_layer = '\n\n' + cognitive_prompt_block(_co) + '\n'
+    except Exception:
+        cognitive_layer = ''
+    learning_layer = ''
+    try:
+        _ld = ctx.system_context.get('learning_decision') if isinstance(ctx.system_context, dict) else None
+        if isinstance(_ld, dict) and _ld:
+            lines = ['ADAPTIVE LEARNING (wiążące dla stylu/planu — nie powtarzaj odrzuconych ścieżek):']
+            um = _ld.get('user_model_v2') or {}
+            if um.get('verbosity'):
+                lines.append(f"- preferred_verbosity={um.get('verbosity')} (conf={float(um.get('verbosity_confidence') or 0):.2f})")
+            if um.get('structure'):
+                lines.append(f"- preferred_structure={um.get('structure')}")
+            rej = list(_ld.get('long_horizon_rejected') or _ld.get('blocked_rejected_options') or [])
+            if rej:
+                lines.append('Odrzucone decyzje (NIE proponuj ponownie bez nowego dowodu): ' + ' | '.join(str(x)[:80] for x in rej[-8:]))
+            suppress = list(_ld.get('learning_suppress_options') or [])
+            if suppress:
+                lines.append('Zablokowane opcje: ' + ', '.join(str(x) for x in suppress[:8]))
+            if _ld.get('learning_length_directive'):
+                lines.append(f"- length_directive={_ld.get('learning_length_directive')}")
+            actions = _ld.get('learning_machine_actions_applied') or []
+            if actions:
+                lines.append('- machine_actions=' + ','.join(str(a.get('action')) for a in actions[:4] if isinstance(a, dict)))
+            acc = list(_ld.get('long_horizon_accepted') or [])
+            if acc:
+                lines.append('Zaakceptowane decyzje: ' + ' | '.join(str(x)[:80] for x in acc[-4:]))
+            if _ld.get('long_horizon_task_id'):
+                lines.append(f"- active_long_horizon_task={_ld.get('long_horizon_task_id')}")
+            if len(lines) > 1:
+                learning_layer = '\n\n' + '\n'.join(lines) + '\n'
+    except Exception:
+        learning_layer = ''
+    knowledge_layer = ''
+    try:
+        from aihub.world_knowledge.engine import knowledge_prompt_block
+        _kd = ctx.system_context.get('knowledge_decision') if isinstance(ctx.system_context, dict) else None
+        _dc = {}
+        if isinstance(_kd, dict) and _kd.get('knowledge_context'):
+            _dc = {'knowledge_context': _kd.get('knowledge_context')}
+        kb = knowledge_prompt_block(_dc)
+        if kb:
+            knowledge_layer = '\n\n' + kb + '\n'
+    except Exception:
+        knowledge_layer = ''
     web_policy_layer = '\nControlled web usage policy:\n- Gdy użytkownik podaje URL lub prosi o sprawdzenie web/research, użyj odpowiedniego narzędzia web/research.\n- Nie deklaruj wyników web bez realnego narzędzia w tej turze.\n- Jeśli poniżej w wątku jest wynik prefetchu web — traktuj go jako ugruntowanie, nie jako luźny komentarz.\n- Zapytania o aktualne wyniki (sport, news, ceny): reformułuj zapytanie na 2–3 warianty, sprawdź różne sformułowania i źródła, zanim przyznasz brak danych.\n- NIGDY nie odpowiadaj surowym „BRAK DANYCH (web)” ani jednym słowem „BRAK DANYCH” — wyjaśnij co sprawdziłeś, dlaczego wynik jest niepewny i jaki konkret od usera pomoże.\n'
     capabilities_layer = f'\nDostępne capability:\n{capabilities_text}'
-    base = global_anti_hallucination_layer + system_rules + product_rules + execution_rules + sales_listing_layer + psyche_layer + memory_layer + correction_layer + web_policy_layer + capabilities_layer
+    base = global_anti_hallucination_layer + system_rules + product_rules + execution_rules + sales_listing_layer + psyche_layer + memory_layer + correction_layer + pragmatics_layer + cognitive_layer + learning_layer + knowledge_layer + web_policy_layer + capabilities_layer
     if decision_hints:
         base = base + f'\nDecision Core:\n{decision_hints}'
     if files_context:

@@ -185,6 +185,7 @@ def test_legacy_http_memory_search_includes_unified_v2_fields(isolated_db, monke
     from aihub import main
     from aihub.psyche_core import get_psyche_core
 
+    monkeypatch.setenv("AIHUB_DISABLE_LEGACY_MEMORY_V1_HTTP", "0")
     monkeypatch.setenv("API_KEY", "")
     monkeypatch.setattr(main, "start_worker_once", lambda: None)
     uid = "legacy_search_v2_fields"

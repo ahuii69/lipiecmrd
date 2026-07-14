@@ -20,7 +20,6 @@ from aihub.executive_controller import (
     build_agent_cycle_response,
     get_executive_controller,
 )
-from aihub.llm.provider_registry import get_default_provider
 from aihub.response_variants_engine import ResponseVariantsEngine
 from aihub.turn.application import ChatTurnApplicationService
 from aihub.turn.ops import (
@@ -34,6 +33,18 @@ from aihub.turn.ops import _TRACE_CACHE  # noqa: F401
 from aihub.turn.provider_service import ProviderExecutionService
 
 logger = logging.getLogger(__name__)
+
+
+def get_default_provider():
+    """Call-time provider resolve.
+
+    Tests may monkeypatch this module attribute OR
+    ``aihub.llm.provider_registry.get_default_provider``; both bind.
+    """
+    from aihub.llm import provider_registry
+
+    return provider_registry.get_default_provider()
+
 
 __all__ = [
     "ChatRuntime",
@@ -51,14 +62,19 @@ __all__ = [
 ]
 
 
+def _resolve_default_provider():
+    """Resolve via module-local ``get_default_provider`` (honors monkeypatches)."""
+    return get_default_provider()
+
+
 class ChatRuntime(TurnOps):
     """Facade + TurnOps: application service owns idempotency/locks; ops owns stages."""
 
     def __init__(self) -> None:
         super().__init__()
-        # Honor monkeypatched ``aihub.chat_runtime.get_default_provider``.
+        # Rebind after TurnOps: honor cr.get_default_provider / registry patches.
         try:
-            provider = get_default_provider()
+            provider = _resolve_default_provider()
             self._provider = provider
             self._provider_service = ProviderExecutionService(provider)
         except Exception:
@@ -95,7 +111,7 @@ def get_chat_runtime() -> ChatRuntime:
         _RUNTIME = ChatRuntime()
     else:
         try:
-            fresh = get_default_provider()
+            fresh = _resolve_default_provider()
             if fresh is not None:
                 _RUNTIME._provider = fresh
                 _RUNTIME._provider_service = ProviderExecutionService(fresh)

@@ -96,6 +96,8 @@ class PipelineMixin:
             g['identity_bridge_snapshot'] = build_identity_snapshot(g['turn'].user_id, g['turn'].message)
             g['memory_v2_runtime_ctx'] = build_memory_v2_runtime_context(g['turn'].user_id, g['turn'].message)
             g['psyche_v2_behavior_ctx'] = build_psyche_v2_behavior_context(g['turn'].user_id)
+            if isinstance(g['ctx'].system_context, dict):
+                g['ctx'].system_context['identity_bridge_snapshot'] = g['identity_bridge_snapshot']
         except Exception as bridge_error:
             g['bridge_error'] = bridge_error
             logger.warning(f'Failed to load V2 bridges: {bridge_error}')
@@ -121,16 +123,71 @@ class PipelineMixin:
             if g['memory_lookup_flag'] and g['mem_total'] > 0:
                 await emit_memory_used(count=g['mem_total'])
         g['psyche_brief'] = self._build_psyche_brief(g['psyche_snapshot'])
+        if isinstance(g['ctx'].system_context, dict):
+            g['ctx'].system_context['memory_brief'] = g['memory_brief']
+            g['ctx'].system_context['psyche_brief'] = g['psyche_brief']
         g['tools'] = self._build_provider_tools(g['ctx'])
         g['tool_results']: list[ToolCallResult] = []
         g['tool_calls']: list[ToolCallRequest] = []
         g['provider_usages']: list[ProviderUsage] = []
         g['errors']: list[dict[str, Any]] = []
         g['controlled_web']: dict[str, Any] = {'triggered': False, 'reason': 'not_required', 'tool_name': None, 'ok': None, 'has_results': None, 'provider_info': None, 'query': None, 'source_count': 0, 'freshness_needed': False}
+        # Conversation pragmatics — before strategy selection
+        try:
+            from aihub.turn.pragmatics import analyze_pragmatics
+            g['_active_tid'] = str(getattr(getattr(self, '_active_turn_ctx', None), 'turn_id', None) or getattr(g['turn'], 'turn_id', '') or '')
+            g['pragmatics'] = analyze_pragmatics(
+                raw_text=g['turn'].message or '',
+                history=list(g['turn'].history or []),
+                user_id=g['turn'].user_id,
+                session_id=g['turn'].session_id,
+                turn_id=g['_active_tid'],
+                memory_brief=g.get('memory_brief') or '',
+                psyche_brief=g.get('psyche_brief') or '',
+            )
+            g['ctx'].system_context['pragmatics'] = g['pragmatics'].model_dump()
+            g['ctx'].system_context['pragmatics_obj'] = g['pragmatics']
+            g['ctx'].system_context['pragmatics_response_mode'] = g['pragmatics'].response_mode
+            if g['pragmatics'].needs_recent_history:
+                g['pragmatics'].history_injected = True
+                g['decision_core_pragmatics_history'] = True
+        except Exception as pragmatics_error:
+            g['pragmatics_error'] = pragmatics_error
+            logger.warning('pragmatics analysis failed: %s', pragmatics_error, exc_info=True)
+            g['pragmatics'] = None
+            g['ctx'].system_context['pragmatics'] = {'degraded': True, 'reason_codes': ['PRAGMATICS_DEGRADED_FALLBACK']}
+        # Cognitive Integration V2 — conversation state + user model + cross-module pack
+        try:
+            from aihub.turn.cognitive_integration import build_cognitive_influence_pack
+            g['_corr_hints'] = str((g['ctx'].system_context or {}).get('correction_hints_text') or '')
+            g['_sel_goal'] = None
+            g['cognitive'] = build_cognitive_influence_pack(
+                user_id=g['turn'].user_id,
+                session_id=g['turn'].session_id,
+                message=g['turn'].message or '',
+                history=list(g['turn'].history or []),
+                pragmatics=g.get('pragmatics'),
+                memory_brief=g.get('memory_brief') or '',
+                psyche_brief=g.get('psyche_brief') or '',
+                memory_v2_ctx=g.get('memory_v2_runtime_ctx'),
+                psyche_v2_ctx=g.get('psyche_v2_behavior_ctx'),
+                identity_snapshot=g.get('identity_bridge_snapshot'),
+                selected_goal=None,
+                experience_signal_summary='',
+                correction_hints=g['_corr_hints'],
+                reflection_summary='',
+            )
+            g['ctx'].system_context['cognitive'] = g['cognitive'].model_dump()
+            g['ctx'].system_context['cognitive_obj'] = g['cognitive']
+        except Exception as cognitive_error:
+            g['cognitive_error'] = cognitive_error
+            logger.warning('cognitive integration failed: %s', cognitive_error, exc_info=True)
+            g['cognitive'] = None
+            g['ctx'].system_context['cognitive'] = {'degraded': True, 'influence_reason_codes': ['COG_DEGRADED_FALLBACK']}
 
     async def _stage_decision_blocker(self, g):
         g['decision_core'] = self._pre_exec_decision_core(turn=g['turn'], ctx=g['ctx'], psyche_snapshot=g['psyche_snapshot'], memory_v2_runtime_ctx=g['memory_v2_runtime_ctx'], psyche_v2_behavior_ctx=g['psyche_v2_behavior_ctx'])
-        g['tools'] = self._apply_strategy_to_tools(g['tools'], g['decision_core']['selected_strategy'])
+        g['tools'] = self._apply_strategy_to_tools(g['tools'], g['decision_core']['selected_strategy'], tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []))
         if not g['decision_core'].get('escalation_use_tools'):
             g['tools'] = []
         g['blocker_verdict'] = self._evaluate_blocker_verdict(g['decision_core'])
@@ -161,7 +218,7 @@ class PipelineMixin:
                 g['decision_core']['reason_codes'].append(f"BLOCKER_{g['blocker_verdict'].resolution.upper()}_{g['old_strategy'].upper()}_TO_{g['new_strategy'].upper()}")
                 logger.info('Blocker %s: strategy %s→%s for user=%s (type=%s)', g['blocker_verdict'].resolution, g['old_strategy'], g['new_strategy'], g['turn'].user_id, g['blocker_verdict'].blocker_type)
                 self._finalize_escalation(g['decision_core'])
-                g['tools'] = self._apply_strategy_to_tools(self._build_provider_tools(g['ctx']), g['decision_core']['selected_strategy'])
+                g['tools'] = self._apply_strategy_to_tools(self._build_provider_tools(g['ctx']), g['decision_core']['selected_strategy'], tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []))
                 if not g['decision_core'].get('escalation_use_tools'):
                     g['tools'] = []
 
@@ -258,6 +315,134 @@ class PipelineMixin:
                 g['trace']['vault_user_message_redacted'] = g['vault_user_redacted']
                 g['trace'].update(g['hist_smart_trim'])
                 augment_trace_context_truth(g['trace'], mem_truth=g['mem_truth'], controlled_web=g['controlled_web'], decision_core=g['decision_core'])
+                # Cognitive / pragmatics observability + write-back also on provider_fallback
+                try:
+                    from aihub.turn.pragmatics import pragmatics_trace_fields, PragmaticAnalysis
+                    from aihub.turn.cognitive_integration import (
+                        CognitiveInfluencePack,
+                        calibrate_from_outcome,
+                        cognitive_trace_fields,
+                        update_conversation_after_turn,
+                        update_user_model_from_turn,
+                    )
+                    g['_pa_fb'] = g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj')
+                    if g['_pa_fb'] is None and isinstance((g['ctx'].system_context or {}).get('pragmatics'), dict):
+                        g['_pa_fb'] = PragmaticAnalysis.model_validate(g['ctx'].system_context['pragmatics'])
+                    if g['_pa_fb'] is not None:
+                        g['trace'].update(pragmatics_trace_fields(g['_pa_fb']))
+                    else:
+                        g['trace']['pragmatics_analysis_happened'] = False
+                        g['trace']['pragmatics_degraded'] = True
+                    g['_cog_fb'] = g.get('cognitive') or (g['ctx'].system_context or {}).get('cognitive_obj')
+                    if g['_cog_fb'] is None and isinstance((g['ctx'].system_context or {}).get('cognitive'), dict):
+                        g['_cog_fb'] = CognitiveInfluencePack.model_validate(g['ctx'].system_context['cognitive'])
+                    if g['_cog_fb'] is not None:
+                        g['trace'].update(cognitive_trace_fields(g['_cog_fb']))
+                        update_conversation_after_turn(
+                            user_id=g['turn'].user_id,
+                            session_id=g['turn'].session_id,
+                            message=g['turn'].message or '',
+                            response_text=g['fallback_text'] or '',
+                            pragmatics=g['_pa_fb'],
+                            pack=g['_cog_fb'],
+                            ok=False,
+                        )
+                        g['_um_fb'] = update_user_model_from_turn(
+                            user_id=g['turn'].user_id,
+                            message=g['turn'].message or '',
+                            response_text=g['fallback_text'] or '',
+                            pragmatics=g['_pa_fb'],
+                            critic_score=None,
+                            revision_happened=False,
+                            pack=g['_cog_fb'],
+                        )
+                        g['_cal_fb'] = calibrate_from_outcome(
+                            user_id=g['turn'].user_id,
+                            decision_core=g['decision_core'],
+                            ok=False,
+                            critic_score=None,
+                            revision_happened=False,
+                            web_used=bool(g['controlled_web'].get('triggered') and g['controlled_web'].get('ok')),
+                            web_required=str(g['decision_core'].get('web_decision') or 'off') == 'required',
+                            tool_successes=len([r for r in g['tool_results'] if r.ok]),
+                            tool_failures=len([r for r in g['tool_results'] if not r.ok]),
+                            correction_this_turn=bool(getattr(g['_pa_fb'], 'speech_act', '') == 'correction') if g['_pa_fb'] else False,
+                        )
+                        g['trace']['cognitive_writeback_happened'] = True
+                        g['trace']['user_model_sample_count'] = g['_um_fb'].sample_count
+                        g['trace']['user_model_length'] = g['_um_fb'].preferred_answer_length
+                        g['trace']['user_model_humour'] = g['_um_fb'].preferred_humour
+                        g['trace']['user_model_tech_depth'] = g['_um_fb'].preferred_technical_depth
+                        g['trace']['user_model_confidence'] = g['_um_fb'].confidence
+                        g['trace']['calibration_signals'] = list((g['_cal_fb'] or {}).get('signals') or [])
+                        g['trace']['conversation_turn_count'] = int(
+                            getattr(getattr(g['_cog_fb'], 'conversation', None), 'turn_count', 0) or 0
+                        )
+                    else:
+                        g['trace']['cognitive_integration_happened'] = False
+                        g['trace']['cognitive_degraded'] = True
+                except Exception as _cog_fb_err:
+                    logger.debug('fallback cognitive merge skipped: %s', _cog_fb_err, exc_info=True)
+                try:
+                    from aihub.adaptive_learning import process_turn_learning, learning_trace_fields
+                    g['_tid_learn_fb'] = str(
+                        getattr(getattr(self, '_active_turn_ctx', None), 'turn_id', None)
+                        or getattr(g.get('ctx'), 'turn_id', None)
+                        or (g.get('trace') or {}).get('turn_id')
+                        or getattr(g['turn'], 'turn_id', None)
+                        or ''
+                    )
+                    if not g['_tid_learn_fb']:
+                        import uuid as _uuid_learn_fb
+                        g['_tid_learn_fb'] = str(_uuid_learn_fb.uuid4())
+                    g['_learn_fb'] = process_turn_learning(
+                        turn_id=g['_tid_learn_fb'],
+                        user_id=g['turn'].user_id,
+                        session_id=g['turn'].session_id,
+                        message=g['turn'].message or '',
+                        response_text=g['fallback_text'] or '',
+                        trace=g['trace'] if isinstance(g.get('trace'), dict) else {},
+                        decision_core=g['decision_core'],
+                        ok=False,
+                        errors=list(g.get('errors') or []),
+                        replay_mode=False,
+                    )
+                    g['trace'].update(learning_trace_fields(g['_learn_fb']))
+                    if getattr(g['_learn_fb'], 'long_horizon_task_id', None):
+                        g['trace']['long_horizon_task_id'] = g['_learn_fb'].long_horizon_task_id
+                except Exception as _learn_fb_err:
+                    logger.debug('fallback learning skipped: %s', _learn_fb_err, exc_info=True)
+                    g['trace']['learning_degraded'] = True
+                try:
+                    from aihub.world_knowledge import process_turn_knowledge, knowledge_trace_fields
+                    g['_tid_wk_fb'] = str(
+                        getattr(getattr(self, '_active_turn_ctx', None), 'turn_id', None)
+                        or getattr(g.get('ctx'), 'turn_id', None)
+                        or (g.get('trace') or {}).get('turn_id')
+                        or g.get('_tid_learn_fb')
+                        or ''
+                    )
+                    g['_wk_fb'] = process_turn_knowledge(
+                        turn_id=g['_tid_wk_fb'],
+                        user_id=g['turn'].user_id,
+                        session_id=g['turn'].session_id,
+                        message=g['turn'].message or '',
+                        response_text=g['fallback_text'] or '',
+                        trace=g['trace'] if isinstance(g.get('trace'), dict) else {},
+                        decision_core=g.get('decision_core') or {},
+                        replay_mode=False,
+                    )
+                    g['trace'].update(knowledge_trace_fields(g['_wk_fb']))
+                    if (g.get('decision_core') or {}).get('knowledge_context_loaded'):
+                        g['trace']['knowledge_context_loaded'] = True
+                        g['trace']['knowledge_entities_count'] = g['decision_core'].get('knowledge_entities_count')
+                        g['trace']['knowledge_claims_count'] = g['decision_core'].get('knowledge_claims_count')
+                        g['trace']['verification_required'] = g['decision_core'].get('verification_required')
+                        g['trace']['graph_influenced_strategy'] = bool(g['decision_core'].get('graph_influenced_strategy'))
+                        g['trace']['graph_influenced_planner'] = bool(g['decision_core'].get('graph_influenced_planner'))
+                except Exception as _wk_fb_err:
+                    logger.debug('fallback world knowledge skipped: %s', _wk_fb_err, exc_info=True)
+                    g['trace']['knowledge_learning_degraded'] = True
                 self._write_back_experience(turn=g['turn'], response_text=g['fallback_text'], grounding_mode='fallback', tool_calls=g['tool_calls'], tool_results=g['tool_results'], trace=g['trace'], errors=g['errors'], psyche_snapshot=g['psyche_snapshot'], decision_core=g['decision_core'])
                 if str(getattr(g['turn'], 'runtime_mode', '') or '').lower() == 'audit':
                     g['trace']['psyche_snapshot_happened'] = False
@@ -322,7 +507,67 @@ class PipelineMixin:
                 g['decision_core'][g['_dk']] = g['deliberation_metadata'][g['_dk']]
         g['decision_core']['deliberation_outcome_quality'] = self._compute_deliberation_outcome_quality(g['deliberation_metadata'])
         g['post_reflection'] = self._post_exec_reflection(user_id=g['turn'].user_id, message=g['turn'].message, response_text=g['response_text'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], handoff_happened=False)
+        # Response critic V2 — at most one revision, no re-run of side-effect tools
+        g['response_revision_happened'] = False
+        try:
+            from aihub.turn.pragmatics import PragmaticAnalysis
+            from aihub.turn.cognitive_integration import critique_response_v2, CognitiveInfluencePack
+            g['_pa'] = g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj')
+            if g['_pa'] is None and isinstance((g['ctx'].system_context or {}).get('pragmatics'), dict):
+                g['_pa'] = PragmaticAnalysis.model_validate(g['ctx'].system_context['pragmatics'])
+            g['_cog'] = g.get('cognitive') or (g['ctx'].system_context or {}).get('cognitive_obj')
+            if g['_cog'] is None and isinstance((g['ctx'].system_context or {}).get('cognitive'), dict):
+                g['_cog'] = CognitiveInfluencePack.model_validate(g['ctx'].system_context['cognitive'])
+            if g['_pa'] is not None or g['_cog'] is not None:
+                g['critic'] = critique_response_v2(
+                    response_text=g['response_text'],
+                    pragmatics=g['_pa'],
+                    pack=g['_cog'],
+                    memory_used=bool(g.get('memory_substantive_flag') or (g.get('memory_v2_runtime_ctx') and getattr(g['memory_v2_runtime_ctx'], 'loaded', False))),
+                    psyche_used=bool((g.get('psyche_v2_behavior_ctx') and getattr(g['psyche_v2_behavior_ctx'], 'loaded', False)) or (g.get('psyche_brief') and 'BRAK' not in str(g.get('psyche_brief') or '')[:20])),
+                    planner_recommended=bool(g['decision_core'].get('planner_recommended') or g['decision_core'].get('escalation_use_reasoning')),
+                    web_used=bool(g['controlled_web'].get('triggered') and g['controlled_web'].get('ok')),
+                    web_was_required=str(g['decision_core'].get('web_decision') or 'off') == 'required',
+                )
+                if g['_pa'] is not None:
+                    g['_pa'].critic = g['critic']
+                if (not g['critic'].passed) and g['critic'].revision_instruction and g.get('messages'):
+                    g['messages'].append(ChatMessage(role='user', content=('[Korekta odpowiedzi — nie zmieniaj tematu użytkownika. Instrukcja:] ' + g['critic'].revision_instruction + '\n\nOdpowiedź do poprawy:\n' + (g['response_text'] or '')[:2500])))
+                    try:
+                        g['rev'] = await self._provider_call(messages=g['messages'], tools=[])
+                        if g['rev'] and (g['rev'].content or '').strip():
+                            g['response_text'] = g['rev'].content
+                            g['response_revision_happened'] = True
+                            g['provider_usages'].append(g['rev'].usage)
+                            g['provider_call_count'] = int(g.get('provider_call_count') or 0) + 1
+                    except Exception as rev_exc:
+                        g['rev_exc'] = rev_exc
+                        logger.debug('response critic revision skipped: %s', rev_exc)
+                if g['_pa'] is not None:
+                    g['ctx'].system_context['pragmatics'] = g['_pa'].model_dump()
+                    g['ctx'].system_context['pragmatics_obj'] = g['_pa']
+                    g['pragmatics'] = g['_pa']
+                if g['_cog'] is not None:
+                    g['ctx'].system_context['cognitive'] = g['_cog'].model_dump()
+                    g['ctx'].system_context['cognitive_obj'] = g['_cog']
+                    g['cognitive'] = g['_cog']
+        except Exception as critic_exc:
+            g['critic_exc'] = critic_exc
+            logger.debug('response critic failed: %s', critic_exc, exc_info=True)
         g['response_text'] = self._shape_response_text(turn=g['turn'], ctx=g['ctx'], response_text=g['response_text'], grounding_mode=g['grounding_mode'], used_fallback=False, memory_v2_context=g['memory_v2_runtime_ctx'], psyche_v2_context=g['psyche_v2_behavior_ctx'], anti_hallucination_trace=g['anti_hallucination_trace'])
+        try:
+            from aihub.world_knowledge import apply_action_claim_guard
+            g['response_text'], g['_acg'] = apply_action_claim_guard(
+                response_text=g['response_text'] or '',
+                tool_results=g.get('tool_results') or [],
+                validation_succeeded=bool((g.get('decision_core') or {}).get('validation_succeeded')),
+                execution_effects=list((g.get('decision_core') or {}).get('execution_effects') or []),
+                trace=g['trace'] if isinstance(g.get('trace'), dict) else None,
+            )
+            if isinstance(g.get('trace'), dict) and isinstance(g.get('_acg'), dict):
+                g['trace'].update({k: v for k, v in g['_acg'].items() if k.startswith('action_claim')})
+        except Exception:
+            logger.debug('action claim guard skipped', exc_info=True)
         for g['_dk'] in ('response_variants_triggered', 'response_variants_confidence', 'response_variants_risk', 'response_variants_synthesis_used', 'response_variants_winner_type'):
             if g['_dk'] in g['deliberation_metadata']:
                 g['decision_core'][g['_dk']] = g['deliberation_metadata'][g['_dk']]
@@ -357,6 +602,31 @@ class PipelineMixin:
         g['trace']['vault_user_message_redacted'] = g['vault_user_redacted']
         g['trace'].update(g['hist_smart_trim'])
         augment_trace_context_truth(g['trace'], mem_truth=g['mem_truth'], controlled_web=g['controlled_web'], decision_core=g['decision_core'])
+        try:
+            from aihub.turn.pragmatics import pragmatics_trace_fields, PragmaticAnalysis
+            from aihub.turn.cognitive_integration import cognitive_trace_fields, CognitiveInfluencePack
+            g['_pa_t'] = g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj')
+            if g['_pa_t'] is None and isinstance((g['ctx'].system_context or {}).get('pragmatics'), dict):
+                g['_pa_t'] = PragmaticAnalysis.model_validate(g['ctx'].system_context['pragmatics'])
+            if g['_pa_t'] is not None:
+                g['trace'].update(pragmatics_trace_fields(g['_pa_t']))
+                g['trace']['response_revision_happened'] = bool(g.get('response_revision_happened'))
+                if g.get('critic') is not None:
+                    g['trace']['response_critic_score'] = getattr(g['critic'], 'score', None)
+                    g['trace']['response_revision_reason_codes'] = list(getattr(g['critic'], 'reason_codes', []) or [])
+            else:
+                g['trace']['pragmatics_analysis_happened'] = False
+                g['trace']['pragmatics_degraded'] = True
+            g['_cog_t'] = g.get('cognitive') or (g['ctx'].system_context or {}).get('cognitive_obj')
+            if g['_cog_t'] is None and isinstance((g['ctx'].system_context or {}).get('cognitive'), dict):
+                g['_cog_t'] = CognitiveInfluencePack.model_validate(g['ctx'].system_context['cognitive'])
+            if g['_cog_t'] is not None:
+                g['trace'].update(cognitive_trace_fields(g['_cog_t']))
+        except Exception:
+            g['trace']['pragmatics_analysis_happened'] = False
+            g['trace']['pragmatics_degraded'] = True
+            g['trace']['cognitive_integration_happened'] = False
+            g['trace']['cognitive_degraded'] = True
 
     async def _stage_writeback(self, g):
         g['trace']['memory_v2_writeback_attempted'] = False
@@ -393,6 +663,151 @@ class PipelineMixin:
                 g['trace']['psyche_v2_writeback_succeeded'] = g['psyche_wb'].get('succeeded', False)
                 g['trace']['psyche_v2_event_applied'] = g['psyche_wb'].get('event_applied')
                 logger.info(f"V2 chat write-back: memory={g['memory_wb'].get('succeeded')} psyche={g['psyche_wb'].get('succeeded')} user={g['turn'].user_id}")
+                # Cognitive write-backs: conversation state, user model, self-calibration
+                try:
+                    from aihub.turn.cognitive_integration import (
+                        update_conversation_after_turn,
+                        update_user_model_from_turn,
+                        calibrate_from_outcome,
+                        CognitiveInfluencePack,
+                    )
+                    g['_cog_wb'] = g.get('cognitive') or (g['ctx'].system_context or {}).get('cognitive_obj')
+                    if g['_cog_wb'] is None and isinstance((g['ctx'].system_context or {}).get('cognitive'), dict):
+                        g['_cog_wb'] = CognitiveInfluencePack.model_validate(g['ctx'].system_context['cognitive'])
+                    g['_pa_wb'] = g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj')
+                    g['_cs'] = update_conversation_after_turn(
+                        user_id=g['turn'].user_id,
+                        session_id=g['turn'].session_id,
+                        message=g['turn'].message or '',
+                        response_text=g['response_text'] or '',
+                        pragmatics=g['_pa_wb'],
+                        pack=g['_cog_wb'],
+                        ok=len(g['errors']) == 0 and not g['fallback'],
+                    )
+                    g['_um'] = update_user_model_from_turn(
+                        user_id=g['turn'].user_id,
+                        message=g['turn'].message or '',
+                        response_text=g['response_text'] or '',
+                        pragmatics=g['_pa_wb'],
+                        critic_score=(g['trace'].get('response_critic_score') if isinstance(g.get('trace'), dict) else None) or (getattr(g.get('critic'), 'score', None)),
+                        revision_happened=bool(g.get('response_revision_happened')),
+                        pack=g['_cog_wb'],
+                    )
+                    g['_cal'] = calibrate_from_outcome(
+                        user_id=g['turn'].user_id,
+                        decision_core=g['decision_core'],
+                        ok=len(g['errors']) == 0 and not g['fallback'],
+                        critic_score=(g['trace'].get('response_critic_score') if isinstance(g.get('trace'), dict) else None) or (getattr(g.get('critic'), 'score', None)),
+                        revision_happened=bool(g.get('response_revision_happened')),
+                        web_used=bool(g['controlled_web'].get('triggered') and g['controlled_web'].get('ok')),
+                        web_required=str(g['decision_core'].get('web_decision') or 'off') == 'required',
+                        tool_successes=len([g['r'] for g['r'] in g['tool_results'] if g['r'].ok]),
+                        tool_failures=len([g['r'] for g['r'] in g['tool_results'] if not g['r'].ok]),
+                        correction_this_turn=bool(g['_pa_wb'] and getattr(g['_pa_wb'], 'speech_act', '') == 'correction'),
+                    )
+                    g['trace']['cognitive_writeback_happened'] = True
+                    g['trace']['conversation_turn_count'] = g['_cs'].turn_count
+                    g['trace']['user_model_sample_count'] = g['_um'].sample_count
+                    g['trace']['user_model_length'] = g['_um'].preferred_answer_length
+                    g['trace']['user_model_humour'] = g['_um'].preferred_humour
+                    g['trace']['user_model_tech_depth'] = g['_um'].preferred_technical_depth
+                    g['trace']['user_model_confidence'] = g['_um'].confidence
+                    g['trace']['calibration_signals'] = list((g['_cal'] or {}).get('signals') or [])
+                    # Persist last reflection summary for next-turn cognitive pack
+                    try:
+                        if g.get('post_reflection') and g['post_reflection'].get('reflection_summary'):
+                            from aihub.db import append_event as _ae
+                            _ae(g['turn'].user_id, 'cognitive.reflection_prior', {
+                                'session_id': g['turn'].session_id,
+                                'summary': str(g['post_reflection'].get('reflection_summary') or '')[:400],
+                                'durable': False,
+                            })
+                    except Exception:
+                        logger.debug('reflection prior persist skipped', exc_info=True)
+                except Exception as cog_wb_err:
+                    g['cog_wb_err'] = cog_wb_err
+                    logger.debug('cognitive write-back skipped: %s', cog_wb_err, exc_info=True)
+                    g['trace']['cognitive_writeback_happened'] = False
+                # Adaptive learning pipeline (outcome → causal → lessons → metrics → self/user model)
+                try:
+                    from aihub.adaptive_learning import process_turn_learning, learning_trace_fields
+                    g['_tid_learn'] = str(
+                        getattr(getattr(self, '_active_turn_ctx', None), 'turn_id', None)
+                        or getattr(g.get('ctx'), 'turn_id', None)
+                        or (g.get('trace') or {}).get('turn_id')
+                        or g.get('turn_id_for_wb')
+                        or getattr(g['turn'], 'turn_id', None)
+                        or ''
+                    )
+                    if not g['_tid_learn']:
+                        import uuid as _uuid_learn
+                        g['_tid_learn'] = str(_uuid_learn.uuid4())
+                    g['_learn'] = process_turn_learning(
+                        turn_id=g['_tid_learn'],
+                        user_id=g['turn'].user_id,
+                        session_id=g['turn'].session_id,
+                        message=g['turn'].message or '',
+                        response_text=g['response_text'] or '',
+                        trace=g['trace'] if isinstance(g.get('trace'), dict) else {},
+                        decision_core=g['decision_core'],
+                        ok=len(g['errors']) == 0 and not g.get('fallback'),
+                        errors=list(g.get('errors') or []),
+                        replay_mode=False,
+                    )
+                    g['trace'].update(learning_trace_fields(g['_learn']))
+                    if getattr(g['_learn'], 'long_horizon_task_id', None):
+                        g['trace']['long_horizon_task_id'] = g['_learn'].long_horizon_task_id
+                    g['trace']['strategy_learning_applied'] = bool(
+                        g['decision_core'].get('self_model_influenced_strategy')
+                        or g['decision_core'].get('learning_strategy_bias')
+                    )
+                    g['trace']['planner_learning_applied'] = bool(g['decision_core'].get('planner_recommended'))
+                    g['trace']['provider_learning_applied'] = bool(g['decision_core'].get('provider_learning_preference'))
+                    g['trace']['tool_learning_applied'] = 'LEARN_TOOL_ORDER_METRICS' in list(g['decision_core'].get('reason_codes') or [])
+                    g['trace']['research_learning_applied'] = bool(g['trace'].get('research_query_variants'))
+                    g['trace']['self_model_influenced_strategy'] = bool(g['decision_core'].get('self_model_influenced_strategy'))
+                    g['trace']['confidence_raw'] = g['decision_core'].get('strategy_confidence_raw')
+                    g['trace']['confidence_calibrated'] = g['decision_core'].get('strategy_confidence')
+                    g['trace']['confidence_calibration_delta'] = g['decision_core'].get('confidence_calibration_delta')
+                    if g['decision_core'].get('long_horizon_task_id'):
+                        g['trace']['long_horizon_task_id'] = g['decision_core'].get('long_horizon_task_id')
+                except Exception as learn_err:
+                    logger.debug('adaptive learning write-back skipped: %s', learn_err, exc_info=True)
+                    g['trace']['learning_degraded'] = True
+                    g['trace']['outcome_evaluation_happened'] = False
+                # World knowledge write-back (claims/evidence/entities) + trace
+                try:
+                    from aihub.world_knowledge import process_turn_knowledge, knowledge_trace_fields
+                    g['_tid_wk'] = str(
+                        getattr(getattr(self, '_active_turn_ctx', None), 'turn_id', None)
+                        or getattr(g.get('ctx'), 'turn_id', None)
+                        or (g.get('trace') or {}).get('turn_id')
+                        or g.get('_tid_learn')
+                        or ''
+                    )
+                    g['_wk'] = process_turn_knowledge(
+                        turn_id=g['_tid_wk'],
+                        user_id=g['turn'].user_id,
+                        session_id=g['turn'].session_id,
+                        message=g['turn'].message or '',
+                        response_text=g['response_text'] or '',
+                        trace=g['trace'] if isinstance(g.get('trace'), dict) else {},
+                        decision_core=g.get('decision_core') or {},
+                        replay_mode=False,
+                    )
+                    g['trace'].update(knowledge_trace_fields(g['_wk']))
+                    if g['decision_core'].get('graph_influenced_strategy'):
+                        g['trace']['graph_influenced_strategy'] = True
+                    if g['decision_core'].get('graph_influenced_planner'):
+                        g['trace']['graph_influenced_planner'] = True
+                    if g['decision_core'].get('execution_graph_id'):
+                        g['trace']['execution_graph_id'] = g['decision_core'].get('execution_graph_id')
+                    g['trace']['graph_influenced_response'] = bool(
+                        (g['decision_core'].get('knowledge_context') or {}).get('claims')
+                    )
+                except Exception as wk_err:
+                    logger.debug('world knowledge write-back skipped: %s', wk_err, exc_info=True)
+                    g['trace']['knowledge_learning_degraded'] = True
             except Exception as v2_wb_error:
                 g['v2_wb_error'] = v2_wb_error
                 logger.warning(f'V2 chat write-back failed: {v2_wb_error}', exc_info=True)

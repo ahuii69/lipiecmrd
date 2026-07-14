@@ -8,6 +8,7 @@ from fastapi.testclient import TestClient
 def test_memory_v1_http_surfaces_are_marked_legacy(monkeypatch):
     from aihub import main
 
+    monkeypatch.setenv("AIHUB_DISABLE_LEGACY_MEMORY_V1_HTTP", "0")
     monkeypatch.setenv("API_KEY", "")
     monkeypatch.setattr(main, "start_worker_once", lambda: None)
 

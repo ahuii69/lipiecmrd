@@ -411,6 +411,8 @@ def build_agent_cycle_response(
         "strategy_source": str(
             cycle.get("strategy_source") or STRATEGY_SOURCE_FALLBACK_LOCAL
         ),
+        "execution_graph_id": str(cycle.get("execution_graph_id") or ""),
+        "execution_graph_bound": bool(cycle.get("execution_graph_bound", False)),
     }
 
     response = {
@@ -424,6 +426,12 @@ def build_agent_cycle_response(
         ),
         "strategy": str(cycle.get("strategy") or ""),
         "strategy_reason": str(cycle.get("strategy_reason") or ""),
+        "execution_graph_id": str(cycle.get("execution_graph_id") or ""),
+        "execution_graph_bound": bool(cycle.get("execution_graph_bound", False)),
+        "execution_graph_created": bool(cycle.get("execution_graph_created", False)),
+        "execution_graph_resumed": bool(cycle.get("execution_graph_resumed", False)),
+        "execution_graph_finalized": bool(cycle.get("execution_graph_finalized", False)),
+        "execution_graph_status": cycle.get("execution_graph_status"),
         "planning_used": planning_executed,
         "reasoning_used": reasoning_executed,
         "context_signals": context_signals,
@@ -1102,6 +1110,162 @@ class ExecutiveController:
             planner_summary,
         )
 
+    def _bind_wk_execution_graph(
+        self,
+        *,
+        perception: PerceptionInput,
+        plan: ExecutionPlan,
+        planned_graph: TaskGraph | None,
+        cycle_id: str,
+    ) -> dict[str, Any]:
+        """Bind this cycle to the canonical WK ExecutionGraph (create or resume)."""
+        meta: dict[str, Any] = {
+            "execution_graph_id": "",
+            "execution_graph_bound": False,
+            "execution_graph_created": False,
+            "execution_graph_resumed": False,
+        }
+        try:
+            from aihub.world_knowledge.execution import (
+                build_execution_graph_from_plan,
+                resume_execution,
+            )
+            from aihub.world_knowledge import store as wk_store
+
+            existing_id = str(
+                perception.raw_event.get("execution_graph_id")
+                or plan.metadata.get("execution_graph_id")
+                or ""
+            ).strip()
+            if existing_id:
+                resumed = resume_execution(
+                    existing_id, owner=f"executive:{perception.user_id}"
+                )
+                if resumed is not None:
+                    meta["execution_graph_id"] = resumed.execution_id
+                    meta["execution_graph_bound"] = True
+                    meta["execution_graph_resumed"] = True
+                    return meta
+
+            steps: list[dict[str, Any]] = []
+            if planned_graph is not None and getattr(planned_graph, "nodes", None):
+                nodes = planned_graph.nodes
+                ordered = (
+                    list(nodes.values())
+                    if isinstance(nodes, dict)
+                    else list(nodes or [])
+                )
+                for i, n in enumerate(ordered[:12]):
+                    steps.append(
+                        {
+                            "step_id": str(getattr(n, "task_id", None) or f"n{i+1}"),
+                            "action": str(
+                                getattr(n, "task_type", None)
+                                or (getattr(n, "payload", {}) or {}).get("action")
+                                or f"step_{i+1}"
+                            )[:200],
+                            "node_type": "tool"
+                            if str(getattr(n, "task_type", "")).startswith("tool")
+                            else "reason",
+                            "tool_name": str(
+                                (getattr(n, "payload", {}) or {}).get("tool")
+                                or (getattr(n, "payload", {}) or {}).get("tool_name")
+                                or ""
+                            ),
+                            "dependencies": list(getattr(n, "depends_on", None) or []),
+                            "arguments": dict(getattr(n, "payload", None) or {}),
+                            "validation": ["task_ok"],
+                            "idempotency_key": f"{cycle_id}:{getattr(n, 'task_id', i)}",
+                        }
+                    )
+            elif plan.tasks:
+                for i, t in enumerate(plan.tasks[:12]):
+                    steps.append(
+                        {
+                            "step_id": str(t.task_id or f"n{i+1}"),
+                            "action": str(t.task_type or f"step_{i+1}")[:200],
+                            "node_type": "reason",
+                            "dependencies": list(t.depends_on or []),
+                            "arguments": dict(t.payload or {}),
+                            "validation": ["task_ok"],
+                            "idempotency_key": f"{cycle_id}:{t.task_id}",
+                        }
+                    )
+            if not steps:
+                return meta
+            goal_id = str(plan.metadata.get("selected_goal_id") or "")
+            lht = str(perception.raw_event.get("long_horizon_task_id") or "")
+            g = build_execution_graph_from_plan(
+                user_id=perception.user_id,
+                session_id=str(perception.raw_event.get("session_id") or ""),
+                turn_id=str(perception.raw_event.get("turn_id") or cycle_id),
+                task_id=lht,
+                goal_id=goal_id,
+                steps=steps,
+            )
+            g.status = "running"
+            g.lease_owner = f"executive:{perception.user_id}"
+            g.lease_until = time.time() + 60.0
+            wk_store.save_execution_graph(g)
+            meta["execution_graph_id"] = g.execution_id
+            meta["execution_graph_bound"] = True
+            meta["execution_graph_created"] = True
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WK execution graph bind skipped: %s", exc, exc_info=True)
+            meta["error"] = str(exc)
+        return meta
+
+    def _finalize_wk_execution_graph(
+        self,
+        *,
+        execution_id: str,
+        execution_result: Any,
+        planned_graph: TaskGraph | None,
+    ) -> dict[str, Any]:
+        """Mark WK execution nodes from cycle outcome (durable SoT update)."""
+        out: dict[str, Any] = {"execution_graph_finalized": False}
+        if not execution_id:
+            return out
+        try:
+            from aihub.world_knowledge.execution import (
+                fail_node_and_replan,
+                mark_node_completed,
+            )
+            from aihub.world_knowledge import store as wk_store
+
+            graph = wk_store.get_execution_graph(execution_id)
+            if graph is None:
+                return out
+            ok = bool(getattr(execution_result, "ok", False))
+            summary = str(getattr(execution_result, "action_summary", "") or "")[:400]
+            pending = [n for n in graph.nodes if n.status in ("pending", "running")]
+            if ok:
+                for n in list(pending):
+                    graph = mark_node_completed(
+                        graph,
+                        n.node_id,
+                        summary=summary or n.action,
+                        validation_ok=True,
+                    )
+            elif pending:
+                err = ""
+                errs = list(getattr(execution_result, "errors", None) or [])
+                if errs:
+                    err = str((errs[0] or {}).get("error") or errs[0])[:200]
+                graph = fail_node_and_replan(
+                    graph,
+                    pending[0].node_id,
+                    error=err or "cycle_failed",
+                    error_class="transient",
+                )
+            out["execution_graph_finalized"] = True
+            out["execution_graph_status"] = graph.status
+            out["execution_graph_id"] = graph.execution_id
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("WK execution graph finalize skipped: %s", exc, exc_info=True)
+            out["error"] = str(exc)
+        return out
+
     async def _execute_planner_tasks_lightweight(
         self,
         graph: TaskGraph,
@@ -1771,6 +1935,7 @@ class ExecutiveController:
             psyche_v2_relation_trust = float(psyche_v2_behavior_ctx.trust)
 
         memory_influenced_strategy = False
+        # 19.07: Psyche modulates tone only — never rewrites executive strategy.
         psyche_influenced_strategy = False
 
         psyche_reason_codes: list[str] = []
@@ -1795,43 +1960,8 @@ class ExecutiveController:
                     f"V2 override: procedures → reactive_tick (user={perception.user_id})"
                 )
 
-            if psyche_v2_mode == "cautious" and strategy == STRATEGY_REACTIVE:
-                strategy = STRATEGY_PLANNED
-                strategy_reason = f"Psyche V2: cautious mode requires careful planning"
-                psyche_influenced_strategy = True
-                psyche_reason_codes.append("cautious_mode_active")
-                logger.info(
-                    f"V2 override: cautious mode → planned_reasoning (user={perception.user_id})"
-                )
-
-            if psyche_v2_mode == "focused" and (
-                strategy == STRATEGY_COGNITIVE or perception.mode == "loop"
-            ):
-                strategy = STRATEGY_REACTIVE
-                strategy_reason = f"Psyche V2: focused mode prefers direct execution"
-                psyche_influenced_strategy = True
-                psyche_reason_codes.append("focused_mode_active")
-                logger.info(
-                    f"V2 override: focused mode → reactive_tick (user={perception.user_id})"
-                )
-
-            if (
-                psyche_v2_behavior_ctx is not None
-                and getattr(psyche_v2_behavior_ctx, "loaded", False)
-                and getattr(psyche_v2_behavior_ctx, "consistency_decision", "allow")
-                == "suppress"
-                and memory_v2_runtime_ctx is not None
-                and getattr(memory_v2_runtime_ctx, "loaded", False)
-                and memory_v2_actionable_contradictions == 0
-                and strategy == STRATEGY_PLANNED
-                and "cautious_mode_active" in psyche_reason_codes
-            ):
-                strategy = STRATEGY_REACTIVE
-                strategy_reason = (
-                    "Self-consistency: ostrożny tryb bez twardych sprzeczności pamięci "
-                    "— planowanie nie jest wymuszane"
-                )
-                psyche_reason_codes.append("SELF_CONSISTENCY_RELAX_PLANNED")
+            if psyche_v2_mode in ("cautious", "focused", "exploratory"):
+                psyche_reason_codes.append(f"tone_only:{psyche_v2_mode}")
 
         # ETAP 9A: Pre-routing strategy analysis (informational layer)
         active_goals_summary = None
@@ -1881,12 +2011,28 @@ class ExecutiveController:
             strategy, strategy_reason, ctx
         )
         plan.metadata["cycle_id"] = cycle_id
+        wk_graph_meta = self._bind_wk_execution_graph(
+            perception=perception,
+            plan=plan,
+            planned_graph=planned_graph,
+            cycle_id=cycle_id,
+        )
+        if wk_graph_meta.get("execution_graph_id"):
+            plan.metadata["execution_graph_id"] = wk_graph_meta["execution_graph_id"]
+            ctx.context_signals["execution_graph_id"] = wk_graph_meta["execution_graph_id"]
         execution_result, raw_payload = await self._execute_plan(
             plan,
             ctx,
             planned_graph=planned_graph,
             planner_summary=planner_summary,
             cycle_id=cycle_id,
+        )
+        wk_graph_meta.update(
+            self._finalize_wk_execution_graph(
+                execution_id=str(wk_graph_meta.get("execution_graph_id") or ""),
+                execution_result=execution_result,
+                planned_graph=planned_graph,
+            )
         )
 
         # Execution truth flags (facts) used by canonical response serializers.
@@ -2045,6 +2191,12 @@ class ExecutiveController:
             "goal_progress_update": goal_progress_update,
             "execution_plan": asdict(plan),
             "execution_result": asdict(execution_result),
+            "execution_graph_id": wk_graph_meta.get("execution_graph_id") or "",
+            "execution_graph_bound": bool(wk_graph_meta.get("execution_graph_bound")),
+            "execution_graph_created": bool(wk_graph_meta.get("execution_graph_created")),
+            "execution_graph_resumed": bool(wk_graph_meta.get("execution_graph_resumed")),
+            "execution_graph_finalized": bool(wk_graph_meta.get("execution_graph_finalized")),
+            "execution_graph_status": wk_graph_meta.get("execution_graph_status"),
             "reflection": asdict(reflection),
             "legacy_response": raw_payload,
         }

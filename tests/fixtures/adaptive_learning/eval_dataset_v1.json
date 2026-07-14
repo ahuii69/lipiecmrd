@@ -1,0 +1,62 @@
+[
+  {
+    "id": "slang_irony",
+    "message": "no spoko, totalnie mi pomogłeś...",
+    "expect": ["sarcasm", "critic"]
+  },
+  {
+    "id": "ambiguity_lody",
+    "message": "Lody robisz?",
+    "expect": ["intent_ranking", "pragmatics"]
+  },
+  {
+    "id": "correction_sexual",
+    "message": "Nie, chodziło mi o podtekst seksualny",
+    "expect": ["delayed_feedback", "correction"]
+  },
+  {
+    "id": "technical_debug",
+    "message": "napraw import json w module ops",
+    "expect": ["contextual", "planner_optional"]
+  },
+  {
+    "id": "research_sports",
+    "message": "jaki wynik meczu mundial przed wczoraj",
+    "expect": ["research", "query_rewrite"]
+  },
+  {
+    "id": "planning_multi",
+    "message": "zrób plan wdrożenia w trzech etapach",
+    "expect": ["long_horizon", "planner"]
+  },
+  {
+    "id": "reject_decision",
+    "message": "odrzucam pomysł z redisem",
+    "expect": ["rejected_guard"]
+  },
+  {
+    "id": "delayed_accept",
+    "message": "tak, dokładnie",
+    "expect": ["delayed_positive"]
+  },
+  {
+    "id": "style_short",
+    "message": "napisz krócej",
+    "expect": ["user_model_v2"]
+  },
+  {
+    "id": "topic_switch_return",
+    "message": "wróćmy do planu migracji",
+    "expect": ["long_horizon_resume"]
+  },
+  {
+    "id": "wrong_strategy_instant_fresh",
+    "message": "aktualne ceny BTC teraz",
+    "expect": ["research_bias"]
+  },
+  {
+    "id": "provider_fallback",
+    "message": "elo",
+    "expect": ["learning_on_fallback"]
+  }
+]

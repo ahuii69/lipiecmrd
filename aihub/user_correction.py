@@ -15,6 +15,8 @@ EVENT_TYPE = "user.correction"
 _STRONG_PATTERNS: list[tuple[str, str]] = [
     (r"nie\s+o\s+to\s+chodzi", "negative"),
     (r"nie\s+o\s+to\s*$", "negative"),
+    (r"chodziło\s+o|chodzilo\s+o|miałem\s+na\s+myśli|miałam\s+na\s+myśli|"
+     r"mialem\s+na\s+mysli|miam\s+na\s+mysli", "factual"),
     (r"(?<![\w])(źle|żle)(?![\w])", "negative"),
     (r"\b(błędnie|to\s+błąd|jest\s+błąd|totalnie\s+źle)\b", "negative"),
     (r"nie\s+podałem|nie\s+podałam|nie\s+podałeś|nie\s+podałaś", "factual"),

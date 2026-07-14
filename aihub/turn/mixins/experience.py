@@ -1086,6 +1086,41 @@ class ExperienceMixin:
             # Fallback path is injected by runtime itself and should be explicit.
             return text
 
+        # Cognitive length / structure shaping (deterministic trim for short preference)
+        try:
+            cog = None
+            learning = None
+            if isinstance(getattr(ctx, "system_context", None), dict):
+                cog = ctx.system_context.get("cognitive") or {}
+                learning = ctx.system_context.get("learning_decision") or {}
+            length_dir = str((cog or {}).get("length_directive") or "")
+            if not length_dir:
+                length_dir = str((learning or {}).get("learning_length_directive") or "")
+            um = (cog or {}).get("user_model") or {}
+            um2 = (learning or {}).get("user_model_v2") or {}
+            if not length_dir:
+                length_dir = str(um.get("preferred_answer_length") or um2.get("verbosity") or "")
+            if length_dir == "short" and len(text) > 1200:
+                # 19.07: never hard-trim code fences, markdown lists, or step sequences.
+                protect = (
+                    "```" in text
+                    or bool(re.search(r"(?m)^\s{0,3}([-*+]|\d+\.)\s+\S", text))
+                    or "http://" in text
+                    or "https://" in text
+                )
+                if not protect:
+                    cut = text[:1100]
+                    for sep in (". ", "! ", "? ", "\n"):
+                        idx = cut.rfind(sep)
+                        if idx > 400:
+                            cut = cut[: idx + 1]
+                            break
+                    text = cut.rstrip() + (
+                        "…" if not text[:1100].endswith((".", "!", "?")) else ""
+                    )
+        except Exception:
+            text = text
+
         if grounding_mode in {"model_only", "unknown_not_verified"}:
             if is_cap_q:
                 cap_names = [c.name for c in ctx.capabilities]

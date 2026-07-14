@@ -147,17 +147,25 @@ def test_gate_chat_turn_writes_stm_and_marks_psyche_trace(monkeypatch, isolated_
     monkeypatch.setenv("API_KEY", "")
     monkeypatch.setattr(main, "start_worker_once", lambda: None)
 
-    async def _fake_gen(_self, _req, **_kwargs):
-        return {
-            "message": {"role": "assistant", "content": "system-gate assistant"},
-            "tool_calls": [],
-            "stop_reason": "done",
-        }
+    async def _fake_gen(req, **_kwargs):
+        from aihub.chat_contracts import ModelResponse, ProviderUsage
 
+        return ModelResponse(
+            provider="fake",
+            model="fake-model",
+            content="system-gate assistant",
+            usage=ProviderUsage(total_tokens=3, reporting_mode="provider"),
+        )
+
+    fake = SimpleNamespace(generate=_fake_gen, provider_name="fake")
     monkeypatch.setattr(
         "aihub.llm.provider_registry.get_default_provider",
-        lambda: SimpleNamespace(generate=_fake_gen),
+        lambda: fake,
     )
+    # Ensure runtime singleton picks up the patched provider
+    import aihub.chat_runtime as cr
+
+    cr._RUNTIME = None
 
     uid = "product_gate_e2e_user"
     before = db_mod.fetch_one(

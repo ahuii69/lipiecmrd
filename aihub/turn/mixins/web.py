@@ -48,12 +48,111 @@ class WebMixin:
             reason = "explicit_url"
         elif web_decision == "required":
             # Strategy says web is required, no explicit URL — use research.query
-            call = ToolCallRequest(
-                tool_call_id=f"controlled_web_{int(time.time() * 1000)}",
-                name="research.query",
-                arguments={"query": turn.message, "research_type": "general"},
+            # Prefer pragmatics-rewritten / cognitively ranked query variants.
+            q = turn.message
+            ranked: list[str] = []
+            try:
+                pa = (ctx.system_context or {}).get("pragmatics") or {}
+                rw = str(pa.get("rewritten_query_for_tools") or "").strip()
+                if rw:
+                    q = rw
+                cog = (ctx.system_context or {}).get("cognitive") or {}
+                ranked = [str(x).strip() for x in list(cog.get("research_query_variants") or []) if str(x).strip()]
+                if ranked:
+                    q = ranked[0]
+                # Also honor decision_core variants if present on ctx
+                dc_ranked = list(
+                    ((ctx.system_context or {}).get("decision_core") or {}).get("research_query_variants")
+                    or []
+                )
+                for item in dc_ranked:
+                    s = str(item).strip()
+                    if s and s not in ranked:
+                        ranked.append(s)
+            except Exception as _rw_exc:
+                logger.debug("pragmatics web rewrite skipped: %s", _rw_exc)
+                ranked = []
+            if not ranked:
+                ranked = [str(q or turn.message or "").strip()]
+
+            exec_ctx = ToolExecutionContext(
+                user_id=turn.user_id,
+                session_id=turn.session_id,
+                mode=ctx.mode,
+                include_debug=turn.include_debug,
+                policy_overrides=dict(turn.tool_policy_overrides or {}),
             )
-            reason = "web_decision_required"
+            result = None
+            call = None
+            used_query = ""
+            fallback_tried = 0
+            for qi, candidate in enumerate(ranked[:4]):
+                used_query = candidate
+                call = ToolCallRequest(
+                    tool_call_id=f"controlled_web_{int(time.time() * 1000)}_{qi}",
+                    name="research.query",
+                    arguments={"query": candidate, "research_type": "general"},
+                )
+                reason = "web_decision_required" if qi == 0 else "web_decision_required_fallback_variant"
+                started = time.monotonic()
+                tlabel = TurnOps._sse_tool_display_name(call.name)
+                if stream_session_active():
+                    await emit_tool_event(tlabel, "start")
+                try:
+                    result = await self._tool_router.execute(call, exec_ctx)
+                except Exception as exc:  # noqa: BLE001
+                    result = ToolCallResult(
+                        tool_call_id=call.tool_call_id,
+                        name=call.name,
+                        ok=False,
+                        error=f"tool_error: {exc}",
+                        latency_ms=(time.monotonic() - started) * 1000.0,
+                    )
+                if stream_session_active():
+                    await emit_tool_event(tlabel, "done")
+                # Accept first success with results; otherwise try next variant
+                has_out = bool(result and result.ok and result.output)
+                if has_out:
+                    break
+                fallback_tried += 1
+            reason = "web_decision_required" if fallback_tried == 0 else f"web_decision_required_after_{fallback_tried}_fallbacks"
+
+            payload = {
+                "ok": bool(result and result.ok),
+                "name": call.name if call else "research.query",
+                "reason": reason,
+                "error": getattr(result, "error", None),
+                "output_preview": self._safe_preview(getattr(result, "output", None), max_chars=2200),
+                "research_query_used": used_query,
+                "research_query_variants_tried": ranked[:4],
+                "research_fallback_count": fallback_tried,
+            }
+            messages = [
+                ChatMessage(
+                    role="assistant",
+                    content=(
+                        "Prefetch web (runtime): wynik w wiadomości narzędzia — "
+                        "użyj jako źródło, nie powtarzaj suchej deklaracji bez treści."
+                    ),
+                    tool_calls=[call] if call else [],
+                ),
+                ChatMessage(
+                    role="tool",
+                    name=call.name if call else "research.query",
+                    tool_call_id=call.tool_call_id if call else "",
+                    content=json.dumps(payload, ensure_ascii=False),
+                ),
+            ]
+            return {
+                "triggered": True,
+                "reason": reason,
+                "tool_name": call.name if call else "research.query",
+                "tool_call": call,
+                "tool_result": result,
+                "messages": messages,
+                "query": used_query,
+                "research_fallback_count": fallback_tried,
+            }
 
         if call is None:
             return {
@@ -444,6 +543,20 @@ class WebMixin:
             decision_core=dc,
             force_no_web_verified=True,
         )
+        try:
+            from aihub.turn.pragmatics import pragmatics_trace_fields, PragmaticAnalysis
+
+            _pa = None
+            if isinstance(ctx.system_context, dict):
+                _pa = ctx.system_context.get("pragmatics_obj")
+                if _pa is None and isinstance(ctx.system_context.get("pragmatics"), dict):
+                    _pa = PragmaticAnalysis.model_validate(ctx.system_context["pragmatics"])
+            if _pa is not None:
+                trace.update(pragmatics_trace_fields(_pa))
+        except Exception as prag_exc:
+            logger.debug("web_required_ungrounded: pragmatics trace skipped: %s", prag_exc)
+            trace["pragmatics_analysis_happened"] = False
+            trace["pragmatics_degraded"] = True
         try:
             from aihub.runtime_psyche_bridge import build_psyche_v2_behavior_context
 

@@ -90,6 +90,7 @@ class DecisionMixin:
     def _apply_strategy_to_tools(
         tools: list[ProviderToolSpec],
         strategy: str,
+        tool_order_hint: list[str] | None = None,
     ) -> list[ProviderToolSpec]:
         """Restrict available tools to those relevant for the selected strategy."""
         _WHITELIST: dict[str, list[str] | None] = {
@@ -118,10 +119,34 @@ class DecisionMixin:
         }
         whitelist = _WHITELIST.get(strategy)
         if whitelist is None:
-            return tools
-        filtered = [t for t in tools if any(t.name.startswith(p) for p in whitelist)]
-        # Safety: never return an empty tool list — fall back to full set
-        return filtered if filtered else tools
+            filtered = list(tools)
+        else:
+            filtered = [t for t in tools if any(t.name.startswith(p) for p in whitelist)]
+            # Safety: never return an empty tool list — fall back to full set
+            if not filtered:
+                filtered = list(tools)
+
+        # Cognitive tool-order hint: stable sort by family priority
+        if tool_order_hint:
+            family_rank = {str(f).lower(): i for i, f in enumerate(tool_order_hint)}
+
+            def _rank(spec: ProviderToolSpec) -> tuple[int, str]:
+                name = str(getattr(spec, "name", "") or "")
+                fam = name.split(".", 1)[0].lower() if name else ""
+                # Map aliases used in cognitive hints
+                alias = {
+                    "planner": "goal",
+                    "reasoning": "runtime",
+                    "code": "runtime",
+                    "web": "research",
+                }.get(fam, fam)
+                for key, idx in family_rank.items():
+                    if fam == key or alias == key or name.startswith(key + ".") or key in name:
+                        return (idx, name)
+                return (len(family_rank) + 5, name)
+
+            filtered = sorted(filtered, key=_rank)
+        return filtered
 
     def _should_handoff_to_agent(
         self,
