@@ -391,6 +391,34 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
             result["strategy_adjustment_log"] = log
     except Exception:
         logger.debug("meta ask strategy clamp skipped", exc_info=True)
+    try:
+        from aihub.strategy_selector import is_simple_greeting
+
+        if is_simple_greeting(turn.message or "") and result.get("selected_strategy") in {
+            "agentic",
+            "planner",
+            "planned_reasoning",
+            "research",
+        }:
+            old = result["selected_strategy"]
+            result["selected_strategy"] = "instant"
+            result["planner_recommended"] = False
+            result["reason_codes"] = list(result.get("reason_codes") or []) + [
+                "GREETING_BLOCKED_AGENTIC"
+            ]
+            log = list(result.get("strategy_adjustment_log") or [])
+            log.append(
+                {
+                    "source": "greeting_guard",
+                    "reason_code": "GREETING_BLOCKED_AGENTIC",
+                    "old_value": old,
+                    "new_value": "instant",
+                    "confidence_delta": 0.0,
+                }
+            )
+            result["strategy_adjustment_log"] = log
+    except Exception:
+        logger.debug("greeting strategy clamp skipped", exc_info=True)
     self._finalize_escalation(result)
     result['user_turn_text'] = turn.message or ''
     # 19.07: one controlled adjustment trail — base → adjustments → final

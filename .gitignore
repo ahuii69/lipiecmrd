@@ -38,6 +38,7 @@ cockpit/coverage/
 *.tsbuildinfo
 
 # --- Runtime data / artifacts ---
+artifacts/
 data/*
 !data/.gitkeep
 logs/

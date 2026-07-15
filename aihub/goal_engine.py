@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -1150,6 +1151,15 @@ class GoalEngine:
             p in lower for p in ("kim jesteś", "kim jestes", "jak działasz", "jak dzialasz", "powiedz krótko")
         ):
             return True, "GOAL_SKIPPED_SIMPLE_META"
+        if re.search(r"(?i)^zapami[eę]taj\b", raw):
+            return True, "GOAL_SKIPPED_MEMORY_STORE"
+        if re.search(
+            r"(?i)(jak nazywa|czego nie lubi|jaki jest m[oó]j|m[oó]j pies|m[oó]j kod projektu)",
+            lower,
+        ):
+            return True, "GOAL_SKIPPED_MEMORY_RECALL"
+        if lower in {"elo", "hej", "cześć", "czesc", "siema", "no i co tam u ciebie?"}:
+            return True, "GOAL_SKIPPED_GREETING"
         return False, ""
 
     def build_goal_context(

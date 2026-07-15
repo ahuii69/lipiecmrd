@@ -8,6 +8,7 @@ from aihub.chat_decision_trace import (
     ROUTE_CONTEXTUAL_ANSWER,
     ROUTE_INSTANT_ANSWER,
     ROUTE_RESEARCH_ANSWER,
+    apply_provider_failure_response_trace_honesty,
     merge_canonical_for_llm_path,
 )
 
@@ -135,3 +136,22 @@ def test_merge_llm_path_provider_fallback_suffix():
     )
     assert tr["selected_route"] == ROUTE_INSTANT_ANSWER
     assert str(tr["route_reason"]).endswith(";provider_fallback")
+
+
+def test_provider_failure_trace_honesty_clears_response_impact_flags():
+    tr = {
+        "memory_v2_context_injected": True,
+        "psyche_v2_behavior_applied": True,
+        "cognitive_integration_happened": True,
+        "pragmatics_analysis_happened": True,
+        "simulation_ran": True,
+        "policy_feedback_applied": True,
+        "graph_influenced_strategy": True,
+    }
+    apply_provider_failure_response_trace_honesty(tr)
+    assert tr["llm_response_generated"] is False
+    assert tr["provider_failure_prevented_llm"] is True
+    assert tr["memory_v2_context_injected"] is False
+    assert tr["cognitive_integration_happened"] is False
+    assert tr["pragmatics_affected_response"] is False
+    assert tr["simulation_affected_response"] is False

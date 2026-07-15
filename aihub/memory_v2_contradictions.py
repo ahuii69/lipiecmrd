@@ -156,6 +156,8 @@ def _detect_procedural_conflicts(
 
 def _contains_opposite_sentiment(text_a: str, text_b: str) -> bool:
     """Simple heuristic for opposite sentiment detection."""
+    if _polish_preference_conflict(text_a, text_b):
+        return True
     # Positive signals
     likes_a = any(word in text_a for word in ["prefer", "like", "favor", "want", "choose", "detailed", "comprehensive"])
     dislikes_a = any(word in text_a for word in ["dislike", "avoid", "reject", "don't want", "short", "concise", "brief"])
@@ -173,6 +175,37 @@ def _contains_opposite_sentiment(text_a: str, text_b: str) -> bool:
         return True
 
     return (likes_a and dislikes_b) or (dislikes_a and likes_b)
+
+
+def _polish_preference_conflict(text_a: str, text_b: str) -> bool:
+    """Detect lubi X vs nie lubi X on the same Polish topic stem."""
+    import re
+
+    def prefs(t: str) -> tuple[set[str], set[str]]:
+        likes = {re.sub(r"[^\w]", "", m.group(1).lower())[:5] for m in re.finditer(r"(?iu)\blubi\s+(\S+)", t)}
+        dislikes = {
+            re.sub(r"[^\w]", "", m.group(1).lower())[:5]
+            for m in re.finditer(r"(?iu)\bnie\s+lubi\s+(\S+)", t)
+        }
+        return likes, dislikes
+
+    la, da = prefs(text_a)
+    lb, db = prefs(text_b)
+    for stem in la:
+        if stem and stem in db:
+            return True
+    for stem in da:
+        if stem and stem in lb:
+            return True
+    for hs in la:
+        for cs in db:
+            if hs[:4] and hs[:4] == cs[:4]:
+                return True
+    for hs in da:
+        for cs in lb:
+            if hs[:4] and hs[:4] == cs[:4]:
+                return True
+    return False
 
 
 def _contains_opposite_strategy(text_a: str, text_b: str) -> bool:

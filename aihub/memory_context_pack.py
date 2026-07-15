@@ -11,6 +11,7 @@ memory ids.
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Literal
 
@@ -121,7 +122,14 @@ _JUNK_MEMORY_MARKERS = (
     "helpdesk",
     "smoke ok",
     "test ping",
+    "made progress",
+    "planned_reasoning",
+    "reasoning steps",
+    "[kontekst pamięci]",
+    "[kontekst pamieci]",
 )
+
+_EPISODE_ECHO = re.compile(r"(?is)\bU\s*:.+\|\|.*A\s*:")
 
 _SPORT_NOISE = (
     "wynik meczu",
@@ -142,6 +150,8 @@ def is_junk_memory_content(text: str, *, query: str = "") -> bool:
     low = raw.lower()
     if any(m in low for m in _JUNK_MEMORY_MARKERS):
         return True
+    if _EPISODE_ECHO.search(raw) or "||" in raw or raw.strip().startswith("U:"):
+        return True
     # Single-token shout / nonverbal noise
     if len(raw.split()) <= 2 and low in {"elo", "gówno", "gowno", "ok", "działa", "dziala", "siema", "hej"}:
         return True
@@ -157,6 +167,43 @@ def is_junk_memory_content(text: str, *, query: str = "") -> bool:
         return True
     if meta and ("wynik" in low or "mecz" in low) and "system" not in low:
         return True
+    return False
+
+
+def _pref_stem(word: str) -> str:
+    return re.sub(r"[^\w]", "", (word or "").lower())[:5]
+
+
+def _extract_pl_preferences(text: str) -> tuple[set[str], set[str]]:
+    likes: set[str] = set()
+    dislikes: set[str] = set()
+    for m in re.finditer(r"(?iu)\blubi\s+(\S+)", text or ""):
+        likes.add(_pref_stem(m.group(1)))
+    for m in re.finditer(r"(?iu)\bnie\s+lubi\s+(\S+)", text or ""):
+        dislikes.add(_pref_stem(m.group(1)))
+    return likes, dislikes
+
+
+def memory_contradicts_correction_hints(content: str, correction_hints: str) -> bool:
+    """Drop stale memory when durable user correction flips like/dislike on same topic."""
+    if not (content or "").strip() or not (correction_hints or "").strip():
+        return False
+    h_likes, h_dislikes = _extract_pl_preferences(correction_hints)
+    c_likes, c_dislikes = _extract_pl_preferences(content)
+    if not h_likes and not h_dislikes:
+        return False
+    for stem in h_likes:
+        if stem and stem in c_dislikes:
+            return True
+    for stem in h_dislikes:
+        if stem and stem in c_likes:
+            return True
+    # Explicit negation flip on shared token (e.g. burz*).
+    if h_likes and c_dislikes:
+        for hs in h_likes:
+            for cs in c_dislikes:
+                if hs[:4] and hs[:4] == cs[:4]:
+                    return True
     return False
 
 
@@ -282,6 +329,7 @@ def build_memory_context_pack(
     *,
     max_chars: int = 2400,
     max_items: int = 8,
+    correction_hints: str = "",
 ) -> MemoryContextPack:
     """Build one deterministic budgeted context pack from canonical memory read outcome."""
     max_chars = max(600, min(4000, int(max_chars or 2400)))
@@ -342,6 +390,11 @@ def build_memory_context_pack(
             continue
         if is_junk_memory_content(item.content, query=query) or is_junk_memory_content(
             item.title, query=query
+        ):
+            excluded.append(item.id)
+            continue
+        if memory_contradicts_correction_hints(item.content, correction_hints) or memory_contradicts_correction_hints(
+            item.title, correction_hints
         ):
             excluded.append(item.id)
             continue

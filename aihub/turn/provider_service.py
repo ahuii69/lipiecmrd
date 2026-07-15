@@ -9,7 +9,7 @@ import time
 from typing import Any, Protocol
 
 from aihub.chat_contracts import ChatMessage, ModelResponse, ProviderUsage, ToolCallRequest
-from aihub.config import GROQ_MODEL, LLM_MODEL_NAME, LLM_PRIMARY_PROVIDER, LLM_RESERVE_PROVIDER, LLM_STREAMING_ENABLED
+from aihub.config import GROQ_MODEL, LLM_MODEL_NAME, LLM_PRIMARY_PROVIDER, LLM_RESERVE_PROVIDER, LLM_STREAMING_ENABLED, OLLAMA_LLM_MODEL
 from aihub.chat_stream_session import stream_session_active
 from aihub.llm.failover_policy import (
     failure_class_for_error,
@@ -17,7 +17,7 @@ from aihub.llm.failover_policy import (
     max_retries_before_failover,
     parse_retry_after,
 )
-from aihub.llm.provider_registry import provider_candidate_names
+from aihub.llm.provider_registry import provider_candidate_names, reserve_provider_names
 from aihub.llm.provider_types import ProviderChatRequest, ProviderError, ProviderToolSpec
 from aihub.turn.errors import (
     ProviderExecutionError,
@@ -190,17 +190,34 @@ def _attempt_record(
 
 
 class ProviderExecutionService:
-    """Single canonical LLM call path with DeepInfra → Groq failover."""
+    """Single canonical LLM call path with DeepInfra → Groq → Ollama failover."""
 
     def __init__(
         self,
         primary: SupportsGenerate,
         reserve: SupportsGenerate | None = None,
+        reserves: list[SupportsGenerate] | None = None,
     ) -> None:
         self._primary = primary
-        self._reserve = reserve
+        self._reserves: list[SupportsGenerate] = []
+        if reserves:
+            self._reserves.extend(reserves)
+        elif reserve is not None:
+            self._reserves.append(reserve)
         # Backward compat: single-provider attribute
         self._provider = primary
+
+    def _providers_to_try(self) -> list[SupportsGenerate]:
+        seen: set[str] = set()
+        ordered: list[SupportsGenerate] = []
+        for provider in [self._primary, *self._reserves]:
+            name = str(getattr(provider, "provider_name", "")).lower()
+            if name and name in seen:
+                continue
+            if name:
+                seen.add(name)
+            ordered.append(provider)
+        return ordered
 
     @property
     def provider_name(self) -> str:
@@ -216,6 +233,8 @@ class ProviderExecutionService:
         name = str(getattr(provider, "provider_name", "") or "").lower()
         if name == "groq":
             return GROQ_MODEL
+        if name == "ollama":
+            return OLLAMA_LLM_MODEL
         return LLM_MODEL_NAME
 
     async def _call_provider_once(
@@ -242,6 +261,7 @@ class ProviderExecutionService:
         remaining_s: float | None,
         trace: TraceBuilder | None,
         attempt_offset: int,
+        max_tokens: int | None = None,
     ) -> tuple[ModelResponse, list[ProviderAttempt], list[dict[str, Any]]]:
         if cancelled:
             raise TurnCancelledError(internal_detail="provider_call")
@@ -256,6 +276,7 @@ class ProviderExecutionService:
             model=default_model,
             tools=tools,
             stream=use_stream,
+            max_tokens=max_tokens,
         )
 
         attempts: list[ProviderAttempt] = []
@@ -363,6 +384,7 @@ class ProviderExecutionService:
             {
                 "provider_primary": LLM_PRIMARY_PROVIDER,
                 "provider_reserve": LLM_RESERVE_PROVIDER,
+                "provider_reserve_chain": reserve_provider_names(),
                 "provider_candidates": provider_candidate_names(),
                 "provider_attempt_count": len(trace_attempts),
                 "provider_attempts": trace_attempts,
@@ -383,17 +405,13 @@ class ProviderExecutionService:
         cancelled: bool = False,
         remaining_s: float | None = None,
         trace: TraceBuilder | None = None,
+        max_tokens: int | None = None,
     ) -> ProviderExecutionResult:
         env = environment or RuntimeEnvironment()
         started_total = time.monotonic()
         all_attempts: list[ProviderAttempt] = []
         all_trace_attempts: list[dict[str, Any]] = []
-        providers_to_try: list[SupportsGenerate] = [self._primary]
-        if self._reserve is not None:
-            reserve_name = str(getattr(self._reserve, "provider_name", "")).lower()
-            primary_name = str(getattr(self._primary, "provider_name", "")).lower()
-            if reserve_name and reserve_name != primary_name:
-                providers_to_try.append(self._reserve)
+        providers_to_try = self._providers_to_try()
 
         last_err: BaseException | None = None
         failover_happened = False
@@ -411,6 +429,7 @@ class ProviderExecutionService:
                     remaining_s=remaining_s,
                     trace=trace,
                     attempt_offset=len(all_attempts),
+                    max_tokens=max_tokens,
                 )
                 all_attempts.extend(attempts)
                 all_trace_attempts.extend(trace_attempts)

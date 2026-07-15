@@ -25,6 +25,68 @@ ROUTE_WEB_REQUIRED_UNGROUNDED = "web_required_ungrounded"
 # Błąd infrastruktury handoff (nie mylić z udanym agentic_plan_execute).
 ROUTE_AGENT_HANDOFF_ERROR = "agent_handoff_error"
 
+PROVIDER_TRACE_MERGE_KEYS = (
+    "provider_primary",
+    "provider_reserve",
+    "provider_candidates",
+    "provider_attempt_count",
+    "provider_attempts",
+    "provider_failover_happened",
+    "provider_selected_final",
+    "provider_final_model",
+    "provider_final_ok",
+    "provider_total_duration_ms",
+)
+
+
+def merge_provider_trace_from_builder(
+    target: dict[str, Any],
+    trace_builder: Any | None,
+) -> dict[str, Any]:
+    """Copy provider failover fields from TraceBuilder into a trace dict."""
+    merged: dict[str, Any] = {}
+    data = getattr(trace_builder, "_data", None) if trace_builder is not None else None
+    if isinstance(data, dict):
+        for pk in PROVIDER_TRACE_MERGE_KEYS:
+            if pk in data:
+                merged[pk] = data[pk]
+    if merged:
+        target.update(merged)
+    return merged
+
+
+def apply_provider_failure_response_trace_honesty(trace: dict[str, Any]) -> None:
+    """Pre-provider modules may run; only mark response impact when LLM succeeded."""
+    trace["llm_response_generated"] = False
+    trace["provider_failure_prevented_llm"] = True
+    trace["response_outcome_quality"] = "provider_failure_fallback"
+
+    trace["memory_v2_context_injected"] = False
+    trace["memory_v2_procedure_bias_applied"] = False
+    trace["memory_v2_contradiction_guard_applied"] = False
+    trace["memory_substantive_injected_in_prompt"] = False
+    trace["memory_substantive_in_prompt"] = False
+
+    trace["psyche_v2_behavior_applied"] = False
+    trace["psyche_v2_pressure_applied"] = False
+    trace["psyche_v2_relation_tone_applied"] = False
+
+    if trace.get("cognitive_integration_happened"):
+        trace["cognitive_integration_affected_response"] = False
+        trace["cognitive_integration_happened"] = False
+
+    if trace.get("pragmatics_analysis_happened"):
+        trace["pragmatics_affected_response"] = False
+
+    if trace.get("simulation_ran"):
+        trace["simulation_affected_response"] = False
+
+    if trace.get("policy_feedback_applied"):
+        trace["policy_feedback_affected_response"] = False
+
+    if trace.get("graph_influenced_strategy"):
+        trace["graph_influenced_response"] = False
+
 
 def trace_blocker_gate_outcome(
     trace: dict[str, Any],

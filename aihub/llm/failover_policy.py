@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import re
 from typing import Any
 
 from aihub.llm.provider_types import ProviderError
+
+_RETRY_AFTER_IN_MSG = re.compile(
+    r"(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*s",
+)
 
 
 def failure_class_for_error(exc: BaseException) -> str:
@@ -72,7 +77,9 @@ def max_retries_before_failover(exc: BaseException) -> int:
         status = int(exc.status_code or 0)
         if status in {401, 402, 403}:
             return 0
-        if status in {408, 429} or status >= 500:
+        if status == 429:
+            return 2
+        if status in {408} or status >= 500:
             return 1
         code = str(exc.code or "").lower()
         if code in {"timeout", "transport"}:
@@ -84,6 +91,13 @@ def max_retries_before_failover(exc: BaseException) -> int:
 
 
 def parse_retry_after(exc: BaseException) -> float | None:
+    msg = str(exc)
+    m = _RETRY_AFTER_IN_MSG.search(msg)
+    if m:
+        try:
+            return max(0.5, float(m.group(1)) + 0.5)
+        except (TypeError, ValueError):
+            return None
     details = getattr(exc, "details", None) or {}
     if isinstance(details, dict):
         headers = details.get("headers") or details.get("response_headers")

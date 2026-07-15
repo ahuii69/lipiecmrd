@@ -85,6 +85,16 @@ class ChatTurnInput(BaseModel):
         default=None,
         description="Trusted runtime mode; audit disables write-backs.",
     )
+    max_completion_tokens: Optional[int] = Field(
+        default=None,
+        ge=16,
+        le=8192,
+        description="Optional cap on model completion tokens for this turn.",
+    )
+    skip_response_critic: bool = Field(
+        default=False,
+        description="When true, skip post-response critic revision loop.",
+    )
 
 
 class ChatTurnContext(BaseModel):

@@ -13,6 +13,7 @@ class PromptContextMixin:
         memory_context: dict[str, Any],
         *,
         include_stm: bool = True,
+        correction_hints: str = "",
     ) -> str:
         if not isinstance(memory_context, dict):
             return "BRAK DANYCH"
@@ -34,28 +35,47 @@ class PromptContextMixin:
         ):
             return "Brak trafień pamięci dla tej wiadomości."
 
+        from aihub.memory_context_pack import (
+            is_junk_memory_content,
+            memory_contradicts_correction_hints,
+        )
+
+        def _line_ok(text: str) -> bool:
+            if not text or is_junk_memory_content(text):
+                return False
+            if memory_contradicts_correction_hints(text, correction_hints):
+                return False
+            return True
+
         stm_lines: list[str] = []
         if include_stm:
             for item in stm[-10:]:
                 if isinstance(item, dict):
                     role = str(item.get("role") or "")
                     body = str(item.get("content") or "")
-                    stm_lines.append(f"- [{role}] {body[:220]}")
+                    if _line_ok(body):
+                        stm_lines.append(f"- [{role}] {body[:220]}")
 
         epi_lines = []
         for item in episodic[:2]:
             if isinstance(item, dict):
-                epi_lines.append(f"- {str(item.get('content', ''))[:180]}")
+                body = str(item.get("content", ""))
+                if _line_ok(body):
+                    epi_lines.append(f"- {body[:180]}")
 
         sem_lines = []
         for item in semantic[:4]:
             if isinstance(item, dict):
-                sem_lines.append(f"- {str(item.get('content', ''))[:180]}")
+                body = str(item.get("content", ""))
+                if _line_ok(body):
+                    sem_lines.append(f"- {body[:180]}")
 
         dense_lines = []
         for item in dense[:3]:
             if isinstance(item, dict):
-                dense_lines.append(f"- {str(item.get('text', ''))[:160]}")
+                body = str(item.get("text", ""))
+                if _line_ok(body):
+                    dense_lines.append(f"- {body[:160]}")
 
         if include_stm:
             stm_block = (
@@ -85,6 +105,7 @@ class PromptContextMixin:
         memory_context: dict[str, Any],
         *,
         include_stm: bool = True,
+        correction_hints: str = "",
     ) -> list[dict[str, Any]]:
         """Observability: snapshot tego, co faktycznie poszło do promptu (STM opcjonalnie)."""
         out: list[dict[str, Any]] = []
@@ -103,9 +124,14 @@ class PromptContextMixin:
             if not t:
                 return
             try:
-                from aihub.memory_context_pack import is_junk_memory_content
+                from aihub.memory_context_pack import (
+                    is_junk_memory_content,
+                    memory_contradicts_correction_hints,
+                )
 
                 if is_junk_memory_content(t):
+                    return
+                if memory_contradicts_correction_hints(t, correction_hints):
                     return
             except Exception as junk_exc:
                 logger.debug("junk memory filter skipped: %s", junk_exc)
@@ -332,6 +358,10 @@ class PromptContextMixin:
                 r"(?iu)\b(mecz|wynik|liga|news|cena|kurs)\b", lower
             ):
                 freshness_needed = False
+        from aihub.strategy_selector import _LOCAL_INFRA_NO_WEB
+
+        if _LOCAL_INFRA_NO_WEB.search(msg):
+            freshness_needed = False
         # An attached image/file makes the turn about that attachment; do not force web
         # research on top of it (the vision/description path must win).
         if freshness_needed and not has_attachments and not pragmatics_blocks_freshness:
@@ -503,6 +533,7 @@ class PromptContextMixin:
                 limit=pack_limit,
                 max_chars=pack_chars,
                 include_graph=not meta_ask,
+                correction_hints=hints,
             )
             pack_dump = pack.model_dump(mode="json")
             pack_prompt = pack.to_prompt_text(max_chars=pack_chars)
@@ -640,9 +671,41 @@ class PromptContextMixin:
                 res.response_text, user_message=turn.message
             )
             if changed:
+                dry_marker = "model nie oddał treści"
+                if cleaned and dry_marker in cleaned.lower():
+                    web_fallback = TurnOps._web_synthesis_from_tool_results(res)
+                    if web_fallback:
+                        cleaned = web_fallback
+                    else:
+                        res.ok = False
+                        if isinstance(res.trace, dict):
+                            res.trace["persona_guard_empty_after_sanitize"] = True
                 res.response_text = cleaned
                 if isinstance(res.trace, dict):
                     res.trace["persona_leakage_sanitized"] = True
         except Exception:  # noqa: BLE001
             logger.debug("persona guard skipped", exc_info=True)
+
+    @staticmethod
+    def _web_synthesis_from_tool_results(res: ChatTurnResult) -> str | None:
+        """Build a short grounded answer when persona guard would drop the whole LLM reply."""
+        trace = res.trace if isinstance(res.trace, dict) else {}
+        controlled_web = trace.get("controlled_web") if isinstance(trace.get("controlled_web"), dict) else {}
+        if not controlled_web.get("triggered") and not trace.get("web_used"):
+            for tr in res.tool_results or []:
+                if tr.ok and (tr.name or "") in {"research.query", "web.fetch_url"}:
+                    controlled_web = {
+                        "triggered": True,
+                        "ok": True,
+                        "tool_name": tr.name,
+                        "query": "",
+                        "source_count": 1,
+                    }
+                    break
+            else:
+                return None
+        return TurnOps._build_controlled_web_synthesis(
+            controlled_web=controlled_web,
+            tool_results=res.tool_results or [],
+        )
 

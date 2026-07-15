@@ -218,6 +218,7 @@ class MemoryCanonicalCore:
         limit: int = 24,
         max_chars: int = 8000,
         include_graph: bool = True,
+        correction_hints: str = "",
     ):
         """Build the canonical MemoryContextPack used by prompt/trace/frontend."""
         from aihub.memory_context_pack import build_memory_context_pack
@@ -226,7 +227,12 @@ class MemoryCanonicalCore:
         if not include_graph:
             spec = spec.model_copy(update={"include_graph": False, "graph_limit": 0})
         outcome = self.read_memory(spec)
-        return build_memory_context_pack(outcome, max_chars=max_chars, max_items=limit)
+        return build_memory_context_pack(
+            outcome,
+            max_chars=max_chars,
+            max_items=limit,
+            correction_hints=correction_hints,
+        )
 
     def v2_process_index_jobs(self, user_id: str | None = None, limit: int = 50) -> Dict[str, Any]:
         """Retry durable Memory V2 vector index jobs."""

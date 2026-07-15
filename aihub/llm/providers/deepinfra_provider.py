@@ -200,6 +200,7 @@ class DeepInfraProvider(BaseProvider):
         content = (
             self._extract_text_content(message.get("content"))
             or self._extract_text_content(message.get("output_text"))
+            or self._extract_text_content(message.get("reasoning"))
             or self._extract_text_content(first.get("text"))
             or self._extract_text_content(data.get("output_text"))
             or self._extract_text_content(data.get("output"))

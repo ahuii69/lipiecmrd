@@ -11,6 +11,7 @@ and maps to StrategySelection for the canonical chat runtime.
 from __future__ import annotations
 
 import logging
+import re
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -21,6 +22,19 @@ from aihub.psyche_core import get_psyche_core
 logger = logging.getLogger(__name__)
 
 StrategyType = Literal["instant", "contextual", "research", "agentic"]
+
+_LOCAL_INFRA_NO_WEB = re.compile(
+    r"(?iu)\b("
+    r"zrestartuj\s+.*backend\w*|"
+    r"restartuj\s+.*backend\w*|"
+    r"status\s+backend\w*|"
+    r"sprawd[źz]\s+.*backend\w*|"
+    r"health\s+(?:\w+\s+){0,4}backend\w*|"
+    r"/ops/ready|/system/ping|"
+    r"ma\s+(?:teraz\s+)?adres\s+\d{1,3}(?:\.\d{1,3}){3}|"
+    r"adres\s+\d{1,3}(?:\.\d{1,3}){3}"
+    r")\b"
+)
 
 # Stable reason codes for classification (extended for rule-trace contract)
 REASON_CODES = {
@@ -508,6 +522,30 @@ def is_assistant_meta_ask(user_text: str) -> bool:
         for k in ("zaplanuj", "wykonaj", "przeanalizuj", "krok po kroku")
     )
     return bool(short_ask and self_ref and not exec_blocked)
+
+
+_SIMPLE_GREETINGS = frozenset(
+    {"elo", "hej", "cześć", "czesc", "siema", "hi", "hello", "hey", "yo"}
+)
+
+
+def is_simple_greeting(user_text: str) -> bool:
+    """Single-token or very short social openers — never agentic/planner."""
+    text = (user_text or "").strip()
+    if not text:
+        return False
+    lower = text.lower().rstrip("!?., ")
+    if lower in _SIMPLE_GREETINGS:
+        return True
+    words = [w for w in lower.split() if w]
+    if len(words) <= 4 and lower.startswith(("cześć", "czesc", "hej", "siema")):
+        return True
+    if len(words) <= 5 and "co tam" in lower:
+        return True
+    if len(words) <= 7 and "co tam u ciebie" in lower:
+        return True
+    return False
+
 
 RESEARCH_INTENT_TOKENS = (
     "znajdź",
@@ -1126,6 +1164,10 @@ def select_strategy(
     elif "://" in _text_for_url:
         selection.web_decision = "required"
         selection.web_decision_reason = "explicit_url_in_query"
+    elif _LOCAL_INFRA_NO_WEB.search(_text_for_url):
+        selection.web_decision = "off"
+        selection.web_decision_reason = "local_infra_or_fact_no_web"
+        selection.research_needed = False
     elif selection.research_needed:
         selection.web_decision = "required"
         selection.web_decision_reason = "research_keywords_match"

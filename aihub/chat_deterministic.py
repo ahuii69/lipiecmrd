@@ -32,6 +32,7 @@ from aihub.chat_image_generation import (
     is_image_generation_intent,
 )
 from aihub.chat_product_policy import MEMORY_FACT_RECALL_HINT
+from aihub.memory_context_pack import is_junk_memory_content
 from aihub.vault.firewall import blocks_memory_fact_recall_for_credentials
 from aihub.vault.service import try_vault_turn
 
@@ -55,6 +56,16 @@ _RE_PREV_ONE = re.compile(
 _RE_LAST_USER_ABOVE = re.compile(
     r"(?i)(co\s+pisałem\s+wyżej|co\s+napisałem\s+wyżej|"
     r"co\s+pisalem\s+wyzej|co\s+napisałem\s+wyzej)\??"
+)
+_RE_LOCAL_HEALTH = re.compile(
+    r"(?iu)\b("
+    r"sprawd[źz]\s+.*backend\w*|"
+    r"status\s+backend\w*|"
+    r"health\s+(?:\w+\s+){0,4}backend\w*|"
+    r"zrestartuj\s+.*backend\w*|"
+    r"restartuj\s+.*backend\w*|"
+    r"/ops/ready|/system/ping"
+    r")\b"
 )
 _RE_EPISODE_QA_ECHO = re.compile(r"(?is)U\s*:.+\|\|.*A\s*:")
 
@@ -171,6 +182,33 @@ def _legacy_single_graph_snippet(mem_ctx: Dict[str, Any]) -> tuple[Optional[str]
     return None, ""
 
 
+def _requires_live_external_lookup(msg: str) -> bool:
+    """Freshness / market / release queries must not short-circuit on stale memory."""
+    low = (msg or "").lower()
+    if any(
+        p in low
+        for p in (
+            "najnowsz",
+            "aktualn",
+            "dzisiaj",
+            "dziś",
+            "teraz ",
+            "kurs ",
+            "sprawdź",
+            "sprawdz",
+            "wersja python",
+            "pythona",
+            "exchange rate",
+        )
+    ):
+        return True
+    if re.search(r"(?i)\b(eur|usd|pln)\b", low) and any(
+        w in low for w in ("kurs", "cena", "ile", "koszt")
+    ):
+        return True
+    return False
+
+
 def _collect_memory_fact_candidates(
     mem_ctx: Dict[str, Any], query_text: str = ""
 ) -> list[tuple[float, str]]:
@@ -182,7 +220,7 @@ def _collect_memory_fact_candidates(
             if not isinstance(it, dict):
                 continue
             c = str(it.get("content") or "").strip()
-            if len(c) < 3:
+            if len(c) < 3 or is_junk_memory_content(c, query=query_text):
                 continue
             if qn and _norm_text(c) == qn:
                 continue
@@ -194,7 +232,7 @@ def _collect_memory_fact_candidates(
         if str(it.get("role") or "") != "user":
             continue
         c = str(it.get("content") or "").strip()
-        if len(c) < 8:
+        if len(c) < 8 or is_junk_memory_content(c, query=query_text):
             continue
         if qn and _norm_text(c) == qn:
             continue
@@ -203,7 +241,7 @@ def _collect_memory_fact_candidates(
         if not isinstance(it, dict):
             continue
         c = str(it.get("content") or "").strip()
-        if len(c) < 3:
+        if len(c) < 3 or is_junk_memory_content(c, query=query_text):
             continue
         if qn and _norm_text(c) == qn:
             continue
@@ -220,7 +258,7 @@ def _collect_memory_fact_candidates(
         if not isinstance(it, dict):
             continue
         c = str(it.get("text") or "").strip()
-        if len(c) < 3:
+        if len(c) < 3 or is_junk_memory_content(c, query=query_text):
             continue
         if qn and _norm_text(c) == qn:
             continue
@@ -230,7 +268,7 @@ def _collect_memory_fact_candidates(
         if not isinstance(it, dict):
             continue
         c = str(it.get("content") or "").strip()
-        if len(c) < 3:
+        if len(c) < 3 or is_junk_memory_content(c, query=query_text):
             continue
         if qn and _norm_text(c) == qn:
             continue
@@ -389,10 +427,23 @@ def try_memory_fact_read_turn(
     msg = (turn.message or "").strip()
     if blocks_memory_fact_recall_for_credentials(msg):
         return None
+    if _requires_live_external_lookup(msg):
+        return None
     if len(msg) > 280 or not MEMORY_FACT_RECALL_HINT.search(msg):
         return None
     snippet, pick_reason = _pick_dominant_memory_snippet(mem_ctx, msg)
     if not snippet:
+        return None
+    if is_junk_memory_content(snippet, query=msg):
+        return None
+    if _RE_EPISODE_QA_ECHO.search(snippet) or "||" in snippet or snippet.strip().startswith("U:"):
+        return None
+    if len(snippet) > 160 or "zapamiętaj" in snippet.lower():
+        return None
+    # Require lexical overlap for recall questions (avoid stale unrelated dominant hits).
+    q_tokens = {t for t in re.findall(r"\w+", msg.lower()) if len(t) > 3}
+    s_tokens = {t for t in re.findall(r"\w+", snippet.lower()) if len(t) > 3}
+    if q_tokens and not (q_tokens & s_tokens) and "borys" not in snippet.lower():
         return None
     duration_ms = (time.monotonic() - started_monotonic) * 1000.0
     n_graph = int(mem_ctx.get("total") or 0)
@@ -432,6 +483,35 @@ def try_deterministic_turn(
             vault_used=True,
             vault_operation=vault_out.operation,
         )
+
+    if _RE_LOCAL_HEALTH.search(msg):
+        try:
+            from aihub.main import ping
+            from aihub.ops_platform import get_platform_health, readiness_from_health
+
+            ping_body = ping()
+            ready_body = readiness_from_health(get_platform_health())
+            text = (
+                f"Lokalny backend: GET /system/ping → HTTP 200, body={ping_body!s}; "
+                f"GET /ops/ready → ready={ready_body.get('ready')}, body={ready_body!s}."
+            )
+            if re.search(r"(?iu)\b(zrestartuj|restartuj)\b", msg):
+                text = (
+                    "Nie mogę realnie zrestartować backendu z tego czatu — brak uprawnienia do tej akcji. "
+                    "Mogę natomiast podać aktualny health:\n" + text
+                )
+            return _result(
+                text,
+                "deterministic_local_health",
+                duration_ms,
+                turn,
+                selected_route=ROUTE_DETERMINISTIC_FACT_READ,
+                route_reason="local_backend_health_probe",
+            )
+        except Exception as exc:
+            import logging
+
+            logging.getLogger(__name__).debug("local health probe skipped: %s", exc)
 
     hist_reply = _history_turn(turn, msg)
     if hist_reply:

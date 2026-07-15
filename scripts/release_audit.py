@@ -49,6 +49,7 @@ SKIP_DIRS = {
     ".venv",
     ".venvs",
     "logs",
+    "artifacts",
 }
 TEXT_MARKER_IGNORE = {
     "scripts/doctor.py",  # detection token list, not unfinished code

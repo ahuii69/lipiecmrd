@@ -13,6 +13,7 @@ from aihub.turn.errors import RuntimeInternalError
 class PipelineMixin:
     async def run_turn_core(self, turn: ChatTurnInput) -> ChatTurnResult:
         g: dict[str, Any] = {"turn": turn}
+        self._turn_max_completion_tokens = getattr(turn, "max_completion_tokens", None)
         await self._stage_prepare(g)
         if "__result__" in g:
             return g["__result__"]
@@ -114,8 +115,16 @@ class PipelineMixin:
         g['memory_lookup_flag'] = bool(g['mem_truth']['memory_retrieval_has_rows'])
         g['memory_substantive_flag'] = bool(g['mem_truth']['memory_substantive_in_prompt'])
         g['include_stm_in_memory_brief'] = len(g['turn'].history or []) == 0
-        g['memory_brief'] = self._build_memory_brief(g['ctx'].memory_context, include_stm=g['include_stm_in_memory_brief'])
-        g['memory_used_trace'] = self._build_memory_used_trace(g['ctx'].memory_context, include_stm=g['include_stm_in_memory_brief'])
+        g['memory_brief'] = self._build_memory_brief(
+            g['ctx'].memory_context,
+            include_stm=g['include_stm_in_memory_brief'],
+            correction_hints=str((g['ctx'].system_context or {}).get('correction_hints_text') or ''),
+        )
+        g['memory_used_trace'] = self._build_memory_used_trace(
+            g['ctx'].memory_context,
+            include_stm=g['include_stm_in_memory_brief'],
+            correction_hints=str((g['ctx'].system_context or {}).get('correction_hints_text') or ''),
+        )
         if stream_session_active():
             await emit_status('thinking', label_pl='Analizuję…')
             await emit_status('memory', label_pl='Sprawdzam kontekst…')
@@ -300,7 +309,11 @@ class PipelineMixin:
                 g['fallback_reflection'] = self._post_exec_reflection(user_id=g['turn'].user_id, message=g['turn'].message, response_text=g['fallback_text'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], handoff_happened=False)
                 g['duration_ms'] = (time.monotonic() - g['started']) * 1000.0
                 g['usage_summary'] = self._sum_usage(g['provider_usages'])
-                g['trace'] = {'provider_calls': g['provider_call_count'], 'tool_iterations': g['iteration'], 'fallback': g['fallback_trace'], 'used_tools': len(g['tool_results']) > 0, 'used_fallback': True, 'response_grounding_mode': 'fallback', 'duration_ms': g['duration_ms'], **self._correction_trace_fields(g['ctx']), 'provider': self._current_provider_name(), 'model': LLM_MODEL_NAME, 'usage_reporting_mode': g['usage_summary'].reporting_mode, 'usage_total_tokens': g['usage_summary'].total_tokens, 'selected_strategy': g['decision_core']['selected_strategy'], **self._decision_core_trace_escalation(g['decision_core']), 'reason_codes': g['decision_core']['reason_codes'], 'strategy_confidence': g['decision_core']['strategy_confidence'], 'degraded': g['decision_core']['strategy_degraded'], 'memory_lookup_happened': g['memory_lookup_flag'], 'memory_results_count': memory_results_count_for_trace(g['ctx'].memory_context), 'psyche_snapshot_happened': False, 'research_was_required': self._has_research_tool(g['tool_calls']), 'agentic_executed': False, 'tool_calls_count': len(g['tool_calls']), 'experience_write_back_attempted': False, 'experience_write_back_succeeded': False, 'controlled_web_decision': g['decision_core'].get('web_decision', 'off'), 'controlled_web_decision_reason': g['decision_core'].get('web_decision_reason', 'not_evaluated'), 'controlled_web_triggered': bool(g['controlled_web'].get('triggered')), 'controlled_web_reason': g['controlled_web'].get('reason'), 'controlled_web_tool': g['controlled_web'].get('tool_name'), 'controlled_web_ok': g['controlled_web'].get('ok'), 'controlled_web_has_results': g['controlled_web'].get('has_results'), 'controlled_web_provider_info': g['controlled_web'].get('provider_info'), 'controlled_web_query': g['controlled_web'].get('query'), 'controlled_web_source_count': g['controlled_web'].get('source_count', 0), 'controlled_web_freshness_needed': g['controlled_web'].get('freshness_needed', False), 'consistency_check_ran': g['decision_core']['consistency_check_ran'], 'consistency_classification': g['decision_core']['consistency_classification'], 'contradictions_found': g['decision_core']['contradictions_found'], 'policy_hints_loaded': g['decision_core']['policy_hints_loaded'], 'policy_profile_name': g['decision_core']['policy_profile_name'], 'simulation_ran': g['decision_core']['simulation_ran'], 'simulation_best_action': g['decision_core']['simulation_best_action'], 'simulation_variants_count': g['decision_core']['simulation_variants_count'], 'simulation_risk_summary': g['decision_core']['simulation_risk_summary'], 'experience_lookup_happened': g['decision_core'].get('experience_lookup_happened', False), 'experience_matches_count': g['decision_core'].get('experience_matches_count', 0), 'experience_influenced_strategy': g['decision_core'].get('experience_influenced_strategy', False), 'experience_confidence_adjustment': g['decision_core'].get('experience_confidence_adjustment'), 'experience_handoff_bias': g['decision_core'].get('experience_handoff_bias'), 'experience_blocker_reason': g['decision_core'].get('experience_blocker_reason'), 'experience_signal_summary': g['decision_core'].get('experience_signal_summary'), 'reflection_ran': g['fallback_reflection']['reflection_ran'], 'reflection_summary': g['fallback_reflection']['reflection_summary'], 'selected_goal': g['decision_core'].get('selected_goal'), 'policy_feedback_loaded': bool(g['decision_core'].get('policy_feedback_loaded')), 'policy_feedback_applied': bool(g['decision_core'].get('policy_feedback_applied')), 'policy_feedback_summary': g['decision_core'].get('policy_feedback_summary', ''), 'policy_confidence_delta': g['decision_core'].get('policy_confidence_delta', 0.0), 'policy_handoff_bias': g['decision_core'].get('policy_handoff_bias', 0.0), 'policy_blocker_sensitivity': g['decision_core'].get('policy_blocker_sensitivity', 0.0), 'policy_simulation_risk_cal': g['decision_core'].get('policy_simulation_risk_cal', 0.0), 'policy_strategy_adjustments': g['decision_core'].get('policy_strategy_adjustments', {}), 'reflection_strategy_fit': g['fallback_reflection'].get('strategy_fit', 'neutral'), 'reflection_handoff_hindsight': g['fallback_reflection'].get('handoff_hindsight', 'na'), 'reflection_blocker_hindsight': g['fallback_reflection'].get('blocker_hindsight', 'na'), 'reflection_confidence_hindsight': g['fallback_reflection'].get('confidence_hindsight', 0.0), 'reflection_risk_hindsight': g['fallback_reflection'].get('risk_hindsight', 0.0), 'attached_files': g['attachment_meta'], 'attachments_summary': g['attachments_summary'], 'blocker_verdict': g['blocker_verdict'].model_dump()}
+                g['_provider_trace'] = {}
+                merge_provider_trace_from_builder(g['_provider_trace'], getattr(self, '_active_trace_builder', None))
+                g['_fb_provider'] = g['_provider_trace'].get('provider_selected_final') or self._current_provider_name()
+                g['_fb_model'] = g['_provider_trace'].get('provider_final_model') or LLM_MODEL_NAME
+                g['trace'] = {'provider_calls': g['provider_call_count'], 'tool_iterations': g['iteration'], 'fallback': g['fallback_trace'], 'used_tools': len(g['tool_results']) > 0, 'used_fallback': True, 'response_grounding_mode': 'fallback', 'duration_ms': g['duration_ms'], **self._correction_trace_fields(g['ctx']), 'provider': g['_fb_provider'], 'model': g['_fb_model'], 'usage_reporting_mode': g['usage_summary'].reporting_mode, 'usage_total_tokens': g['usage_summary'].total_tokens, 'selected_strategy': g['decision_core']['selected_strategy'], **self._decision_core_trace_escalation(g['decision_core']), 'reason_codes': g['decision_core']['reason_codes'], 'strategy_confidence': g['decision_core']['strategy_confidence'], 'degraded': g['decision_core']['strategy_degraded'], 'memory_lookup_happened': g['memory_lookup_flag'], 'memory_results_count': memory_results_count_for_trace(g['ctx'].memory_context), 'psyche_snapshot_happened': False, 'research_was_required': self._has_research_tool(g['tool_calls']), 'agentic_executed': False, 'tool_calls_count': len(g['tool_calls']), 'experience_write_back_attempted': False, 'experience_write_back_succeeded': False, 'controlled_web_decision': g['decision_core'].get('web_decision', 'off'), 'controlled_web_decision_reason': g['decision_core'].get('web_decision_reason', 'not_evaluated'), 'controlled_web_triggered': bool(g['controlled_web'].get('triggered')), 'controlled_web_reason': g['controlled_web'].get('reason'), 'controlled_web_tool': g['controlled_web'].get('tool_name'), 'controlled_web_ok': g['controlled_web'].get('ok'), 'controlled_web_has_results': g['controlled_web'].get('has_results'), 'controlled_web_provider_info': g['controlled_web'].get('provider_info'), 'controlled_web_query': g['controlled_web'].get('query'), 'controlled_web_source_count': g['controlled_web'].get('source_count', 0), 'controlled_web_freshness_needed': g['controlled_web'].get('freshness_needed', False), 'consistency_check_ran': g['decision_core']['consistency_check_ran'], 'consistency_classification': g['decision_core']['consistency_classification'], 'contradictions_found': g['decision_core']['contradictions_found'], 'policy_hints_loaded': g['decision_core']['policy_hints_loaded'], 'policy_profile_name': g['decision_core']['policy_profile_name'], 'simulation_ran': g['decision_core']['simulation_ran'], 'simulation_best_action': g['decision_core']['simulation_best_action'], 'simulation_variants_count': g['decision_core']['simulation_variants_count'], 'simulation_risk_summary': g['decision_core']['simulation_risk_summary'], 'experience_lookup_happened': g['decision_core'].get('experience_lookup_happened', False), 'experience_matches_count': g['decision_core'].get('experience_matches_count', 0), 'experience_influenced_strategy': g['decision_core'].get('experience_influenced_strategy', False), 'experience_confidence_adjustment': g['decision_core'].get('experience_confidence_adjustment'), 'experience_handoff_bias': g['decision_core'].get('experience_handoff_bias'), 'experience_blocker_reason': g['decision_core'].get('experience_blocker_reason'), 'experience_signal_summary': g['decision_core'].get('experience_signal_summary'), 'reflection_ran': g['fallback_reflection']['reflection_ran'], 'reflection_summary': g['fallback_reflection']['reflection_summary'], 'selected_goal': g['decision_core'].get('selected_goal'), 'policy_feedback_loaded': bool(g['decision_core'].get('policy_feedback_loaded')), 'policy_feedback_applied': bool(g['decision_core'].get('policy_feedback_applied')), 'policy_feedback_summary': g['decision_core'].get('policy_feedback_summary', ''), 'policy_confidence_delta': g['decision_core'].get('policy_confidence_delta', 0.0), 'policy_handoff_bias': g['decision_core'].get('policy_handoff_bias', 0.0), 'policy_blocker_sensitivity': g['decision_core'].get('policy_blocker_sensitivity', 0.0), 'policy_simulation_risk_cal': g['decision_core'].get('policy_simulation_risk_cal', 0.0), 'policy_strategy_adjustments': g['decision_core'].get('policy_strategy_adjustments', {}), 'reflection_strategy_fit': g['fallback_reflection'].get('strategy_fit', 'neutral'), 'reflection_handoff_hindsight': g['fallback_reflection'].get('handoff_hindsight', 'na'), 'reflection_blocker_hindsight': g['fallback_reflection'].get('blocker_hindsight', 'na'), 'reflection_confidence_hindsight': g['fallback_reflection'].get('confidence_hindsight', 0.0), 'reflection_risk_hindsight': g['fallback_reflection'].get('risk_hindsight', 0.0), 'attached_files': g['attachment_meta'], 'attachments_summary': g['attachments_summary'], 'blocker_verdict': g['blocker_verdict'].model_dump()}
                 if g['memory_used_trace']:
                     g['trace']['memory_used'] = g['memory_used_trace']
                 self._augment_memory_observability(g['trace'], g['memory_used_trace'], g['ctx'].memory_context)
@@ -443,14 +456,16 @@ class PipelineMixin:
                 except Exception as _wk_fb_err:
                     logger.debug('fallback world knowledge skipped: %s', _wk_fb_err, exc_info=True)
                     g['trace']['knowledge_learning_degraded'] = True
+                merge_provider_trace_from_builder(g['trace'], getattr(self, '_active_trace_builder', None))
+                apply_provider_failure_response_trace_honesty(g['trace'])
                 self._write_back_experience(turn=g['turn'], response_text=g['fallback_text'], grounding_mode='fallback', tool_calls=g['tool_calls'], tool_results=g['tool_results'], trace=g['trace'], errors=g['errors'], psyche_snapshot=g['psyche_snapshot'], decision_core=g['decision_core'])
                 if str(getattr(g['turn'], 'runtime_mode', '') or '').lower() == 'audit':
                     g['trace']['psyche_snapshot_happened'] = False
                     g['trace']['experience_write_back_attempted'] = False
                     g['trace']['experience_write_back_succeeded'] = False
                 self._run_runtime_experience_feedback(g['turn'].user_id, g['trace'])
-                _cr_hook('append_event', append_event)(g['turn'].user_id, 'chat.turn', {'ok': False, 'provider': self._current_provider_name(), 'model': LLM_MODEL_NAME, 'errors': g['errors'], 'trace': g['trace']})
-                g['result'] = ChatTurnResult(ok=False, response_text=g['fallback_text'], model=LLM_MODEL_NAME, provider=self._current_provider_name(), tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug={'context': g['ctx'].model_dump()} if g['turn'].include_debug else None, attachments_summary=g['attachments_summary'])
+                _cr_hook('append_event', append_event)(g['turn'].user_id, 'chat.turn', {'ok': False, 'provider': g['_fb_provider'], 'model': g['_fb_model'], 'errors': g['errors'], 'trace': g['trace']})
+                g['result'] = ChatTurnResult(ok=False, response_text=g['fallback_text'], model=g['_fb_model'], provider=g['_fb_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug={'context': g['ctx'].model_dump()} if g['turn'].include_debug else None, attachments_summary=g['attachments_summary'])
                 _TRACE_CACHE[g['turn'].user_id].append(g['result'].trace)
                 g['__result__'] = g['result']
                 return
@@ -519,51 +534,52 @@ class PipelineMixin:
         g['post_reflection'] = self._post_exec_reflection(user_id=g['turn'].user_id, message=g['turn'].message, response_text=g['response_text'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], handoff_happened=False)
         # Response critic V2 — at most one revision, no re-run of side-effect tools
         g['response_revision_happened'] = False
-        try:
-            from aihub.turn.pragmatics import PragmaticAnalysis
-            from aihub.turn.cognitive_integration import critique_response_v2, CognitiveInfluencePack
-            g['_pa'] = g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj')
-            if g['_pa'] is None and isinstance((g['ctx'].system_context or {}).get('pragmatics'), dict):
-                g['_pa'] = PragmaticAnalysis.model_validate(g['ctx'].system_context['pragmatics'])
-            g['_cog'] = g.get('cognitive') or (g['ctx'].system_context or {}).get('cognitive_obj')
-            if g['_cog'] is None and isinstance((g['ctx'].system_context or {}).get('cognitive'), dict):
-                g['_cog'] = CognitiveInfluencePack.model_validate(g['ctx'].system_context['cognitive'])
-            if g['_pa'] is not None or g['_cog'] is not None:
-                g['critic'] = critique_response_v2(
-                    response_text=g['response_text'],
-                    pragmatics=g['_pa'],
-                    pack=g['_cog'],
-                    memory_used=bool(g.get('memory_substantive_flag') or (g.get('memory_v2_runtime_ctx') and getattr(g['memory_v2_runtime_ctx'], 'loaded', False))),
-                    psyche_used=bool((g.get('psyche_v2_behavior_ctx') and getattr(g['psyche_v2_behavior_ctx'], 'loaded', False)) or (g.get('psyche_brief') and 'BRAK' not in str(g.get('psyche_brief') or '')[:20])),
-                    planner_recommended=bool(g['decision_core'].get('planner_recommended') or g['decision_core'].get('escalation_use_reasoning')),
-                    web_used=bool(g['controlled_web'].get('triggered') and g['controlled_web'].get('ok')),
-                    web_was_required=str(g['decision_core'].get('web_decision') or 'off') == 'required',
-                )
-                if g['_pa'] is not None:
-                    g['_pa'].critic = g['critic']
-                if (not g['critic'].passed) and g['critic'].revision_instruction and g.get('messages'):
-                    g['messages'].append(ChatMessage(role='user', content=('[Korekta odpowiedzi — nie zmieniaj tematu użytkownika. Instrukcja:] ' + g['critic'].revision_instruction + '\n\nOdpowiedź do poprawy:\n' + (g['response_text'] or '')[:2500])))
-                    try:
-                        g['rev'] = await self._provider_call(messages=g['messages'], tools=[])
-                        if g['rev'] and (g['rev'].content or '').strip():
-                            g['response_text'] = g['rev'].content
-                            g['response_revision_happened'] = True
-                            g['provider_usages'].append(g['rev'].usage)
-                            g['provider_call_count'] = int(g.get('provider_call_count') or 0) + 1
-                    except Exception as rev_exc:
-                        g['rev_exc'] = rev_exc
-                        logger.debug('response critic revision skipped: %s', rev_exc)
-                if g['_pa'] is not None:
-                    g['ctx'].system_context['pragmatics'] = g['_pa'].model_dump()
-                    g['ctx'].system_context['pragmatics_obj'] = g['_pa']
-                    g['pragmatics'] = g['_pa']
-                if g['_cog'] is not None:
-                    g['ctx'].system_context['cognitive'] = g['_cog'].model_dump()
-                    g['ctx'].system_context['cognitive_obj'] = g['_cog']
-                    g['cognitive'] = g['_cog']
-        except Exception as critic_exc:
-            g['critic_exc'] = critic_exc
-            logger.debug('response critic failed: %s', critic_exc, exc_info=True)
+        if not getattr(g['turn'], 'skip_response_critic', False):
+            try:
+                from aihub.turn.pragmatics import PragmaticAnalysis
+                from aihub.turn.cognitive_integration import critique_response_v2, CognitiveInfluencePack
+                g['_pa'] = g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj')
+                if g['_pa'] is None and isinstance((g['ctx'].system_context or {}).get('pragmatics'), dict):
+                    g['_pa'] = PragmaticAnalysis.model_validate(g['ctx'].system_context['pragmatics'])
+                g['_cog'] = g.get('cognitive') or (g['ctx'].system_context or {}).get('cognitive_obj')
+                if g['_cog'] is None and isinstance((g['ctx'].system_context or {}).get('cognitive'), dict):
+                    g['_cog'] = CognitiveInfluencePack.model_validate(g['ctx'].system_context['cognitive'])
+                if g['_pa'] is not None or g['_cog'] is not None:
+                    g['critic'] = critique_response_v2(
+                        response_text=g['response_text'],
+                        pragmatics=g['_pa'],
+                        pack=g['_cog'],
+                        memory_used=bool(g.get('memory_substantive_flag') or (g.get('memory_v2_runtime_ctx') and getattr(g['memory_v2_runtime_ctx'], 'loaded', False))),
+                        psyche_used=bool((g.get('psyche_v2_behavior_ctx') and getattr(g['psyche_v2_behavior_ctx'], 'loaded', False)) or (g.get('psyche_brief') and 'BRAK' not in str(g.get('psyche_brief') or '')[:20])),
+                        planner_recommended=bool(g['decision_core'].get('planner_recommended') or g['decision_core'].get('escalation_use_reasoning')),
+                        web_used=bool(g['controlled_web'].get('triggered') and g['controlled_web'].get('ok')),
+                        web_was_required=str(g['decision_core'].get('web_decision') or 'off') == 'required',
+                    )
+                    if g['_pa'] is not None:
+                        g['_pa'].critic = g['critic']
+                    if (not g['critic'].passed) and g['critic'].revision_instruction and g.get('messages'):
+                        g['messages'].append(ChatMessage(role='user', content=('[Korekta odpowiedzi — nie zmieniaj tematu użytkownika. Instrukcja:] ' + g['critic'].revision_instruction + '\n\nOdpowiedź do poprawy:\n' + (g['response_text'] or '')[:2500])))
+                        try:
+                            g['rev'] = await self._provider_call(messages=g['messages'], tools=[])
+                            if g['rev'] and (g['rev'].content or '').strip():
+                                g['response_text'] = g['rev'].content
+                                g['response_revision_happened'] = True
+                                g['provider_usages'].append(g['rev'].usage)
+                                g['provider_call_count'] = int(g.get('provider_call_count') or 0) + 1
+                        except Exception as rev_exc:
+                            g['rev_exc'] = rev_exc
+                            logger.debug('response critic revision skipped: %s', rev_exc)
+                    if g['_pa'] is not None:
+                        g['ctx'].system_context['pragmatics'] = g['_pa'].model_dump()
+                        g['ctx'].system_context['pragmatics_obj'] = g['_pa']
+                        g['pragmatics'] = g['_pa']
+                    if g['_cog'] is not None:
+                        g['ctx'].system_context['cognitive'] = g['_cog'].model_dump()
+                        g['ctx'].system_context['cognitive_obj'] = g['_cog']
+                        g['cognitive'] = g['_cog']
+            except Exception as critic_exc:
+                g['critic_exc'] = critic_exc
+                logger.debug('response critic failed: %s', critic_exc, exc_info=True)
         g['response_text'] = self._shape_response_text(turn=g['turn'], ctx=g['ctx'], response_text=g['response_text'], grounding_mode=g['grounding_mode'], used_fallback=False, memory_v2_context=g['memory_v2_runtime_ctx'], psyche_v2_context=g['psyche_v2_behavior_ctx'], anti_hallucination_trace=g['anti_hallucination_trace'])
         try:
             from aihub.world_knowledge import apply_action_claim_guard

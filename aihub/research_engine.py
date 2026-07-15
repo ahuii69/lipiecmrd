@@ -28,7 +28,7 @@ from aihub.psyche_core import get_psyche_core
 logger = logging.getLogger(__name__)
 
 # Optional aggregation backends: failures are soft (Brave remains primary when configured).
-_OPTIONAL_RESEARCH_BACKENDS = frozenset({"Wikipedia", "DuckDuckGo"})
+_OPTIONAL_RESEARCH_BACKENDS = frozenset({"Wikipedia", "DuckDuckGo", "Frankfurter"})
 
 
 def _optional_research_backends_enabled() -> bool:
@@ -47,6 +47,9 @@ def _method_is_overridden(bound_method: Any, original_func: Any) -> bool:
     return getattr(bound_method, "__func__", None) is not original_func
 
 
+_RESEARCH_USER_AGENT = "AIHub-Research/1.0 (+https://mordzixai.xyz)"
+
+
 def _http_client_kwargs(timeout: float) -> dict[str, Any]:
     verify = (
         ssl.create_default_context(cafile=HTTP_CA_BUNDLE)
@@ -57,7 +60,43 @@ def _http_client_kwargs(timeout: float) -> dict[str, Any]:
         "timeout": timeout,
         "verify": verify,
         "trust_env": HTTP_TRUST_ENV,
+        "headers": {"User-Agent": _RESEARCH_USER_AGENT},
     }
+
+
+def _research_query_variants(query: str) -> List[str]:
+    """Expand Polish/FX queries so optional backends return useful extracts."""
+    variants = [query.strip()]
+    ql = query.lower()
+    if "python" in ql and ("wersj" in ql or "stable" in ql or "najnow" in ql):
+        variants.extend(
+            [
+                "Python latest stable version",
+                "Python (programming language)",
+            ]
+        )
+    if ("eur" in ql and "pln" in ql) or ("euro" in ql and "złot" in ql):
+        variants.extend(
+            [
+                "EUR PLN exchange rate",
+                "Euro Polish zloty exchange rate today",
+            ]
+        )
+    seen: set[str] = set()
+    out: List[str] = []
+    for v in variants:
+        key = v.strip().lower()
+        if key and key not in seen:
+            seen.add(key)
+            out.append(v.strip())
+    return out
+
+
+def _fx_pair_from_query(query: str) -> tuple[str, str] | None:
+    ql = query.lower()
+    if ("eur" in ql or "euro" in ql) and ("pln" in ql or "złot" in ql or "zlot" in ql):
+        return "EUR", "PLN"
+    return None
 
 
 # ---- Hardening constants ----
@@ -190,7 +229,7 @@ class ResearchEngine:
     def __init__(self, max_results: int = 10):
         self.max_results = max_results
         self.extraction_patterns = self._init_patterns()
-        self._query_cache: Dict[str, float] = {}
+        self._query_cache: Dict[str, tuple[float, Dict[str, Any]]] = {}
 
     def _init_patterns(self) -> Dict[str, List[str]]:
         """Regex patterns dla ekstrakcji faktów."""
@@ -284,21 +323,18 @@ class ResearchEngine:
 
             # Query-level dedup cache
             cache_key = f"{user_id}\0{normalize_query(query)}"
-            cached_ts = self._query_cache.get(cache_key, 0.0)
-            age = now_ts() - cached_ts
-            if age < RESEARCH_CACHE_TTL:
-                logger.info(
-                    "research.cached: user=%s query=%s (%.0fs ago)", user_id, query, age
-                )
-                return {
-                    "ok": True,
-                    "user_id": user_id,
-                    "query": query,
-                    "cached": True,
-                    "total_results": 0,
-                    "total_facts": 0,
-                    "ts": now_ts(),
-                }
+            cached = self._query_cache.get(cache_key)
+            if cached:
+                cached_ts, cached_payload = cached
+                age = now_ts() - cached_ts
+                if age < RESEARCH_CACHE_TTL and isinstance(cached_payload, dict):
+                    logger.info(
+                        "research.cached: user=%s query=%s (%.0fs ago)",
+                        user_id,
+                        query,
+                        age,
+                    )
+                    return {**cached_payload, "cached": True}
 
             logger.info("Starting research for user %s: %s", user_id, query)
             try:
@@ -369,6 +405,7 @@ class ResearchEngine:
                         {
                             "title": result["title"],
                             "url": result["url"],
+                            "content": str(result.get("content") or "")[:800],
                             "relevance": relevance,
                             "facts_extracted": stored,
                             "source": result.get("source", "unknown"),
@@ -408,17 +445,7 @@ class ResearchEngine:
                 },
             )
 
-            # Update query cache
-            self._query_cache[cache_key] = now_ts()
-
-            logger.info(
-                "Research completed for user %s: %d results, %d facts",
-                user_id,
-                len(results),
-                sum(r.get("facts_extracted", 0) for r in results),
-            )
-
-            return {
+            payload = {
                 "ok": True,
                 "user_id": user_id,
                 "query": query,
@@ -428,6 +455,16 @@ class ResearchEngine:
                 "total_facts": sum(r.get("facts_extracted", 0) for r in results),
                 "ts": now_ts(),
             }
+            self._query_cache[cache_key] = (now_ts(), dict(payload))
+
+            logger.info(
+                "Research completed for user %s: %d results, %d facts",
+                user_id,
+                len(results),
+                sum(r.get("facts_extracted", 0) for r in results),
+            )
+
+            return payload
 
         except Exception as e:
             logger.error(f"Error in research: {e}", exc_info=True)
@@ -474,6 +511,10 @@ class ResearchEngine:
             tasks.append(asyncio.to_thread(self._fetch_duckduckgo, query))
             names.append("DuckDuckGo")
 
+            if _fx_pair_from_query(query):
+                tasks.append(asyncio.to_thread(self._fetch_frankfurter_fx, query))
+                names.append("Frankfurter")
+
         if not tasks:
             logger.info(
                 "ResearchEngine: no configured online backend for query=%s (set BRAVE_API_KEY or AIHUB_ENABLE_OPTIONAL_RESEARCH_BACKENDS=1)",
@@ -514,133 +555,240 @@ class ResearchEngine:
     def _fetch_brave(self, query: str) -> List[Dict[str, Any]]:
         """Brave Web Search API — up to 5 organic results."""
         out: List[Dict[str, Any]] = []
-        with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
-            resp = _http_get_with_backoff(
-                client,
-                "https://api.search.brave.com/res/v1/web/search",
-                params={"q": query, "count": "5"},
-                headers={
-                    "Accept": "application/json",
-                    "Accept-Encoding": "gzip",
-                    "X-Subscription-Token": BRAVE_API_KEY,
-                },
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            for item in data.get("web", {}).get("results", [])[:5]:
-                title = item.get("title", "")
-                url = item.get("url", "")
-                description = item.get("description", "")
-                extra = item.get("extra_snippets", [])
-                content = description
-                if extra:
-                    content = description + " " + " ".join(extra)
-                if content and len(content) > 30:
-                    out.append(
-                        {
-                            "title": title,
-                            "url": url,
-                            "content": content[:HTTP_MAX_BYTES],
-                            "source": "brave",
-                        }
-                    )
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
+                resp = _http_get_with_backoff(
+                    client,
+                    "https://api.search.brave.com/res/v1/web/search",
+                    params={"q": query, "count": "5"},
+                    headers={
+                        "Accept": "application/json",
+                        "Accept-Encoding": "gzip",
+                        "X-Subscription-Token": BRAVE_API_KEY,
+                    },
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                for item in data.get("web", {}).get("results", [])[:5]:
+                    title = item.get("title", "")
+                    url = item.get("url", "")
+                    description = item.get("description", "")
+                    extra = item.get("extra_snippets", [])
+                    content = description
+                    if extra:
+                        content = description + " " + " ".join(extra)
+                    if content and len(content) > 30:
+                        out.append(
+                            {
+                                "title": title,
+                                "url": url,
+                                "content": content[:HTTP_MAX_BYTES],
+                                "source": "brave",
+                            }
+                        )
+        except httpx.HTTPStatusError as exc:
+            status = int(exc.response.status_code or 0)
+            if status in {401, 402, 403, 429} or status >= 500:
+                logger.info(
+                    "Research backend Brave soft-fail HTTP %s query=%r — trying optional backends",
+                    status,
+                    query[:120],
+                )
+                return []
+            raise
+        except httpx.HTTPError as exc:
+            logger.warning("Brave search failed: %s query=%r", exc, query[:120])
         return out
 
     def _fetch_wikipedia(self, query: str) -> List[Dict[str, Any]]:
         """Search Wikipedia via REST API and return up to 3 article extracts."""
         out: List[Dict[str, Any]] = []
+        for variant in _research_query_variants(query):
+            if out:
+                break
+            try:
+                with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
+                    resp = _http_get_with_backoff(
+                        client,
+                        "https://en.wikipedia.org/w/api.php",
+                        params={
+                            "action": "opensearch",
+                            "search": variant,
+                            "limit": "3",
+                            "format": "json",
+                        },
+                    )
+                    data = resp.json()
+                    titles = data[1] if len(data) > 1 else []
+                    urls = data[3] if len(data) > 3 else []
+
+                    for i, title in enumerate(titles[:3]):
+                        try:
+                            ext_resp = _http_get_with_backoff(
+                                client,
+                                "https://en.wikipedia.org/w/api.php",
+                                params={
+                                    "action": "query",
+                                    "prop": "extracts",
+                                    "exintro": "1",
+                                    "explaintext": "1",
+                                    "titles": title,
+                                    "format": "json",
+                                },
+                            )
+                            pages = ext_resp.json().get("query", {}).get("pages", {})
+                            for page in pages.values():
+                                extract = page.get("extract", "")
+                                if len(extract) > 30:
+                                    out.append(
+                                        {
+                                            "title": title,
+                                            "url": urls[i] if i < len(urls) else "",
+                                            "content": extract[:HTTP_MAX_BYTES],
+                                            "source": "wikipedia",
+                                        }
+                                    )
+                        except httpx.HTTPError as e:
+                            logger.debug(
+                                "Wikipedia extract fetch failed for %s: %s", title, e
+                            )
+            except httpx.HTTPError as e:
+                logger.debug("Wikipedia opensearch failed for %r: %s", variant, e)
+        return out
+
+    def _fetch_frankfurter_fx(self, query: str) -> List[Dict[str, Any]]:
+        """ECB-backed FX rates via Frankfurter (no API key)."""
+        pair = _fx_pair_from_query(query)
+        if pair is None:
+            return []
+        base, quote = pair
+        out: List[Dict[str, Any]] = []
         try:
-            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
-                # Step 1: opensearch to get titles
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S), follow_redirects=True) as client:
                 resp = _http_get_with_backoff(
                     client,
-                    "https://en.wikipedia.org/w/api.php",
-                    params={
-                        "action": "opensearch",
-                        "search": query,
-                        "limit": "3",
-                        "format": "json",
-                    },
+                    "https://api.frankfurter.dev/v1/latest",
+                    params={"base": base, "symbols": quote},
                 )
                 data = resp.json()
-                titles = data[1] if len(data) > 1 else []
-                urls = data[3] if len(data) > 3 else []
+                rate = (data.get("rates") or {}).get(quote)
+                if rate is None:
+                    return []
+                day = str(data.get("date") or "")
+                content = (
+                    f"Exchange rate {base}/{quote} on {day}: 1 {base} = {rate} {quote}. "
+                    f"Source: Frankfurter API (ECB reference rates)."
+                )
+                out.append(
+                    {
+                        "title": f"{base}/{quote} exchange rate {day}".strip(),
+                        "url": f"https://api.frankfurter.dev/v1/latest?base={base}&symbols={quote}",
+                        "content": content,
+                        "source": "frankfurter",
+                    }
+                )
+        except httpx.HTTPError as exc:
+            logger.debug("Frankfurter FX fetch failed: %s", exc)
+        return out
 
-                # Step 2: fetch extracts for each title
-                for i, title in enumerate(titles[:3]):
-                    try:
-                        ext_resp = _http_get_with_backoff(
-                            client,
-                            "https://en.wikipedia.org/w/api.php",
-                            params={
-                                "action": "query",
-                                "prop": "extracts",
-                                "exintro": "1",
-                                "explaintext": "1",
-                                "titles": title,
-                                "format": "json",
-                            },
+    def _fetch_duckduckgo_html(self, query: str) -> List[Dict[str, Any]]:
+        """HTML search fallback when instant-answer API has no abstract."""
+        out: List[Dict[str, Any]] = []
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S), follow_redirects=True) as client:
+                for variant in _research_query_variants(query):
+                    resp = client.post(
+                        "https://html.duckduckgo.com/html/",
+                        data={"q": variant, "b": "", "kl": "wt-wt"},
+                    )
+                    if resp.status_code >= 400:
+                        continue
+                    html = resp.text or ""
+                    for block in re.findall(
+                        r'class="result__body".*?(?=class="result__body"|$)',
+                        html,
+                        flags=re.DOTALL,
+                    ):
+                        link_m = re.search(
+                            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+                            block,
+                            flags=re.DOTALL,
                         )
-                        pages = ext_resp.json().get("query", {}).get("pages", {})
-                        for page in pages.values():
-                            extract = page.get("extract", "")
-                            if len(extract) > 30:
-                                out.append(
-                                    {
-                                        "title": title,
-                                        "url": urls[i] if i < len(urls) else "",
-                                        "content": extract[:HTTP_MAX_BYTES],
-                                        "source": "wikipedia",
-                                    }
-                                )
-                    except httpx.HTTPError as e:
-                        logger.debug(
-                            "Wikipedia extract fetch failed for %s: %s", title, e
+                        snip_m = re.search(
+                            r'class="result__snippet"[^>]*>(.*?)</(?:a|td|span)',
+                            block,
+                            flags=re.DOTALL,
                         )
+                        if not link_m:
+                            continue
+                        url = re.sub(r"\s+", " ", link_m.group(1).strip())
+                        title = re.sub(r"<[^>]+>", " ", link_m.group(2))
+                        title = re.sub(r"\s+", " ", title).strip()
+                        snippet = ""
+                        if snip_m:
+                            snippet = re.sub(r"<[^>]+>", " ", snip_m.group(1))
+                            snippet = re.sub(r"\s+", " ", snippet).strip()
+                        content = snippet or title
+                        if len(content) > 30:
+                            out.append(
+                                {
+                                    "title": title[:200] or variant,
+                                    "url": url,
+                                    "content": content[:HTTP_MAX_BYTES],
+                                    "source": "duckduckgo_html",
+                                }
+                            )
+                        if len(out) >= 5:
+                            break
+                    if out:
+                        break
         except httpx.HTTPError as e:
-            logger.debug("Wikipedia opensearch failed (optional backend): %s", e)
+            logger.debug("DuckDuckGo HTML search failed: %s", e)
         return out
 
     def _fetch_duckduckgo(self, query: str) -> List[Dict[str, Any]]:
         """Fetch DuckDuckGo instant answer API (no API key needed)."""
         out: List[Dict[str, Any]] = []
         try:
-            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
-                resp = _http_get_with_backoff(
-                    client,
-                    "https://api.duckduckgo.com/",
-                    params={"q": query, "format": "json", "no_redirect": "1"},
-                )
-                data = resp.json()
-
-                # Abstract text
-                abstract = data.get("AbstractText", "")
-                abstract_url = data.get("AbstractURL", "")
-                if abstract and len(abstract) > 30:
-                    out.append(
-                        {
-                            "title": data.get("Heading", query),
-                            "url": abstract_url,
-                            "content": abstract[:HTTP_MAX_BYTES],
-                            "source": "duckduckgo",
-                        }
+            for variant in _research_query_variants(query):
+                with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S)) as client:
+                    resp = _http_get_with_backoff(
+                        client,
+                        "https://api.duckduckgo.com/",
+                        params={"q": variant, "format": "json", "no_redirect": "1"},
                     )
+                    data = resp.json()
 
-                # Related topics
-                for topic in data.get("RelatedTopics", [])[:5]:
-                    text = topic.get("Text", "")
-                    first_url = topic.get("FirstURL", "")
-                    if text and len(text) > 30:
+                    abstract = data.get("AbstractText", "")
+                    abstract_url = data.get("AbstractURL", "")
+                    if abstract and len(abstract) > 30:
                         out.append(
                             {
-                                "title": text[:80],
-                                "url": first_url,
-                                "content": text[:HTTP_MAX_BYTES],
+                                "title": data.get("Heading", variant),
+                                "url": abstract_url,
+                                "content": abstract[:HTTP_MAX_BYTES],
                                 "source": "duckduckgo",
                             }
                         )
+
+                    for topic in data.get("RelatedTopics", [])[:5]:
+                        text = topic.get("Text", "")
+                        first_url = topic.get("FirstURL", "")
+                        if text and len(text) > 30:
+                            out.append(
+                                {
+                                    "title": text[:80],
+                                    "url": first_url,
+                                    "content": text[:HTTP_MAX_BYTES],
+                                    "source": "duckduckgo",
+                                }
+                            )
+                if out:
+                    break
         except httpx.HTTPError as e:
             logger.warning("DuckDuckGo API failed: %s", e)
+        if not out:
+            out.extend(self._fetch_duckduckgo_html(query))
         return out
 
     def research_detailed(

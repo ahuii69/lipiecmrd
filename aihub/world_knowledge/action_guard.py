@@ -60,6 +60,14 @@ def apply_action_claim_guard(
     }
     if not _ACTION_CLAIM.search(text):
         return text, meta
+    # Memory recall / preference answers — not executable action claims.
+    if re.search(
+        r"(?iu)\b(pies|kot|lubi|nie\s+lubi|nazywa\s+się|z\s+pamięci|w\s+pamięci)\b",
+        text,
+    ) and not re.search(r"(?iu)\b(zrestartow|wdroż|deploy|naprawiłem|uruchomiłem)\b", text):
+        return text, meta
+    if re.search(r"(?iu)\bzapisane\s+w\s+pamięci\b", text):
+        return text, meta
     # Do not fight existing anti-hallucination wording.
     if _ALREADY_HONEST.search(text):
         meta["action_claim_guard_applied"] = True

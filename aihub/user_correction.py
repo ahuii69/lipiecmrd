@@ -13,6 +13,10 @@ EVENT_TYPE = "user.correction"
 
 # Silne sygnały korekty (PL), bez uruchamiania się na zwykłych pytaniach typu „czy nie…”.
 _STRONG_PATTERNS: list[tuple[str, str]] = [
+    (
+        r"(?iu)^nie\s*,.*\b(lubi|nie\s+lubi|nazywa\s+się|nazywa\s+sie)\b",
+        "factual",
+    ),
     (r"nie\s+o\s+to\s+chodzi", "negative"),
     (r"nie\s+o\s+to\s*$", "negative"),
     (r"chodziło\s+o|chodzilo\s+o|miałem\s+na\s+myśli|miałam\s+na\s+myśli|"
@@ -60,6 +64,10 @@ def detect_user_correction(message: str) -> dict[str, Any] | None:
         return None
 
     durable = bool(_DURABLE_MARKERS.search(raw))
+    if kind == "factual" and re.search(
+        r"(?iu)\b(lubi|nie\s+lubi|nazywa|pies|kot|preferuj)\b", raw
+    ):
+        durable = True
     # Krótka, jednozdaniowa korekta stylu często jest „regułą” na przyszłość
     if kind == "style" and len(raw) < 160 and not durable:
         if re.search(
@@ -101,7 +109,45 @@ def record_user_correction_turn(turn: Any) -> dict[str, Any]:
     out["recorded"] = True
     out["kind"] = det["kind"]
     out["durable"] = bool(det["durable"])
+    if det["kind"] == "factual" and det["durable"]:
+        _persist_factual_correction_memory(uid, sid, msg, det)
     return out
+
+
+def _persist_factual_correction_memory(
+    user_id: str, session_id: str, message: str, det: dict[str, Any]
+) -> None:
+    """Write durable correction to Memory V2 and supersede conflicting items."""
+    try:
+        from aihub.memory_core import get_memory_core
+        from aihub.memory_v2_contradictions import (
+            detect_contradictions,
+            resolve_contradiction_supersede,
+        )
+
+        core = get_memory_core()
+        item = core.v2_create_item(
+            user_id=user_id,
+            memory_type="preference",
+            scope="long_term",
+            title="Korekta użytkownika",
+            content=_normalize_summary(message, 480),
+            source_kind="explicit_learning",
+            source_ref=session_id,
+            session_id=session_id,
+            importance_score=0.95,
+            confidence_score=0.95,
+        )
+        if not item:
+            return
+        for contradiction in detect_contradictions(user_id, item):
+            older_id = str(contradiction.to_memory_id or "")
+            if older_id and older_id != item.id:
+                resolve_contradiction_supersede(item.id, older_id, user_id)
+    except Exception as exc:
+        import logging
+
+        logging.getLogger(__name__).debug("correction memory persist skipped: %s", exc)
 
 
 def _event_row_applies(data: dict[str, Any], session_id: str) -> bool:

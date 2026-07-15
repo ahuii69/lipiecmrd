@@ -42,6 +42,7 @@ class ExecutionMixin:
             env = active.environment
         cancelled = bool(getattr(getattr(active, "cancellation", None), "cancelled", False))
         remaining = float(getattr(active, "remaining_s", None) or env.provider_total_timeout_s)
+        max_tokens = getattr(self, "_turn_max_completion_tokens", None)
         exec_res = await self._provider_service.execute(
             messages=messages,
             tools=tools,
@@ -49,6 +50,7 @@ class ExecutionMixin:
             cancelled=cancelled,
             remaining_s=remaining,
             trace=getattr(self, "_active_trace_builder", None),
+            max_tokens=max_tokens,
         )
         tool_calls = []
         for idx, tc in enumerate(exec_res.tool_calls or []):

@@ -481,10 +481,17 @@ def analyze_pragmatics(
             pa.reason_codes.append("PRAGMATICS_TEMPORAL_NORMALIZATION")
 
     needs_web = False
-    if _SPORT_CURRENT.search(normalized) and (
+    _local_health = re.search(
+        r"(?iu)\b(health|backend|/ops/ready|/system/ping|status\s+backendu|lokalnego\s+backendu)\b",
+        normalized,
+    )
+    if _SPORT_CURRENT.search(normalized) and not _local_health and (
         pa.temporal_reference_detected
         or re.search(r"(?iu)\b20\d{2}\b", normalized)
-        or re.search(r"(?iu)\b(wynik|kto\s+wygra|skład)\b", normalized)
+        or re.search(
+            r"(?iu)\b(wynik\s+mecz|wynik\s+.*(?:mecz|meczu|liga)|kto\s+wygra|skład)\b",
+            normalized,
+        )
     ):
         needs_web = True
         pa.reason_codes.append("PRAGMATICS_WEB_QUERY_REWRITE")

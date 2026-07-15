@@ -37,11 +37,13 @@ from aihub.chat_contracts import (
 from aihub.chat_decision_trace import (
     ROUTE_AGENT_HANDOFF_ERROR,
     ROUTE_BLOCKED_HARD,
+    apply_provider_failure_response_trace_honesty,
     llm_path_verified_research_grounding,
     merge_canonical_decision_trace,
     merge_canonical_executive_handoff_success,
     merge_canonical_for_llm_path,
     merge_canonical_web_required_ungrounded,
+    merge_provider_trace_from_builder,
     trace_blocker_gate_outcome,
 )
 from aihub.chat_file_service import (
