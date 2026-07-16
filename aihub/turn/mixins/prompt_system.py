@@ -6,6 +6,35 @@ globals().update({k: v for k, v in vars(_ops_ns).items() if not k.startswith('__
 TurnOps = None  # late-bound
 
 def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, psyche_brief: str, decision_hints: str='', correction_hints: str='', memory_v2_context=None, psyche_v2_context=None, files_context: str='', first_turn_in_thread: bool, history_rollup: str | None=None, listing_sales_boost: bool=False) -> str:
+    # Canonical budget profile — selected before prompt assembly when available.
+    _budget = None
+    if isinstance(ctx.system_context, dict):
+        _budget = ctx.system_context.get('prompt_budget_decision')
+    if _budget is None and isinstance(ctx.system_context, dict) and (
+        ctx.system_context.get('assistant_meta_ask_pure')
+        or ctx.system_context.get('budget_profile') == 'meta_light'
+    ):
+        from aihub.turn.prompt_budget import build_meta_light_system_prompt, select_prompt_budget
+
+        _budget = select_prompt_budget(
+            user_text=str(ctx.system_context.get('user_turn_text') or ''),
+            selected_strategy='instant',
+        )
+        ctx.system_context['prompt_budget_decision'] = _budget
+        ctx.system_context['budget_profile'] = _budget.profile
+    if _budget is not None and getattr(_budget, 'profile', None) == 'meta_light':
+        from aihub.turn.prompt_budget import build_meta_light_system_prompt, build_prompt_budget_trace
+
+        text = build_meta_light_system_prompt()
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['prompt_budget'] = build_prompt_budget_trace(
+                decision=_budget,
+                system_text=text,
+                history_messages=[],
+                tool_schema_chars=0,
+                layer_chars={'meta_light': len(text)},
+            )
+        return text
     caps = [f'- {c.name}: {c.description}' for c in ctx.capabilities]
     capabilities_text = '\n'.join(caps) if caps else '- brak dostępnych narzędzi'
     behavior_instructions = ''

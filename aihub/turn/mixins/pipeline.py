@@ -260,8 +260,38 @@ class PipelineMixin:
 
     async def _stage_decision_blocker(self, g):
         g['decision_core'] = self._pre_exec_decision_core(turn=g['turn'], ctx=g['ctx'], psyche_snapshot=g['psyche_snapshot'], memory_v2_runtime_ctx=g['memory_v2_runtime_ctx'], psyche_v2_behavior_ctx=g['psyche_v2_behavior_ctx'])
+        # Prompt budget profile — before tools/prompt assembly.
+        try:
+            from aihub.turn.prompt_budget import select_prompt_budget
+            g['prompt_budget'] = select_prompt_budget(
+                user_text=g['turn'].message or '',
+                selected_strategy=str(g['decision_core'].get('selected_strategy') or 'instant'),
+                web_decision=str(g['decision_core'].get('web_decision') or 'off'),
+                history=list(g['turn'].history or []),
+                mode=str(getattr(g['turn'], 'mode', None) or 'chat'),
+            )
+            g['decision_core']['budget_profile'] = g['prompt_budget'].profile
+            g['decision_core']['turn_value_class'] = g['prompt_budget'].turn_value_class
+            g['decision_core']['writeback_policy'] = g['prompt_budget'].writeback_policy
+            if isinstance(g['ctx'].system_context, dict):
+                g['ctx'].system_context['prompt_budget_decision'] = g['prompt_budget']
+                g['ctx'].system_context['budget_profile'] = g['prompt_budget'].profile
+                g['ctx'].system_context['user_turn_text'] = g['turn'].message or ''
+            # Cap completion tokens from budget profile.
+            try:
+                cur = int(self._turn_max_completion_tokens) if self._turn_max_completion_tokens is not None else g['prompt_budget'].max_completion_tokens
+            except (TypeError, ValueError):
+                cur = g['prompt_budget'].max_completion_tokens
+            self._turn_max_completion_tokens = max(64, min(cur, int(g['prompt_budget'].max_completion_tokens)))
+            if not g['prompt_budget'].allow_tools:
+                g['decision_core']['escalation_use_tools'] = False
+                g['tools'] = []
+        except Exception as budget_exc:
+            g['prompt_budget'] = None
+            g['budget_exc'] = budget_exc
+            logger.debug('prompt budget select skipped: %s', budget_exc, exc_info=True)
         g['tools'] = self._apply_strategy_to_tools(g['tools'], g['decision_core']['selected_strategy'], tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []))
-        if not g['decision_core'].get('escalation_use_tools'):
+        if not g['decision_core'].get('escalation_use_tools') or (g.get('prompt_budget') and not g['prompt_budget'].allow_tools):
             g['tools'] = []
         g['blocker_verdict'] = self._evaluate_blocker_verdict(g['decision_core'])
         if g['blocker_verdict'].hard:
@@ -337,7 +367,38 @@ class PipelineMixin:
         if self._web_required_grounding_unsatisfied(g['decision_core'], g['controlled_web']):
             g['__result__'] = await self._finish_turn_web_required_ungrounded(turn=g['turn'], ctx=g['ctx'], started=g['started'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], controlled_web=g['controlled_web'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], errors=list(g['errors']), memory_lookup_flag=g['memory_lookup_flag'], memory_used_trace=g['memory_used_trace'], include_stm_in_memory_brief=g['include_stm_in_memory_brief'], psyche_snapshot=g['psyche_snapshot'], attachment_meta=g['attachment_meta'], attachments_summary=g['attachments_summary'], hist_for_prompt_len=len(g['hist_for_prompt']), vault_user_redacted=g['vault_user_redacted'], hist_smart_trim=g['hist_smart_trim'])
             return
-        g['messages']: list[ChatMessage] = [ChatMessage(role='system', content=self._build_system_prompt(g['ctx'], memory_brief=g['memory_brief'], psyche_brief=g['psyche_brief'], decision_hints=g['decision_core']['strategy_hints'], correction_hints=str(g['ctx'].system_context.get('correction_hints_text') or ''), memory_v2_context=g['memory_v2_runtime_ctx'], psyche_v2_context=g['psyche_v2_behavior_ctx'], files_context=g['attachment_block'], first_turn_in_thread=g['first_turn_in_thread'], history_rollup=g['history_rollup'], listing_sales_boost=listing_copy_no_web_intent(g['turn'].message))), *g['hist_for_prompt'], *g['pre_messages'], ChatMessage(role='user', content=g['user_llm_text'])]
+        # History clip per budget profile (meta_light: 0 or 2).
+        if g.get('prompt_budget') is not None:
+            _hm = int(g['prompt_budget'].history_max_messages or 0)
+            if _hm <= 0:
+                g['hist_for_prompt'] = []
+                g['history_rollup'] = None
+            elif len(g['hist_for_prompt']) > _hm:
+                g['hist_for_prompt'] = list(g['hist_for_prompt'])[-_hm:]
+        g['_system_prompt_text'] = self._build_system_prompt(g['ctx'], memory_brief=g['memory_brief'], psyche_brief=g['psyche_brief'], decision_hints=g['decision_core']['strategy_hints'], correction_hints=str(g['ctx'].system_context.get('correction_hints_text') or ''), memory_v2_context=g['memory_v2_runtime_ctx'], psyche_v2_context=g['psyche_v2_behavior_ctx'], files_context=g['attachment_block'], first_turn_in_thread=g['first_turn_in_thread'], history_rollup=g['history_rollup'], listing_sales_boost=listing_copy_no_web_intent(g['turn'].message))
+        g['messages']: list[ChatMessage] = [ChatMessage(role='system', content=g['_system_prompt_text']), *g['hist_for_prompt'], *g['pre_messages'], ChatMessage(role='user', content=g['user_llm_text'])]
+        try:
+            from aihub.turn.prompt_budget import build_prompt_budget_trace, select_prompt_budget
+            if g.get('prompt_budget') is None:
+                g['prompt_budget'] = select_prompt_budget(
+                    user_text=g['turn'].message or '',
+                    selected_strategy=str(g['decision_core'].get('selected_strategy') or 'instant'),
+                    web_decision=str(g['decision_core'].get('web_decision') or 'off'),
+                    history=list(g['turn'].history or []),
+                    mode=str(getattr(g['turn'], 'mode', None) or 'chat'),
+                )
+            import json as _json
+            _tool_chars = len(_json.dumps([{'name': t.name, 'description': t.description, 'input_schema': t.input_schema} for t in (g.get('tools') or [])], ensure_ascii=False)) if g.get('tools') else 0
+            g['prompt_budget_trace'] = build_prompt_budget_trace(
+                decision=g['prompt_budget'],
+                system_text=g['_system_prompt_text'],
+                history_messages=g['hist_for_prompt'],
+                tool_schema_chars=_tool_chars,
+            )
+            if isinstance(g['ctx'].system_context, dict):
+                g['ctx'].system_context['prompt_budget'] = g['prompt_budget_trace']
+        except Exception as pbt_exc:
+            g['prompt_budget_trace'] = {'budget_profile': getattr(g.get('prompt_budget'), 'profile', None), 'error': str(pbt_exc)[:200]}
         g['response_text'] = ''
         g['final_model'] = LLM_MODEL_NAME
         g['final_provider'] = self._current_provider_name()
@@ -345,7 +406,14 @@ class PipelineMixin:
         g['usage_summary'] = self._sum_usage(g['provider_usages'])
 
     async def _stage_provider_loop(self, g):
-        for g['iteration'] in range(max(1, int(CHAT_MAX_TOOL_ITERATIONS)) + 1):
+        # meta_light: no schemas and no tool loop. Elsewhere preserve legacy behavior:
+        # escalation may strip schemas, but model-returned tool_calls still execute.
+        if g.get('prompt_budget') is not None and not g['prompt_budget'].allow_tools:
+            g['_tool_loop_enabled'] = False
+        else:
+            g['_tool_loop_enabled'] = True
+        g['_max_tool_iters'] = max(1, int(CHAT_MAX_TOOL_ITERATIONS)) if g['_tool_loop_enabled'] else 0
+        for g['iteration'] in range(g['_max_tool_iters'] + 1):
             g['provider_call_count'] += 1
             if stream_session_active():
                 await emit_status('thinking', label_pl='Składam odpowiedź…')
@@ -547,7 +615,7 @@ class PipelineMixin:
                 ):
                     if pk in tb._data:
                         g.setdefault('_provider_trace', {})[pk] = tb._data[pk]
-            if g['model_response'].tool_calls and g['iteration'] < max(1, int(CHAT_MAX_TOOL_ITERATIONS)):
+            if g['model_response'].tool_calls and g['_tool_loop_enabled'] and g['iteration'] < g['_max_tool_iters']:
                 g['messages'].append(ChatMessage(role='assistant', content=g['model_response'].content, tool_calls=g['model_response'].tool_calls))
                 g['exec_ctx'] = ToolExecutionContext(user_id=g['turn'].user_id, session_id=g['turn'].session_id, mode=g['ctx'].mode, include_debug=g['turn'].include_debug, policy_overrides=dict(g['turn'].tool_policy_overrides or {}))
                 if stream_session_active():
@@ -578,8 +646,37 @@ class PipelineMixin:
 
     async def _stage_shape_deliberation(self, g):
         g['deliberation_metadata']: dict[str, Any] = {}
+        g['_light_turn'] = bool(g.get('prompt_budget') and g['prompt_budget'].profile in ('meta_light', 'casual_light'))
+        g['_skip_heavy_shape'] = bool(g.get('prompt_budget') and (not g['prompt_budget'].allow_response_variants) and (not g['prompt_budget'].allow_critic_llm))
         if stream_session_active():
             await emit_status('finalizing', label_pl='Kończę odpowiedź…')
+        if g.get('_skip_heavy_shape'):
+            g['deliberation_metadata'] = {'response_variants_triggered': False, 'response_variants_count': 0, 'response_variants_reason_codes': ['SKIPPED_LIGHT_BUDGET'], 'response_variants_error': False}
+            g['anti_hallucination_trace']: dict[str, Any] = {}
+            g['response_text'] = self._shape_response_text(turn=g['turn'], ctx=g['ctx'], response_text=g['response_text'], grounding_mode=g['grounding_mode'], used_fallback=False, memory_v2_context=g['memory_v2_runtime_ctx'], psyche_v2_context=g['psyche_v2_behavior_ctx'], anti_hallucination_trace=g['anti_hallucination_trace'])
+            g['response_revision_happened'] = False
+            g['decision_core']['deliberation_outcome_quality'] = 'skipped_light'
+            # Deterministic guards only (persona / provider / action claim) — no second provider call.
+            try:
+                from aihub.world_knowledge import apply_action_claim_guard
+                g['response_text'], g['_acg'] = apply_action_claim_guard(
+                    response_text=g['response_text'] or '',
+                    tool_results=g.get('tool_results') or [],
+                    validation_succeeded=bool((g.get('decision_core') or {}).get('validation_succeeded')),
+                    execution_effects=list((g.get('decision_core') or {}).get('execution_effects') or []),
+                    trace=None,
+                )
+            except Exception:
+                logger.debug('action claim guard skipped (light)', exc_info=True)
+            # Soft length clamp for meta_light
+            if g.get('prompt_budget') and g['prompt_budget'].profile == 'meta_light':
+                rt = (g['response_text'] or '').strip()
+                if len(rt) > 900:
+                    cut = rt[:880]
+                    sp = cut.rfind(' ')
+                    g['response_text'] = (cut[:sp] if sp > 400 else cut).rstrip() + '…'
+            g['post_reflection'] = {'reflection_ran': False, 'reflection_summary': '', 'strategy_fit': 'na', 'handoff_hindsight': 'na', 'blocker_hindsight': 'na', 'confidence_hindsight': 0.0, 'risk_hindsight': 0.0, 'deliberation_hindsight': {}}
+            return
         try:
             g['original_msgs'] = [{'role': g['m'].role, 'content': g['m'].content, 'name': g['m'].name, 'tool_call_id': g['m'].tool_call_id} for g['m'] in g['messages']]
             g['deliberated_text'], g['deliberation_metadata'] = await _cr_hook('ResponseVariantsEngine', ResponseVariantsEngine).run_deliberation(decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], original_response=g['response_text'], original_messages=g['original_msgs'], provider_call_fn=self._provider_call, deliberation_history=g['decision_core'].get('deliberation_history'))
@@ -679,9 +776,36 @@ class PipelineMixin:
         g['final_behavior_profile'] = self._neutral_final_behavior_profile(mode=g['psyche_v2_style_mode'])
         if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded:
             g['final_behavior_profile'] = {'mode': g['psyche_v2_style_mode'], 'directness': g['psyche_v2_behavior_ctx'].directness_bias, 'verbosity': g['psyche_v2_behavior_ctx'].verbosity_bias, 'caution': g['psyche_v2_behavior_ctx'].caution_bias, 'pressure': g['psyche_v2_behavior_ctx'].pressure, 'trust': g['psyche_v2_behavior_ctx'].trust, 'friction': g['psyche_v2_behavior_ctx'].friction, 'warmth': g['psyche_v2_behavior_ctx'].warmth, 'autonomy': g['psyche_v2_behavior_ctx'].autonomy_bias, 'structuredness': g['psyche_v2_behavior_ctx'].structuredness_bias, 'tool_bias': g['psyche_v2_behavior_ctx'].tool_bias, 'web_bias': g['psyche_v2_behavior_ctx'].web_bias, 'reassurance': g['psyche_v2_behavior_ctx'].reassurance_bias}
-        g['trace'] = {'provider_calls': g['provider_call_count'], 'tool_iterations': min(g['provider_call_count'], max(1, int(CHAT_MAX_TOOL_ITERATIONS))), 'tool_calls_requested': len(g['tool_calls']), 'tool_calls_executed': len(g['tool_results']), 'tool_calls_successful': len([g['r'] for g['r'] in g['tool_results'] if g['r'].ok]), 'tool_failures': len([g['r'] for g['r'] in g['tool_results'] if not g['r'].ok]), 'used_tools': len(g['tool_results']) > 0, 'used_fallback': False, **self._correction_trace_fields(g['ctx']), 'anti_hallucination_clamp_applied': bool(g['anti_hallucination_trace'].get('applied')), 'anti_hallucination_clamp_reason': g['anti_hallucination_trace'].get('reason'), 'response_grounding_mode': g['grounding_mode'], 'chat_thread_first_turn': g['first_turn_in_thread'], 'chat_history_message_count': len(g['turn'].history or []), **build_history_trace(g['turn']), 'duration_ms': g['duration_ms'], 'provider': g['final_provider'], 'model': g['final_model'], 'usage_reporting_mode': g['usage_summary'].reporting_mode, 'usage_total_tokens': g['usage_summary'].total_tokens, 'selected_strategy': g['decision_core']['selected_strategy'], **self._decision_core_trace_escalation(g['decision_core']), 'reason_codes': g['decision_core']['reason_codes'], 'strategy_confidence': g['decision_core']['strategy_confidence'], 'degraded': g['decision_core']['strategy_degraded'], 'memory_lookup_happened': g['memory_lookup_flag'], 'memory_results_count': memory_results_count_for_trace(g['ctx'].memory_context), 'psyche_snapshot_happened': False, 'research_was_required': g['research_required'], 'agentic_executed': False, 'tool_calls_count': len(g['tool_calls']), 'experience_write_back_attempted': False, 'experience_write_back_succeeded': False, 'controlled_web_decision': g['decision_core'].get('web_decision', 'off'), 'controlled_web_decision_reason': g['decision_core'].get('web_decision_reason', 'not_evaluated'), 'controlled_web_triggered': bool(g['controlled_web'].get('triggered')), 'controlled_web_reason': g['controlled_web'].get('reason'), 'controlled_web_tool': g['controlled_web'].get('tool_name'), 'controlled_web_ok': g['controlled_web'].get('ok'), 'controlled_web_has_results': g['controlled_web'].get('has_results'), 'controlled_web_provider_info': g['controlled_web'].get('provider_info'), 'controlled_web_query': g['controlled_web'].get('query'), 'controlled_web_source_count': g['controlled_web'].get('source_count', 0), 'controlled_web_freshness_needed': g['controlled_web'].get('freshness_needed', False), **self._web_stage_trace_fields(g['decision_core'], g['controlled_web'], explicit_fail_applied=False), 'consistency_check_ran': g['decision_core']['consistency_check_ran'], 'consistency_classification': g['decision_core']['consistency_classification'], 'contradictions_found': g['decision_core']['contradictions_found'], 'policy_hints_loaded': g['decision_core']['policy_hints_loaded'], 'policy_profile_name': g['decision_core']['policy_profile_name'], 'simulation_ran': g['decision_core']['simulation_ran'], 'simulation_best_action': g['decision_core']['simulation_best_action'], 'simulation_variants_count': g['decision_core']['simulation_variants_count'], 'simulation_risk_summary': g['decision_core']['simulation_risk_summary'], 'experience_lookup_happened': g['decision_core'].get('experience_lookup_happened', False), 'experience_matches_count': g['decision_core'].get('experience_matches_count', 0), 'experience_influenced_strategy': g['decision_core'].get('experience_influenced_strategy', False), 'experience_confidence_adjustment': g['decision_core'].get('experience_confidence_adjustment'), 'experience_handoff_bias': g['decision_core'].get('experience_handoff_bias'), 'experience_blocker_reason': g['decision_core'].get('experience_blocker_reason'), 'experience_signal_summary': g['decision_core'].get('experience_signal_summary'), 'reflection_ran': g['post_reflection']['reflection_ran'], 'reflection_summary': g['post_reflection']['reflection_summary'], 'selected_goal': g['decision_core'].get('selected_goal'), 'policy_feedback_loaded': bool(g['decision_core'].get('policy_feedback_loaded')), 'policy_feedback_applied': bool(g['decision_core'].get('policy_feedback_applied')), 'policy_feedback_summary': g['decision_core'].get('policy_feedback_summary', ''), 'policy_confidence_delta': g['decision_core'].get('policy_confidence_delta', 0.0), 'policy_handoff_bias': g['decision_core'].get('policy_handoff_bias', 0.0), 'policy_blocker_sensitivity': g['decision_core'].get('policy_blocker_sensitivity', 0.0), 'policy_simulation_risk_cal': g['decision_core'].get('policy_simulation_risk_cal', 0.0), 'policy_strategy_adjustments': g['decision_core'].get('policy_strategy_adjustments', {}), 'reflection_strategy_fit': g['post_reflection'].get('strategy_fit', 'neutral'), 'reflection_handoff_hindsight': g['post_reflection'].get('handoff_hindsight', 'na'), 'reflection_blocker_hindsight': g['post_reflection'].get('blocker_hindsight', 'na'), 'memory_v2_loaded': g['memory_v2_snapshot'].get('loaded', False), 'memory_v2_match_count': g['memory_v2_snapshot'].get('match_count', 0), 'memory_v2_reinforced_count': g['memory_v2_snapshot'].get('reinforced_count', 0), 'memory_v2_suppressed_count': g['memory_v2_snapshot'].get('suppressed_count', 0), 'memory_v2_contradictions_count': g['memory_v2_snapshot'].get('contradictions_count', 0), 'memory_v2_actionable_contradictions_count': g['memory_v2_snapshot'].get('actionable_contradictions_count', 0), 'memory_v2_transient_contradiction_count': g['memory_v2_snapshot'].get('transient_contradiction_count', 0), 'memory_v2_stability_tier_counts': dict(g['memory_v2_runtime_ctx'].stability_tier_counts) if g['memory_v2_runtime_ctx'] and g['memory_v2_runtime_ctx'].loaded else {}, 'memory_v2_procedure_confidence_raw': g['memory_v2_runtime_ctx'].confidence_modifier_raw if g['memory_v2_runtime_ctx'] and g['memory_v2_runtime_ctx'].loaded else 0.0, 'self_consistency_decision': g['psyche_v2_behavior_ctx'].consistency_decision if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded else 'allow', 'self_consistency_reasons': list(g['psyche_v2_behavior_ctx'].consistency_reasons) if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded else [], 'memory_v2_procedures_count': g['memory_v2_snapshot'].get('procedures_count', 0), 'memory_v2_top_reason_codes': g['memory_v2_snapshot'].get('top_reason_codes', []), 'memory_v2_retrieval_explanation': g['memory_v2_snapshot'].get('retrieval_strategy', ''), 'psyche_v2_loaded': g['psyche_v2_snapshot'].get('loaded', False), 'psyche_v2_mode': g['psyche_v2_snapshot'].get('mode', 'neutral'), 'psyche_v2_relation_trust': g['psyche_v2_snapshot'].get('relation_trust', 0.5), 'psyche_v2_relation_friction': g['psyche_v2_snapshot'].get('relation_friction', 0.0), 'psyche_v2_habit_biases': g['psyche_v2_snapshot'].get('habit_biases', []), 'psyche_v2_behavior_style': g['psyche_v2_snapshot'].get('behavior_policy', {}).get('directness', 0.5), 'identity_bridge_loaded': g['identity_bridge_snapshot'] is not None, 'memory_influenced_strategy': g['decision_core'].get('memory_influenced_strategy_chat', False), 'psyche_influenced_strategy': g['decision_core'].get('psyche_influenced_strategy_chat', False), 'memory_v2_context_injected': g['memory_v2_context_injected'], 'memory_v2_context_item_count': g['memory_v2_context_item_count'], 'memory_v2_procedure_bias_applied': g['memory_v2_procedure_bias_applied'], 'memory_v2_contradiction_guard_applied': g['memory_v2_contradiction_guard_applied'], 'psyche_v2_behavior_applied': g['psyche_v2_behavior_applied'], 'psyche_v2_style_mode': g['psyche_v2_style_mode'], 'psyche_v2_pressure_applied': g['psyche_v2_pressure_applied'], 'psyche_v2_relation_tone_applied': g['psyche_v2_relation_tone_applied'], 'final_behavior_profile': g['final_behavior_profile'], 'reflection_confidence_hindsight': g['post_reflection'].get('confidence_hindsight', 0.0), 'reflection_risk_hindsight': g['post_reflection'].get('risk_hindsight', 0.0), 'reflection_deliberation_hindsight': g['post_reflection'].get('deliberation_hindsight', {}), 'attached_files': g['attachment_meta'], 'attachments_summary': g['attachments_summary'], 'blocker_verdict': g['blocker_verdict'].model_dump(), 'response_variants_triggered': g['deliberation_metadata'].get('response_variants_triggered', False), 'response_variants_count': g['deliberation_metadata'].get('response_variants_count', 0), 'response_variants_reason_codes': g['deliberation_metadata'].get('response_variants_reason_codes', []), 'response_variants_winner': g['deliberation_metadata'].get('response_variants_winner'), 'response_variants_winner_type': g['deliberation_metadata'].get('response_variants_winner_type'), 'response_variants_synthesis_used': g['deliberation_metadata'].get('response_variants_synthesis_used', []), 'response_variants_dropped': g['deliberation_metadata'].get('response_variants_dropped', []), 'response_variants_confidence': g['deliberation_metadata'].get('response_variants_confidence'), 'response_variants_risk': g['deliberation_metadata'].get('response_variants_risk'), 'response_variants_summary': g['deliberation_metadata'].get('response_variants_summary'), 'response_variants_duration_ms': g['deliberation_metadata'].get('response_variants_duration_ms'), 'response_variants_scores': g['deliberation_metadata'].get('response_variants_scores', []), 'response_variants_error': g['deliberation_metadata'].get('response_variants_error', False)}
+        g['trace'] = {'provider_calls': g['provider_call_count'], 'tool_iterations': (0 if (g.get('prompt_budget') is not None and not g['prompt_budget'].allow_tools) else min(int(g.get('iteration') or 0), max(1, int(CHAT_MAX_TOOL_ITERATIONS)))), 'tool_calls_requested': len(g['tool_calls']), 'tool_calls_executed': len(g['tool_results']), 'tool_calls_successful': len([g['r'] for g['r'] in g['tool_results'] if g['r'].ok]), 'tool_failures': len([g['r'] for g['r'] in g['tool_results'] if not g['r'].ok]), 'used_tools': len(g['tool_results']) > 0, 'used_fallback': False, **self._correction_trace_fields(g['ctx']), 'anti_hallucination_clamp_applied': bool(g['anti_hallucination_trace'].get('applied')), 'anti_hallucination_clamp_reason': g['anti_hallucination_trace'].get('reason'), 'response_grounding_mode': g['grounding_mode'], 'chat_thread_first_turn': g['first_turn_in_thread'], 'chat_history_message_count': len(g['turn'].history or []), **build_history_trace(g['turn']), 'duration_ms': g['duration_ms'], 'provider': g['final_provider'], 'model': g['final_model'], 'usage_reporting_mode': g['usage_summary'].reporting_mode, 'usage_total_tokens': g['usage_summary'].total_tokens, 'selected_strategy': g['decision_core']['selected_strategy'], **self._decision_core_trace_escalation(g['decision_core']), 'reason_codes': g['decision_core']['reason_codes'], 'strategy_confidence': g['decision_core']['strategy_confidence'], 'degraded': g['decision_core']['strategy_degraded'], 'memory_lookup_happened': g['memory_lookup_flag'], 'memory_results_count': memory_results_count_for_trace(g['ctx'].memory_context), 'psyche_snapshot_happened': False, 'research_was_required': g['research_required'], 'agentic_executed': False, 'tool_calls_count': len(g['tool_calls']), 'experience_write_back_attempted': False, 'experience_write_back_succeeded': False, 'controlled_web_decision': g['decision_core'].get('web_decision', 'off'), 'controlled_web_decision_reason': g['decision_core'].get('web_decision_reason', 'not_evaluated'), 'controlled_web_triggered': bool(g['controlled_web'].get('triggered')), 'controlled_web_reason': g['controlled_web'].get('reason'), 'controlled_web_tool': g['controlled_web'].get('tool_name'), 'controlled_web_ok': g['controlled_web'].get('ok'), 'controlled_web_has_results': g['controlled_web'].get('has_results'), 'controlled_web_provider_info': g['controlled_web'].get('provider_info'), 'controlled_web_query': g['controlled_web'].get('query'), 'controlled_web_source_count': g['controlled_web'].get('source_count', 0), 'controlled_web_freshness_needed': g['controlled_web'].get('freshness_needed', False), **self._web_stage_trace_fields(g['decision_core'], g['controlled_web'], explicit_fail_applied=False), 'consistency_check_ran': g['decision_core']['consistency_check_ran'], 'consistency_classification': g['decision_core']['consistency_classification'], 'contradictions_found': g['decision_core']['contradictions_found'], 'policy_hints_loaded': g['decision_core']['policy_hints_loaded'], 'policy_profile_name': g['decision_core']['policy_profile_name'], 'simulation_ran': g['decision_core']['simulation_ran'], 'simulation_best_action': g['decision_core']['simulation_best_action'], 'simulation_variants_count': g['decision_core']['simulation_variants_count'], 'simulation_risk_summary': g['decision_core']['simulation_risk_summary'], 'experience_lookup_happened': g['decision_core'].get('experience_lookup_happened', False), 'experience_matches_count': g['decision_core'].get('experience_matches_count', 0), 'experience_influenced_strategy': g['decision_core'].get('experience_influenced_strategy', False), 'experience_confidence_adjustment': g['decision_core'].get('experience_confidence_adjustment'), 'experience_handoff_bias': g['decision_core'].get('experience_handoff_bias'), 'experience_blocker_reason': g['decision_core'].get('experience_blocker_reason'), 'experience_signal_summary': g['decision_core'].get('experience_signal_summary'), 'reflection_ran': g['post_reflection']['reflection_ran'], 'reflection_summary': g['post_reflection']['reflection_summary'], 'selected_goal': g['decision_core'].get('selected_goal'), 'policy_feedback_loaded': bool(g['decision_core'].get('policy_feedback_loaded')), 'policy_feedback_applied': bool(g['decision_core'].get('policy_feedback_applied')), 'policy_feedback_summary': g['decision_core'].get('policy_feedback_summary', ''), 'policy_confidence_delta': g['decision_core'].get('policy_confidence_delta', 0.0), 'policy_handoff_bias': g['decision_core'].get('policy_handoff_bias', 0.0), 'policy_blocker_sensitivity': g['decision_core'].get('policy_blocker_sensitivity', 0.0), 'policy_simulation_risk_cal': g['decision_core'].get('policy_simulation_risk_cal', 0.0), 'policy_strategy_adjustments': g['decision_core'].get('policy_strategy_adjustments', {}), 'reflection_strategy_fit': g['post_reflection'].get('strategy_fit', 'neutral'), 'reflection_handoff_hindsight': g['post_reflection'].get('handoff_hindsight', 'na'), 'reflection_blocker_hindsight': g['post_reflection'].get('blocker_hindsight', 'na'), 'memory_v2_loaded': g['memory_v2_snapshot'].get('loaded', False), 'memory_v2_match_count': g['memory_v2_snapshot'].get('match_count', 0), 'memory_v2_reinforced_count': g['memory_v2_snapshot'].get('reinforced_count', 0), 'memory_v2_suppressed_count': g['memory_v2_snapshot'].get('suppressed_count', 0), 'memory_v2_contradictions_count': g['memory_v2_snapshot'].get('contradictions_count', 0), 'memory_v2_actionable_contradictions_count': g['memory_v2_snapshot'].get('actionable_contradictions_count', 0), 'memory_v2_transient_contradiction_count': g['memory_v2_snapshot'].get('transient_contradiction_count', 0), 'memory_v2_stability_tier_counts': dict(g['memory_v2_runtime_ctx'].stability_tier_counts) if g['memory_v2_runtime_ctx'] and g['memory_v2_runtime_ctx'].loaded else {}, 'memory_v2_procedure_confidence_raw': g['memory_v2_runtime_ctx'].confidence_modifier_raw if g['memory_v2_runtime_ctx'] and g['memory_v2_runtime_ctx'].loaded else 0.0, 'self_consistency_decision': g['psyche_v2_behavior_ctx'].consistency_decision if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded else 'allow', 'self_consistency_reasons': list(g['psyche_v2_behavior_ctx'].consistency_reasons) if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded else [], 'memory_v2_procedures_count': g['memory_v2_snapshot'].get('procedures_count', 0), 'memory_v2_top_reason_codes': g['memory_v2_snapshot'].get('top_reason_codes', []), 'memory_v2_retrieval_explanation': g['memory_v2_snapshot'].get('retrieval_strategy', ''), 'psyche_v2_loaded': g['psyche_v2_snapshot'].get('loaded', False), 'psyche_v2_mode': g['psyche_v2_snapshot'].get('mode', 'neutral'), 'psyche_v2_relation_trust': g['psyche_v2_snapshot'].get('relation_trust', 0.5), 'psyche_v2_relation_friction': g['psyche_v2_snapshot'].get('relation_friction', 0.0), 'psyche_v2_habit_biases': g['psyche_v2_snapshot'].get('habit_biases', []), 'psyche_v2_behavior_style': g['psyche_v2_snapshot'].get('behavior_policy', {}).get('directness', 0.5), 'identity_bridge_loaded': g['identity_bridge_snapshot'] is not None, 'memory_influenced_strategy': g['decision_core'].get('memory_influenced_strategy_chat', False), 'psyche_influenced_strategy': g['decision_core'].get('psyche_influenced_strategy_chat', False), 'memory_v2_context_injected': g['memory_v2_context_injected'], 'memory_v2_context_item_count': g['memory_v2_context_item_count'], 'memory_v2_procedure_bias_applied': g['memory_v2_procedure_bias_applied'], 'memory_v2_contradiction_guard_applied': g['memory_v2_contradiction_guard_applied'], 'psyche_v2_behavior_applied': g['psyche_v2_behavior_applied'], 'psyche_v2_style_mode': g['psyche_v2_style_mode'], 'psyche_v2_pressure_applied': g['psyche_v2_pressure_applied'], 'psyche_v2_relation_tone_applied': g['psyche_v2_relation_tone_applied'], 'final_behavior_profile': g['final_behavior_profile'], 'reflection_confidence_hindsight': g['post_reflection'].get('confidence_hindsight', 0.0), 'reflection_risk_hindsight': g['post_reflection'].get('risk_hindsight', 0.0), 'reflection_deliberation_hindsight': g['post_reflection'].get('deliberation_hindsight', {}), 'attached_files': g['attachment_meta'], 'attachments_summary': g['attachments_summary'], 'blocker_verdict': g['blocker_verdict'].model_dump(), 'response_variants_triggered': g['deliberation_metadata'].get('response_variants_triggered', False), 'response_variants_count': g['deliberation_metadata'].get('response_variants_count', 0), 'response_variants_reason_codes': g['deliberation_metadata'].get('response_variants_reason_codes', []), 'response_variants_winner': g['deliberation_metadata'].get('response_variants_winner'), 'response_variants_winner_type': g['deliberation_metadata'].get('response_variants_winner_type'), 'response_variants_synthesis_used': g['deliberation_metadata'].get('response_variants_synthesis_used', []), 'response_variants_dropped': g['deliberation_metadata'].get('response_variants_dropped', []), 'response_variants_confidence': g['deliberation_metadata'].get('response_variants_confidence'), 'response_variants_risk': g['deliberation_metadata'].get('response_variants_risk'), 'response_variants_summary': g['deliberation_metadata'].get('response_variants_summary'), 'response_variants_duration_ms': g['deliberation_metadata'].get('response_variants_duration_ms'), 'response_variants_scores': g['deliberation_metadata'].get('response_variants_scores', []), 'response_variants_error': g['deliberation_metadata'].get('response_variants_error', False)}
         if isinstance(g.get('_provider_trace'), dict):
             g['trace'].update(g['_provider_trace'])
+        # Honest usage + budget + provider attempt semantics
+        try:
+            g['trace']['prompt_tokens'] = int(getattr(g['usage_summary'], 'prompt_tokens', 0) or 0)
+            g['trace']['completion_tokens'] = int(getattr(g['usage_summary'], 'completion_tokens', 0) or 0)
+            g['trace']['total_tokens'] = int(getattr(g['usage_summary'], 'total_tokens', 0) or g['trace'].get('usage_total_tokens') or 0)
+        except (TypeError, ValueError, AttributeError) as usage_trace_exc:
+            logger.debug('usage token trace skipped: %s', usage_trace_exc)
+        if g.get('prompt_budget_trace'):
+            g['trace']['prompt_budget'] = g['prompt_budget_trace']
+            g['trace']['budget_profile'] = g['prompt_budget_trace'].get('budget_profile')
+        if g.get('prompt_budget') is not None:
+            g['trace']['budget_profile'] = g['prompt_budget'].profile
+            g['trace']['turn_value_class'] = g['prompt_budget'].turn_value_class
+            g['trace']['writeback_policy'] = g['prompt_budget'].writeback_policy
+        # Clarify provider call accounting (keep provider_calls for compat = generation attempts in chat loop)
+        _attempts = g['trace'].get('provider_attempts') or []
+        if isinstance(_attempts, list) and _attempts:
+            g['trace']['provider_attempt_count'] = len(_attempts)
+            g['trace']['provider_success_count'] = sum(1 for a in _attempts if isinstance(a, dict) and a.get('ok'))
+            g['trace']['provider_generation_count'] = int(g['trace'].get('provider_success_count') or 0)
+            g['trace']['provider_failover_happened'] = bool(g['trace'].get('provider_failover_happened')) or (
+                len(_attempts) > 1 and g['trace'].get('provider_success_count', 0) >= 1
+            )
+        else:
+            g['trace'].setdefault('provider_attempt_count', int(g.get('provider_call_count') or 0))
+            g['trace'].setdefault('provider_success_count', 1 if g.get('response_text') else 0)
+            g['trace'].setdefault('provider_generation_count', g['trace'].get('provider_success_count', 0))
         if g['memory_used_trace']:
             g['trace']['memory_used'] = g['memory_used_trace']
         self._augment_memory_observability(g['trace'], g['memory_used_trace'], g['ctx'].memory_context)
@@ -729,6 +853,56 @@ class PipelineMixin:
         g['trace']['psyche_v2_writeback_succeeded'] = False
         g['trace']['psyche_v2_event_applied'] = None
         g['trace']['response_outcome_quality'] = 'success'
+        # Budget / turn-value writeback policy
+        try:
+            from aihub.turn.prompt_budget import writebacks_for_policy
+            _pol = str((g.get('prompt_budget').writeback_policy if g.get('prompt_budget') else None) or g['decision_core'].get('writeback_policy') or 'standard')
+            _tvc = str((g.get('prompt_budget').turn_value_class if g.get('prompt_budget') else None) or g['decision_core'].get('turn_value_class') or 'conversational')
+            g['trace']['turn_value_class'] = _tvc
+            g['trace']['writeback_policy'] = _pol
+            _allowed, _skipped = writebacks_for_policy(_pol)  # type: ignore[arg-type]
+            g['trace']['writebacks_skipped'] = list(_skipped)
+            g['trace']['writebacks_executed'] = []
+            g['_wb_minimal'] = _pol == 'minimal'
+        except Exception:
+            g['_wb_minimal'] = False
+            g['trace'].setdefault('writeback_policy', 'standard')
+            g['trace'].setdefault('turn_value_class', 'conversational')
+            g['trace'].setdefault('writebacks_skipped', [])
+            g['trace'].setdefault('writebacks_executed', [])
+        if g.get('_wb_minimal'):
+            # Minimal: transcript + provider metrics only (already in trace). No heavy writebacks.
+            g['trace']['writebacks_executed'] = ['transcript', 'provider_metrics']
+            g['trace']['memory_v2_writeback_attempted'] = False
+            g['trace']['psyche_v2_writeback_attempted'] = False
+            g['trace']['cognitive_writeback_happened'] = False
+            g['trace']['experience_write_back_attempted'] = False
+            g['trace']['experience_write_back_succeeded'] = False
+            g['trace']['knowledge_writeback_attempted'] = False
+            g['trace']['reflection_ran'] = False
+            # Feedback meta: allow user-model length preference update only.
+            if str(g['trace'].get('turn_value_class') or '') == 'feedback':
+                try:
+                    from aihub.turn.cognitive_integration import update_user_model_from_turn
+                    g['_um_fb'] = update_user_model_from_turn(
+                        user_id=g['turn'].user_id,
+                        message=g['turn'].message or '',
+                        response_text=g['response_text'] or '',
+                        pragmatics=g.get('pragmatics') or (g['ctx'].system_context or {}).get('pragmatics_obj'),
+                        critic_score=None,
+                        revision_happened=False,
+                        pack=g.get('cognitive'),
+                    )
+                    g['trace']['user_model_updated'] = True
+                    g['trace']['user_model_length'] = getattr(g['_um_fb'], 'preferred_answer_length', None)
+                    g['trace']['writebacks_executed'] = list(g['trace'].get('writebacks_executed') or []) + ['user_model']
+                except Exception:
+                    logger.debug('feedback user-model update skipped', exc_info=True)
+            _cr_hook('append_event', append_event)(g['turn'].user_id, 'chat.turn', {'ok': len(g['errors']) == 0, 'provider': g['final_provider'], 'model': g['final_model'], 'trace': g['trace'], 'tool_calls': [], 'tool_results': []})
+            g['result'] = ChatTurnResult(ok=len(g['errors']) == 0, response_text=g['response_text'], model=g['final_model'], provider=g['final_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug={'context': g['ctx'].model_dump()} if g['turn'].include_debug else None, attachments_summary=g.get('attachments_summary'))
+            _TRACE_CACHE[g['turn'].user_id].append(g['result'].trace)
+            g['__result__'] = g['result']
+            return
         if str(getattr(g['turn'], 'runtime_mode', '') or '').lower() != 'audit':
             try:
                 from aihub.memory_core import get_memory_core

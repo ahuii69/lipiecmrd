@@ -510,6 +510,12 @@ _ASSISTANT_META_ASK_MARKERS = (
     "how you work",
     "what are you",
     "what can you do",
+    "opisywałeś swoje działanie",
+    "opisywales swoje dzialanie",
+    "swoje działanie",
+    "swoje dzialanie",
+    "jak działałeś",
+    "jak dzialales",
 )
 
 _META_PRIOR_REF_MARKERS = (

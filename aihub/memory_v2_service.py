@@ -812,6 +812,20 @@ class MemoryV2Service:
         }
 
         try:
+            # Skip durable memory for trivial meta/identity chatter.
+            try:
+                from aihub.turn.prompt_budget import is_trivial_meta_memory_content
+
+                if is_trivial_meta_memory_content(query_text or "", query=query_text or "") or is_trivial_meta_memory_content(
+                    response_text or "", query=query_text or ""
+                ):
+                    result["attempted"] = False
+                    result["succeeded"] = False
+                    result["writeback_kind"] = "skipped_trivial_meta"
+                    result["skipped_reason"] = "trivial_meta_or_identity_chatter"
+                    return result
+            except Exception as trivial_skip_exc:
+                logger.debug("trivial meta memory filter skipped: %s", trivial_skip_exc)
             # Strong signal: controlled web + success
             if grounding_mode == "controlled_web" and tool_successes > 0:
                 web_item = self.create_memory_item(
