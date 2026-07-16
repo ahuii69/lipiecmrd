@@ -112,7 +112,9 @@ from aihub.memory_engine import retrieve_context
 from aihub.psyche_core import get_psyche_core
 from aihub.response_persona_guard import (
     PERSONA_CONTRACT_PROMPT,
+    PRODUCT_IDENTITY_PROMPT,
     dry_fallback_response,
+    sanitize_false_provider_identity,
     sanitize_persona_leakage,
     strip_reasoning_leak,
 )

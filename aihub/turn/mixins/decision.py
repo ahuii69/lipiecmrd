@@ -96,6 +96,8 @@ class DecisionMixin:
         _WHITELIST: dict[str, list[str] | None] = {
             # instant: model-only; lightweight memory reads for grounding only
             "instant": ["memory.search", "memory.get_context"],
+            # direct: same light surface as instant; escalation clears tools for meta
+            "direct": ["memory.search", "memory.get_context"],
             # contextual: memory-heavy; exclude web/research/planner/agent
             "contextual": [
                 "memory.",

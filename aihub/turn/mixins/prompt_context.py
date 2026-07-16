@@ -513,60 +513,96 @@ class PromptContextMixin:
     ) -> ChatTurnContext:
         mode = turn.mode or CHAT_DEFAULT_MODE
         hints = build_correction_hints_for_prompt(turn.user_id, turn.session_id)
-        mem_ctx = retrieve_context(turn.user_id, turn.message, limit=6)
+        from aihub.strategy_selector import (
+            is_assistant_meta_ask,
+            meta_ask_refers_to_prior_conversation,
+        )
+
+        pure_meta = is_assistant_meta_ask(turn.message or "") and not meta_ask_refers_to_prior_conversation(
+            turn.message or ""
+        )
+        meta_ask = is_assistant_meta_ask(turn.message or "")
         system_context: dict[str, Any] = {
             "tool_calling_enabled": LLM_TOOL_CALLING_ENABLED,
             "streaming_enabled": LLM_STREAMING_ENABLED,
             "correction_turn_trace": correction_turn_trace,
             "correction_hints_text": hints,
+            "assistant_meta_ask": meta_ask,
+            "assistant_meta_ask_pure": pure_meta,
         }
-        try:
-            from aihub.memory_core import get_memory_core
-            from aihub.strategy_selector import is_assistant_meta_ask
+        if pure_meta:
+            # Hard cost budget: zero retrieval / zero memory pack for pure identity asks.
+            mem_ctx: dict[str, Any] = {
+                "stm": [],
+                "semantic": [],
+                "episodic": [],
+                "dense_hits": [],
+                "graph_hits": [],
+                "memory_v2_items": [],
+                "total": 0,
+                "memory_lookup_skipped": True,
+                "memory_lookup_happened": False,
+                "meta_ask_lightweight": True,
+            }
+            system_context["memory_context_pack"] = {
+                "selected_ids": [],
+                "used_chars": 0,
+                "source_distribution": {},
+            }
+            system_context["memory_context_pack_prompt"] = ""
+            system_context["memory_context_pack_trace"] = {
+                "selected_count": 0,
+                "used_chars": 0,
+                "skipped": "META_ASK_MEMORY_SKIPPED",
+            }
+            system_context["META_ASK_MEMORY_SKIPPED"] = True
+        else:
+            mem_ctx = retrieve_context(turn.user_id, turn.message, limit=6)
+            try:
+                from aihub.memory_core import get_memory_core
 
-            meta_ask = is_assistant_meta_ask(turn.message or "")
-            pack_limit = 4 if meta_ask else 8
-            pack_chars = 1200 if meta_ask else 2400
-            pack = get_memory_core().build_context_pack(
-                turn.user_id,
-                turn.message,
-                limit=pack_limit,
-                max_chars=pack_chars,
-                include_graph=not meta_ask,
-                correction_hints=hints,
-            )
-            pack_dump = pack.model_dump(mode="json")
-            pack_prompt = pack.to_prompt_text(max_chars=pack_chars)
-            system_context["memory_context_pack"] = pack_dump
-            system_context["memory_context_pack_prompt"] = pack_prompt
-            system_context["memory_context_pack_trace"] = pack.to_trace_summary()
-            if isinstance(mem_ctx, dict):
-                mem_ctx["context_pack"] = pack_dump
-                mem_ctx["context_pack_selected_ids"] = list(pack.selected_ids)
-                mem_ctx["context_pack_source_distribution"] = dict(pack.source_distribution)
-                mem_ctx["context_pack_used_chars"] = int(pack.used_chars)
-                # Cap raw retrieve buckets so memory_hits cannot explode with STM dumps.
-                for key, lim in (
-                    ("stm", 4 if meta_ask else 6),
-                    ("semantic", 4),
-                    ("episodic", 4),
-                    ("dense_hits", 3),
-                    ("graph_hits", 0 if meta_ask else 4),
-                    ("memory_v2_items", 4 if meta_ask else 6),
-                ):
-                    bucket = mem_ctx.get(key)
-                    if isinstance(bucket, list) and len(bucket) > lim:
-                        mem_ctx[key] = bucket[:lim]
-                if meta_ask:
-                    mem_ctx["stm"] = []
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("memory_context_pack_build_failed: %s", exc, exc_info=True)
-            if isinstance(mem_ctx, dict):
-                mem_ctx.setdefault("memory_read_errors", []).append({
-                    "source": "context_pack",
-                    "error": str(exc)[:500],
-                })
-            system_context["memory_context_pack_error"] = str(exc)[:500]
+                pack_limit = 4 if meta_ask else 8
+                pack_chars = 1200 if meta_ask else 2400
+                pack = get_memory_core().build_context_pack(
+                    turn.user_id,
+                    turn.message,
+                    limit=pack_limit,
+                    max_chars=pack_chars,
+                    include_graph=not meta_ask,
+                    correction_hints=hints,
+                )
+                pack_dump = pack.model_dump(mode="json")
+                pack_prompt = pack.to_prompt_text(max_chars=pack_chars)
+                system_context["memory_context_pack"] = pack_dump
+                system_context["memory_context_pack_prompt"] = pack_prompt
+                system_context["memory_context_pack_trace"] = pack.to_trace_summary()
+                if isinstance(mem_ctx, dict):
+                    mem_ctx["context_pack"] = pack_dump
+                    mem_ctx["context_pack_selected_ids"] = list(pack.selected_ids)
+                    mem_ctx["context_pack_source_distribution"] = dict(pack.source_distribution)
+                    mem_ctx["context_pack_used_chars"] = int(pack.used_chars)
+                    # Cap raw retrieve buckets so memory_hits cannot explode with STM dumps.
+                    for key, lim in (
+                        ("stm", 4 if meta_ask else 6),
+                        ("semantic", 4),
+                        ("episodic", 4),
+                        ("dense_hits", 3),
+                        ("graph_hits", 0 if meta_ask else 4),
+                        ("memory_v2_items", 4 if meta_ask else 6),
+                    ):
+                        bucket = mem_ctx.get(key)
+                        if isinstance(bucket, list) and len(bucket) > lim:
+                            mem_ctx[key] = bucket[:lim]
+                    if meta_ask:
+                        mem_ctx["stm"] = []
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("memory_context_pack_build_failed: %s", exc, exc_info=True)
+                if isinstance(mem_ctx, dict):
+                    mem_ctx.setdefault("memory_read_errors", []).append({
+                        "source": "context_pack",
+                        "error": str(exc)[:500],
+                    })
+                system_context["memory_context_pack_error"] = str(exc)[:500]
         capabilities = self._tool_registry.list_capabilities(
             mode=mode,
             include_debug=bool(turn.include_debug),
@@ -676,6 +712,17 @@ class PromptContextMixin:
                 changed = True
                 if isinstance(res.trace, dict):
                     res.trace["reasoning_leak_sanitized"] = True
+            prov_cleaned, prov_changed = sanitize_false_provider_identity(
+                cleaned,
+                user_message=turn.message or "",
+                final_provider=getattr(res, "provider", None),
+                final_model=getattr(res, "model", None),
+            )
+            if prov_changed:
+                cleaned = prov_cleaned
+                changed = True
+                if isinstance(res.trace, dict):
+                    res.trace["false_provider_identity_sanitized"] = True
             if changed:
                 dry_marker = "model nie oddał treści"
                 if cleaned and dry_marker in cleaned.lower():

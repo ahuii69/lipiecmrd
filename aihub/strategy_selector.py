@@ -21,7 +21,7 @@ from aihub.psyche_core import get_psyche_core
 
 logger = logging.getLogger(__name__)
 
-StrategyType = Literal["instant", "contextual", "research", "agentic"]
+StrategyType = Literal["instant", "direct", "contextual", "research", "agentic"]
 
 _LOCAL_INFRA_NO_WEB = re.compile(
     r"(?iu)\b("
@@ -61,7 +61,12 @@ REASON_CODES = {
     "PSYCHE_LOW_ENERGY_DOWNGRADE": "Low energy triggered strategy simplification",
     "PSYCHE_HIGH_FOCUS_BOOST": "High focus boosted confidence for complex strategy",
     "STRATEGY_RULE_INSTANT": "Deterministic short-path classification",
+    "STRATEGY_RULE_DIRECT_META": "Meta/prior-ref lightweight direct path",
     "STRATEGY_RULE_CONTEXTUAL": "History/memory/reference classification",
+    "META_ASK_LIGHTWEIGHT_PATH": "Assistant meta ask → lightweight path",
+    "META_ASK_MEMORY_SKIPPED": "Meta ask skipped memory retrieval",
+    "META_ASK_GOAL_SKIPPED": "Meta ask ignored junk/active goals for routing",
+    "META_ASK_HEAVY_STAGES_SKIPPED": "Meta ask skipped heavy prepare stages",
     "STRATEGY_RULE_RESEARCH": "Web/research intent classification",
     "STRATEGY_RULE_AGENTIC_GOALS": "Active goals → agentic",
     "STRATEGY_RULE_AGENTIC_KEYWORD": "Multi-step / analysis keyword",
@@ -474,14 +479,19 @@ AGENTIC_MULTISTEP_MARKERS = (
 )
 
 # Identity / meta system questions must stay non-agentic.
+# Canonical source of truth for assistant_meta_ask classification.
 _ASSISTANT_META_ASK_MARKERS = (
     "kim jesteś",
     "kim jestes",
-    "kim jesteś",
     "jak działasz",
     "jak dzialasz",
     "jak działacie",
     "jak dzialacie",
+    "co potrafisz",
+    "opisz się",
+    "opisz sie",
+    "jakich elementów systemu",
+    "jakich elementow systemu",
     "jakie elementy",
     "jakich elementów",
     "jakich elementow",
@@ -491,16 +501,39 @@ _ASSISTANT_META_ASK_MARKERS = (
     "wykorzystales",
     "przedstaw się",
     "przedstaw sie",
-    "kim jesteś i",
+    "kto cię stworzył",
+    "kto cie stworzyl",
+    "jaki model teraz",
+    "jaki provider",
     "who are you",
     "how do you work",
     "how you work",
     "what are you",
+    "what can you do",
+)
+
+_META_PRIOR_REF_MARKERS = (
+    "wcześniej",
+    "wczesniej",
+    "jak wcześniej",
+    "jak wczesniej",
+    "jak mówiłeś",
+    "jak mowiles",
+    "jak mówiłaś",
+    "jak mowilas",
+    "w poprzedniej",
+    "ostatnio mówiłeś",
+    "ostatnio mowiles",
+    "przypomnij",
+    "jak mówiłeś wcześniej",
+    "as you said",
+    "earlier you",
+    "you said before",
 )
 
 
 def is_assistant_meta_ask(user_text: str) -> bool:
-    """True for short identity / 'how do you work' / which modules questions."""
+    """Canonical classifier: short identity / capability / how-you-work questions."""
     text = (user_text or "").strip()
     if not text:
         return False
@@ -512,16 +545,42 @@ def is_assistant_meta_ask(user_text: str) -> bool:
     if any(m in lower or _strip_diacritics(m) in ascii_l for m in _ASSISTANT_META_ASK_MARKERS):
         return True
     # "powiedz krótko" + self-reference without execute verbs
-    short_ask = "powiedz krotko" in ascii_l or "powiedz krótko" in lower or "napisz krotk" in ascii_l
+    short_ask = (
+        "powiedz krotko" in ascii_l
+        or "powiedz krótko" in lower
+        or "napisz krotk" in ascii_l
+        or "opisz krotk" in ascii_l
+    )
     self_ref = any(
         t in ascii_l
-        for t in ("kim jestes", "jak dzial", "systemu", "modulu", "element", "o sobie")
+        for t in (
+            "kim jestes",
+            "jak dzial",
+            "systemu",
+            "modulu",
+            "element",
+            "o sobie",
+            "potrafisz",
+            "model",
+            "provider",
+        )
     )
     exec_blocked = any(
         _keyword_in_text(k, lower, ascii_l)
-        for k in ("zaplanuj", "wykonaj", "przeanalizuj", "krok po kroku")
+        for k in ("zaplanuj", "wykonaj", "przeanalizuj", "krok po kroku", "migracj")
     )
     return bool(short_ask and self_ref and not exec_blocked)
+
+
+def meta_ask_refers_to_prior_conversation(user_text: str) -> bool:
+    """True when a meta-ask explicitly points at earlier dialogue (short history OK)."""
+    if not is_assistant_meta_ask(user_text):
+        return False
+    lower = (user_text or "").lower()
+    ascii_l = _strip_diacritics(lower)
+    return any(
+        m in lower or _strip_diacritics(m) in ascii_l for m in _META_PRIOR_REF_MARKERS
+    )
 
 
 _SIMPLE_GREETINGS = frozenset(
@@ -724,15 +783,26 @@ class StrategySelector:
                 "reason": reason,
             }
 
-        # ── 0) Assistant identity / meta-system Q&A → never agentic ─────
+        # ── 0) Assistant identity / meta-system Q&A → lightweight path ─
         if is_assistant_meta_ask(text):
+            prior = meta_ask_refers_to_prior_conversation(text)
+            # Pure meta: instant, zero memory. Prior-ref: direct + short history only.
+            if prior:
+                return _out(
+                    "direct",
+                    0.9,
+                    False,
+                    False,
+                    False,
+                    "Assistant meta ask with prior-conversation reference — light history, no retrieval",
+                )
             return _out(
-                "contextual" if hist >= 1 or mem_rel else "instant",
-                0.88,
-                hist >= 1 or mem_rel,
+                "instant",
+                0.92,
                 False,
                 False,
-                "Assistant identity/meta ask — contextual/direct, no planner",
+                False,
+                "Assistant identity/meta ask — lightweight instant path",
             )
 
         # ── 1) Agentic (highest priority) ─────────────────────────────
@@ -965,8 +1035,8 @@ def _rule_code_from_dict(
     d: dict[str, Any], context: dict[str, Any], user_text: str
 ) -> str:
     s = d["strategy"]
-    if s == "instant":
-        return "STRATEGY_RULE_INSTANT"
+    if s in ("instant", "direct"):
+        return "STRATEGY_RULE_INSTANT" if s == "instant" else "STRATEGY_RULE_DIRECT_META"
     if s == "contextual":
         return "STRATEGY_RULE_CONTEXTUAL"
     if s == "research":
@@ -1003,12 +1073,28 @@ def select_strategy(
         degraded=False,
     )
 
-    memory_summary = _bounded_memory_retrieval(user_id, user_text or "", limit=5)
-    selection.memory_summary_used = memory_summary.lookup_succeeded
-    if not memory_summary.lookup_succeeded:
-        selection.reason_codes.append("MEMORY_UNAVAILABLE_FALLBACK")
-        selection.degraded = True
-    selection.timing["memory_retrieval_ms"] = memory_summary.retrieval_latency_ms
+    pure_meta = is_assistant_meta_ask(user_text or "") and not meta_ask_refers_to_prior_conversation(
+        user_text or ""
+    )
+    if pure_meta:
+        # Hard cost budget: skip selector memory retrieval for pure identity/meta asks.
+        memory_summary = MemoryRoutingSummary(
+            has_relevant_memory=False,
+            lookup_attempted=False,
+            lookup_succeeded=True,
+            retrieval_latency_ms=0.0,
+        )
+        selection.memory_summary_used = False
+        selection.timing["memory_retrieval_ms"] = 0.0
+        selection.reason_codes.append("META_ASK_MEMORY_SKIPPED")
+        selection.reason_codes.append("META_ASK_LIGHTWEIGHT_PATH")
+    else:
+        memory_summary = _bounded_memory_retrieval(user_id, user_text or "", limit=5)
+        selection.memory_summary_used = memory_summary.lookup_succeeded
+        if not memory_summary.lookup_succeeded:
+            selection.reason_codes.append("MEMORY_UNAVAILABLE_FALLBACK")
+            selection.degraded = True
+        selection.timing["memory_retrieval_ms"] = memory_summary.retrieval_latency_ms
 
     psyche_summary = _bounded_psyche_snapshot(user_id)
     selection.psyche_summary_used = psyche_summary.snapshot_succeeded
@@ -1022,16 +1108,34 @@ def select_strategy(
         active_goals_count = int(active_goals_summary.get("active_count", 0))
         goal_urgency_max = float(active_goals_summary.get("max_urgency", 0.0))
 
+    # Pure meta ignores historical junk goals for routing.
+    if pure_meta:
+        active_goals_count = 0
+        goal_urgency_max = 0.0
+        selection.reason_codes.append("META_ASK_GOAL_SKIPPED")
+
     if active_goals_count > 0:
         selection.reason_codes.append("ACTIVE_GOAL_PRESENT")
         if goal_urgency_max >= 0.8:
             selection.reason_codes.append("GOAL_HIGH_URGENCY")
 
     hist_turns = _history_turn_count(history)
+    if pure_meta:
+        hist_turns = 0
+    elif is_assistant_meta_ask(user_text or "") and meta_ask_refers_to_prior_conversation(
+        user_text or ""
+    ):
+        hist_turns = min(hist_turns, 2)
     ctx: dict[str, Any] = {
-        "memory_has_relevant": memory_summary.has_relevant_memory
-        or memory_summary.has_user_preference_match,
-        "memory_task_continuation": memory_summary.has_task_continuation_signal,
+        "memory_has_relevant": False
+        if pure_meta
+        else (
+            memory_summary.has_relevant_memory
+            or memory_summary.has_user_preference_match
+        ),
+        "memory_task_continuation": False
+        if pure_meta
+        else memory_summary.has_task_continuation_signal,
         "history_turns": hist_turns,
         "active_goals_count": active_goals_count,
         "goal_max_urgency": goal_urgency_max,

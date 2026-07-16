@@ -89,46 +89,110 @@ class PipelineMixin:
         g['memory_v2_runtime_ctx'] = None
         g['psyche_v2_behavior_ctx'] = None
         try:
-            from aihub.runtime_identity_bridge import build_identity_bridge_snapshot as build_identity_snapshot
-            from aihub.runtime_memory_bridge import build_memory_v2_runtime_context, build_memory_v2_runtime_snapshot
-            from aihub.runtime_psyche_bridge import build_psyche_v2_behavior_context, build_psyche_v2_runtime_snapshot
-            g['memory_v2_snapshot'] = build_memory_v2_runtime_snapshot(g['turn'].user_id, g['turn'].message)
-            g['psyche_v2_snapshot'] = build_psyche_v2_runtime_snapshot(g['turn'].user_id)
-            g['identity_bridge_snapshot'] = build_identity_snapshot(g['turn'].user_id, g['turn'].message)
-            g['memory_v2_runtime_ctx'] = build_memory_v2_runtime_context(g['turn'].user_id, g['turn'].message)
-            g['psyche_v2_behavior_ctx'] = build_psyche_v2_behavior_context(g['turn'].user_id)
+            from aihub.strategy_selector import (
+                is_assistant_meta_ask,
+                meta_ask_refers_to_prior_conversation,
+            )
+
+            g['assistant_meta_ask'] = is_assistant_meta_ask(g['turn'].message or '')
+            g['assistant_meta_ask_pure'] = bool(
+                g['assistant_meta_ask']
+                and not meta_ask_refers_to_prior_conversation(g['turn'].message or '')
+            )
+        except Exception:
+            g['assistant_meta_ask'] = False
+            g['assistant_meta_ask_pure'] = False
+        if g.get('assistant_meta_ask'):
+            # Cap completion budget for identity/meta asks.
+            cur = self._turn_max_completion_tokens
+            try:
+                cur_i = int(cur) if cur is not None else 256
+            except (TypeError, ValueError):
+                cur_i = 256
+            self._turn_max_completion_tokens = max(160, min(cur_i, 256))
+        if g.get('assistant_meta_ask'):
+            # Skip heavy memory V2 / identity retrieval; keep light psyche for tone.
+            g['memory_v2_snapshot'] = {
+                'loaded': False,
+                'match_count': 0,
+                'reinforced_count': 0,
+                'suppressed_count': 0,
+                'contradictions_count': 0,
+                'actionable_contradictions_count': 0,
+                'transient_contradiction_count': 0,
+                'procedures_count': 0,
+                'top_reason_codes': ['META_ASK_HEAVY_STAGES_SKIPPED'],
+                'retrieval_strategy': 'skipped_meta_ask',
+            }
+            g['memory_v2_runtime_ctx'] = None
+            g['identity_bridge_snapshot'] = None
+            try:
+                from aihub.runtime_psyche_bridge import (
+                    build_psyche_v2_behavior_context,
+                    build_psyche_v2_runtime_snapshot,
+                )
+
+                g['psyche_v2_snapshot'] = build_psyche_v2_runtime_snapshot(g['turn'].user_id)
+                g['psyche_v2_behavior_ctx'] = build_psyche_v2_behavior_context(g['turn'].user_id)
+            except Exception as bridge_error:
+                g['bridge_error'] = bridge_error
+                logger.debug('meta ask light psyche skipped: %s', bridge_error)
             if isinstance(g['ctx'].system_context, dict):
-                g['ctx'].system_context['identity_bridge_snapshot'] = g['identity_bridge_snapshot']
-        except Exception as bridge_error:
-            g['bridge_error'] = bridge_error
-            logger.warning(f'Failed to load V2 bridges: {bridge_error}')
-        try:
-            if g['memory_v2_runtime_ctx'] is not None or g['psyche_v2_behavior_ctx'] is not None:
-                from aihub.psyche_v2_repository import ensure_psyche_profile
-                from aihub.runtime_psyche_bridge import apply_consistency_to_contexts
-                g['_prof'] = ensure_psyche_profile(g['turn'].user_id)
-                g['memory_v2_runtime_ctx'], g['psyche_v2_behavior_ctx'], g['_consistency'] = apply_consistency_to_contexts(g['memory_v2_runtime_ctx'], g['psyche_v2_behavior_ctx'], g['_prof'].core_caution)
-        except Exception as consistency_error:
-            g['consistency_error'] = consistency_error
-            logger.debug('Self-consistency pass skipped: %s', consistency_error, exc_info=True)
+                g['ctx'].system_context['META_ASK_HEAVY_STAGES_SKIPPED'] = True
+                g['ctx'].system_context['identity_bridge_snapshot'] = None
+        else:
+            try:
+                from aihub.runtime_identity_bridge import build_identity_bridge_snapshot as build_identity_snapshot
+                from aihub.runtime_memory_bridge import build_memory_v2_runtime_context, build_memory_v2_runtime_snapshot
+                from aihub.runtime_psyche_bridge import build_psyche_v2_behavior_context, build_psyche_v2_runtime_snapshot
+                g['memory_v2_snapshot'] = build_memory_v2_runtime_snapshot(g['turn'].user_id, g['turn'].message)
+                g['psyche_v2_snapshot'] = build_psyche_v2_runtime_snapshot(g['turn'].user_id)
+                g['identity_bridge_snapshot'] = build_identity_snapshot(g['turn'].user_id, g['turn'].message)
+                g['memory_v2_runtime_ctx'] = build_memory_v2_runtime_context(g['turn'].user_id, g['turn'].message)
+                g['psyche_v2_behavior_ctx'] = build_psyche_v2_behavior_context(g['turn'].user_id)
+                if isinstance(g['ctx'].system_context, dict):
+                    g['ctx'].system_context['identity_bridge_snapshot'] = g['identity_bridge_snapshot']
+            except Exception as bridge_error:
+                g['bridge_error'] = bridge_error
+                logger.warning(f'Failed to load V2 bridges: {bridge_error}')
+            try:
+                if g['memory_v2_runtime_ctx'] is not None or g['psyche_v2_behavior_ctx'] is not None:
+                    from aihub.psyche_v2_repository import ensure_psyche_profile
+                    from aihub.runtime_psyche_bridge import apply_consistency_to_contexts
+                    g['_prof'] = ensure_psyche_profile(g['turn'].user_id)
+                    g['memory_v2_runtime_ctx'], g['psyche_v2_behavior_ctx'], g['_consistency'] = apply_consistency_to_contexts(g['memory_v2_runtime_ctx'], g['psyche_v2_behavior_ctx'], g['_prof'].core_caution)
+            except Exception as consistency_error:
+                g['consistency_error'] = consistency_error
+                logger.debug('Self-consistency pass skipped: %s', consistency_error, exc_info=True)
         g['mem_truth'] = memory_truth_for_prompt(g['ctx'].memory_context)
-        g['memory_lookup_flag'] = bool(g['mem_truth']['memory_retrieval_has_rows'])
-        g['memory_substantive_flag'] = bool(g['mem_truth']['memory_substantive_in_prompt'])
-        g['include_stm_in_memory_brief'] = len(g['turn'].history or []) == 0
-        g['memory_brief'] = self._build_memory_brief(
-            g['ctx'].memory_context,
-            include_stm=g['include_stm_in_memory_brief'],
-            correction_hints=str((g['ctx'].system_context or {}).get('correction_hints_text') or ''),
-        )
-        g['memory_used_trace'] = self._build_memory_used_trace(
-            g['ctx'].memory_context,
-            include_stm=g['include_stm_in_memory_brief'],
-            correction_hints=str((g['ctx'].system_context or {}).get('correction_hints_text') or ''),
-        )
+        g['memory_lookup_flag'] = bool(g['mem_truth']['memory_retrieval_has_rows']) and not g.get('assistant_meta_ask_pure')
+        g['memory_substantive_flag'] = bool(g['mem_truth']['memory_substantive_in_prompt']) and not g.get('assistant_meta_ask_pure')
+        if g.get('assistant_meta_ask_pure'):
+            g['memory_lookup_flag'] = False
+            g['memory_substantive_flag'] = False
+            g['memory_brief'] = ''
+            g['memory_used_trace'] = []
+            g['include_stm_in_memory_brief'] = False
+            if isinstance(g['ctx'].system_context, dict):
+                g['ctx'].system_context['memory_lookup_happened'] = False
+                g['ctx'].system_context['memory_results_count'] = 0
+        else:
+            g['include_stm_in_memory_brief'] = len(g['turn'].history or []) == 0
+            g['memory_brief'] = self._build_memory_brief(
+                g['ctx'].memory_context,
+                include_stm=g['include_stm_in_memory_brief'],
+                correction_hints=str((g['ctx'].system_context or {}).get('correction_hints_text') or ''),
+            )
+            g['memory_used_trace'] = self._build_memory_used_trace(
+                g['ctx'].memory_context,
+                include_stm=g['include_stm_in_memory_brief'],
+                correction_hints=str((g['ctx'].system_context or {}).get('correction_hints_text') or ''),
+            )
         if stream_session_active():
             await emit_status('thinking', label_pl='Analizuję…')
-            await emit_status('memory', label_pl='Sprawdzam kontekst…')
-            g['mem_total'] = memory_results_count_for_trace(g['ctx'].memory_context)
+            if not g.get('assistant_meta_ask_pure'):
+                await emit_status('memory', label_pl='Sprawdzam kontekst…')
+            g['mem_total'] = memory_results_count_for_trace(g['ctx'].memory_context) if not g.get('assistant_meta_ask_pure') else 0
             if g['memory_lookup_flag'] and g['mem_total'] > 0:
                 await emit_memory_used(count=g['mem_total'])
         g['psyche_brief'] = self._build_psyche_brief(g['psyche_snapshot'])
@@ -147,7 +211,7 @@ class PipelineMixin:
             g['_active_tid'] = str(getattr(getattr(self, '_active_turn_ctx', None), 'turn_id', None) or getattr(g['turn'], 'turn_id', '') or '')
             g['pragmatics'] = analyze_pragmatics(
                 raw_text=g['turn'].message or '',
-                history=list(g['turn'].history or []),
+                history=list(g['turn'].history or [])[:2] if g.get('assistant_meta_ask') else list(g['turn'].history or []),
                 user_id=g['turn'].user_id,
                 session_id=g['turn'].session_id,
                 turn_id=g['_active_tid'],
@@ -174,13 +238,13 @@ class PipelineMixin:
                 user_id=g['turn'].user_id,
                 session_id=g['turn'].session_id,
                 message=g['turn'].message or '',
-                history=list(g['turn'].history or []),
+                history=list(g['turn'].history or [])[:2] if g.get('assistant_meta_ask') else list(g['turn'].history or []),
                 pragmatics=g.get('pragmatics'),
                 memory_brief=g.get('memory_brief') or '',
                 psyche_brief=g.get('psyche_brief') or '',
-                memory_v2_ctx=g.get('memory_v2_runtime_ctx'),
+                memory_v2_ctx=None if g.get('assistant_meta_ask') else g.get('memory_v2_runtime_ctx'),
                 psyche_v2_ctx=g.get('psyche_v2_behavior_ctx'),
-                identity_snapshot=g.get('identity_bridge_snapshot'),
+                identity_snapshot=None if g.get('assistant_meta_ask') else g.get('identity_bridge_snapshot'),
                 selected_goal=None,
                 experience_signal_summary='',
                 correction_hints=g['_corr_hints'],

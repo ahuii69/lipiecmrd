@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from typing import Any, Literal, TypedDict
 
-StrategyName = Literal["instant", "contextual", "research", "agentic"]
+StrategyName = Literal["instant", "direct", "contextual", "research", "agentic"]
 FinalMode = Literal["direct", "memory_augmented", "research", "planner"]
 
 
@@ -18,7 +18,7 @@ class EscalationPath(TypedDict):
 
 def _coerce_strategy(value: str) -> StrategyName:
     v = (value or "instant").strip().lower()
-    if v in ("instant", "contextual", "research", "agentic"):
+    if v in ("instant", "direct", "contextual", "research", "agentic"):
         return v  # type: ignore[return-value]
     return "instant"
 
@@ -28,12 +28,13 @@ def decide_execution_path(strategy_output: dict[str, Any]) -> EscalationPath:
 
     Mapping (fixed product contract):
     - instant → direct
+    - direct → direct (meta / prior-ref lightweight)
     - contextual → memory_augmented
     - research → research
     - agentic → planner + reasoning
     """
     s = _coerce_strategy(str(strategy_output.get("strategy", "instant")))
-    if s == "instant":
+    if s in ("instant", "direct"):
         return {
             "final_mode": "direct",
             "use_reasoning": False,

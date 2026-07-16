@@ -23,6 +23,93 @@ PERSONA_CONTRACT_PROMPT = (
     "- Agresja/wulgaryzmy użytkownika: konkretna odpowiedź, bez lania wody i bez odbijania agresji.\n"
 )
 
+PRODUCT_IDENTITY_PROMPT = (
+    "\nTOŻSAMOŚĆ PRODUKTU (wiążące):\n"
+    "- Jesteś asystentem AI-Hub (Mordzix). Odpowiedzi generujesz przez aktualnie dostępny model językowy; "
+    "system może przełączać dostawców awaryjnie.\n"
+    "- Prefiks `openai/` w nazwie modelu oznacza rodzinę/format modelu, NIE oznacza OpenAI API ani ChatGPT.\n"
+    "- Nie twierdź, że działasz „w oparciu o OpenAI”, „przez OpenAI API” ani „jako ChatGPT”, "
+    "chyba że użytkownik pyta o zewnętrzny produkt OpenAI w innym kontekście.\n"
+    "- Przy pytaniu kim jesteś / jak działasz: opisz produkt AI-Hub i ogólny sposób pracy "
+    "(rozmowa, narzędzia gdy potrzebne, failover) — bez zgadywania konkretnego dostawcy tej tury.\n"
+    "- Konkretny provider/model podawaj tylko gdy użytkownik pyta wprost o aktualny provider/model "
+    "i masz to z runtime metadata (nie z nazwy modelu).\n"
+)
+
+_FALSE_PROVIDER_CLAIM_RE = re.compile(
+    r"(?is)("
+    r"w\s+oparciu\s+o\s+(modele?\s+językowe\s+|modele?\s+|modelach\s+)?"
+    r"openai|"
+    r"opart[ya]\s+o\s+(modele?\s+językowe\s+|modele?\s+)?"
+    r"openai|"
+    r"przez\s+openai(\s+api)?|"
+    r"openai\s+api|"
+    r"używam\s+openai|"
+    r"działa[mm]?\s+na\s+openai|"
+    r"powered\s+by\s+openai|"
+    r"using\s+openai(\s+api)?|"
+    r"\bchatgpt\b"
+    r")"
+)
+
+_PROVIDER_MODEL_ASK_RE = re.compile(
+    r"(?is)(jaki\s+model|jaki\s+provider|który\s+model|ktory\s+model|"
+    r"which\s+model|what\s+model|what\s+provider|kto\s+cię\s+hostuje)"
+)
+
+
+def sanitize_false_provider_identity(
+    text: str,
+    *,
+    user_message: str = "",
+    final_provider: str | None = None,
+    final_model: str | None = None,
+) -> tuple[str, bool]:
+    """Strip false claims that THIS turn was served by OpenAI API / ChatGPT.
+
+    Does not globally erase the word OpenAI (other contexts remain valid).
+    """
+    raw = (text or "").strip()
+    if not raw:
+        return text, False
+    prov = (final_provider or "").strip().lower()
+    # If runtime provider really is openai, leave claims alone.
+    if prov in {"openai", "openai_api", "openai-api"}:
+        return text, False
+    if not _FALSE_PROVIDER_CLAIM_RE.search(raw):
+        return text, False
+
+    # Sentence-level drop of false provider claims.
+    parts = [s for s in _SENTENCE_SPLIT.split(raw) if s and s.strip()]
+    kept: list[str] = []
+    changed = False
+    for sentence in parts:
+        if _FALSE_PROVIDER_CLAIM_RE.search(sentence):
+            changed = True
+            continue
+        kept.append(sentence.strip())
+    cleaned = " ".join(kept).strip()
+    if not cleaned:
+        cleaned = (
+            "Jestem asystentem AI-Hub. Odpowiedzi generuję przez aktualnie dostępny model językowy; "
+            "system może przełączać dostawców awaryjnie."
+        )
+        changed = True
+    # Optional honest runtime answer when user asked about provider/model.
+    if _PROVIDER_MODEL_ASK_RE.search(user_message or "") and final_provider:
+        meta = f"W tej turze finalny provider={final_provider}"
+        if final_model:
+            meta += f", model={final_model}"
+        meta += "."
+        if meta.lower() not in cleaned.lower():
+            cleaned = (cleaned + " " + meta).strip()
+            changed = True
+    return cleaned, changed
+
+
+def contains_false_openai_provider_claim(text: str) -> bool:
+    return bool(_FALSE_PROVIDER_CLAIM_RE.search(text or ""))
+
 _STRONG_MARKERS: dict[str, re.Pattern[str]] = {
     "alive": re.compile(r"\b(wciąż|nadal|jeszcze)?\s*żyj[eę]\b", re.IGNORECASE),
     "boredom": re.compile(
