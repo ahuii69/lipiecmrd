@@ -114,6 +114,7 @@ from aihub.response_persona_guard import (
     PERSONA_CONTRACT_PROMPT,
     dry_fallback_response,
     sanitize_persona_leakage,
+    strip_reasoning_leak,
 )
 from aihub.response_variants_engine import ResponseVariantsEngine
 from aihub.strategy_selector import (

@@ -211,3 +211,17 @@ def test_system_prompt_has_mordo_natural_voice(user_input: str):
     assert "mordzix" in prompt or "mordo" in prompt
     assert "jak mogę pomóc" in prompt
     assert user_input  # exercise parametrized inputs for CI matrix
+
+
+def test_strip_reasoning_leak_extracts_polish_answer():
+    from aihub.response_persona_guard import strip_reasoning_leak
+    cot = 'We need to respond. maybe "Elo, wszystko spoko. A u Ciebie?"'
+    cleaned, changed = strip_reasoning_leak(cot)
+    assert changed is True
+    assert 'Elo' in cleaned
+    assert 'We need' not in cleaned
+    ok, ch = strip_reasoning_leak('Z pamięci: FastAPI jest ulubiony.')
+    assert ch is False
+    cot2 = 'The user asks: "Jaki jest port?" I should answer: "Port aplikacji to 8080."'
+    cleaned2, changed2 = strip_reasoning_leak(cot2)
+    assert changed2 and '8080' in cleaned2

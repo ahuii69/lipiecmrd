@@ -80,6 +80,19 @@ class MemoryProcessTurnIn(BaseModel):
     meta: Dict[str, Any] = Field(default_factory=dict)
 
 
+class MemoryProceduresIn(BaseModel):
+    limit: int = Field(default=10, ge=1, le=50)
+    extract: bool = False
+
+
+class KnowledgeLookupIn(BaseModel):
+    query: str = Field(min_length=1, max_length=5000)
+
+
+class ConsistencyCheckIn(BaseModel):
+    text: str = Field(min_length=1, max_length=200000)
+
+
 class GoalCreateIn(BaseModel):
     title: str = Field(min_length=1, max_length=300)
     description: str = Field(min_length=1, max_length=2000)
@@ -362,6 +375,126 @@ class ToolRegistry:
                 timeout_seconds=20.0,
                 visibility=["chat", "agent", "debug"],
                 handler=_memory_process_turn,
+            )
+        )
+
+        async def _memory_list_procedures(
+            ctx: ToolExecutionContext, inp: MemoryProceduresIn
+        ) -> Dict[str, Any]:
+            core = get_memory_core()
+            extracted = 0
+            if inp.extract:
+                procs_new = core.v2_extract_procedures(ctx.user_id)
+                extracted = len(procs_new or [])
+            procs = core.v2_list_procedures(ctx.user_id, limit=inp.limit)
+            items = []
+            for p in procs or []:
+                items.append(
+                    {
+                        "id": getattr(p, "id", None),
+                        "name": getattr(p, "name", None) or getattr(p, "title", None),
+                        "strategy": getattr(p, "recommended_strategy", None),
+                        "confidence": getattr(p, "confidence_score", None),
+                        "success_rate": getattr(p, "success_rate", None),
+                    }
+                )
+            return {
+                "ok": True,
+                "result": {
+                    "procedures": items,
+                    "extracted_now": extracted,
+                    "count": len(items),
+                },
+            }
+
+        self.register(
+            ToolDefinition(
+                name="memory.list_procedures",
+                description="List learned procedural workflows; optionally extract new ones from experience.",
+                capability_group="memory",
+                input_model=MemoryProceduresIn,
+                output_model=ToolEnvelopeOut,
+                enabled=True,
+                read_only=False,
+                requires_confirmation=False,
+                timeout_seconds=25.0,
+                visibility=["chat", "agent", "debug"],
+                handler=_memory_list_procedures,
+            )
+        )
+
+        async def _knowledge_lookup(
+            ctx: ToolExecutionContext, inp: KnowledgeLookupIn
+        ) -> Dict[str, Any]:
+            from aihub.world_knowledge.engine import retrieve_knowledge_context
+
+            kctx = retrieve_knowledge_context(
+                user_id=ctx.user_id, message=inp.query, session_id=ctx.session_id or ""
+            )
+            return {
+                "ok": True,
+                "result": {
+                    "entities": [e.canonical_name for e in (kctx.entities or [])[:8]],
+                    "claims": [
+                        {
+                            "id": c.claim_id,
+                            "statement": c.statement[:200],
+                            "confidence": c.confidence,
+                            "status": c.status,
+                        }
+                        for c in (kctx.claims or [])[:8]
+                    ],
+                    "relations": [r.predicate for r in (kctx.relations or [])[:8]],
+                    "verification_required": bool(kctx.verification_required),
+                    "disputed": list(kctx.disputed_claims or [])[:4],
+                    "stale": list(kctx.stale_claims or [])[:4],
+                },
+            }
+
+        self.register(
+            ToolDefinition(
+                name="knowledge.lookup",
+                description="Lookup world-knowledge entities, claims and relation hints for a query.",
+                capability_group="knowledge",
+                input_model=KnowledgeLookupIn,
+                output_model=ToolEnvelopeOut,
+                enabled=True,
+                read_only=True,
+                requires_confirmation=False,
+                timeout_seconds=15.0,
+                visibility=["chat", "agent", "debug"],
+                handler=_knowledge_lookup,
+            )
+        )
+
+        async def _consistency_check(
+            ctx: ToolExecutionContext, inp: ConsistencyCheckIn
+        ) -> Dict[str, Any]:
+            from aihub.consistency_engine import check_consistency
+
+            verdict = check_consistency(ctx.user_id, inp.text)
+            return {
+                "ok": True,
+                "result": {
+                    "classification": verdict.classification,
+                    "reasoning": getattr(verdict, "reasoning", "") or "",
+                    "confidence": getattr(verdict, "confidence", None),
+                },
+            }
+
+        self.register(
+            ToolDefinition(
+                name="consistency.check",
+                description="Check whether a statement conflicts with stored memory/knowledge.",
+                capability_group="memory",
+                input_model=ConsistencyCheckIn,
+                output_model=ToolEnvelopeOut,
+                enabled=True,
+                read_only=True,
+                requires_confirmation=False,
+                timeout_seconds=12.0,
+                visibility=["chat", "agent", "debug"],
+                handler=_consistency_check,
             )
         )
 

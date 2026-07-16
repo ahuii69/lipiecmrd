@@ -63,6 +63,8 @@ class TestToolRegistryCompleteness:
             "system",
             "debug",
             "image",
+            "knowledge",
+            "consistency",
         }
         tool_groups = {name.split(".")[0] for name in registry._tools.keys()}
         assert tool_groups.issubset(expected_groups | {"snapshot"})
@@ -71,8 +73,8 @@ class TestToolRegistryCompleteness:
 class TestToolVisibilityFiltering:
     """Verify tools are correctly exposed by mode."""
 
-    def test_chat_mode_includes_27_tools(self) -> None:
-        """Chat mode should have 27 tools (+1 image.generate vs prior baseline)."""
+    def test_chat_mode_includes_30_tools(self) -> None:
+        """Chat mode: baseline 27 + memory.list_procedures + knowledge.lookup + consistency.check."""
         registry = get_tool_registry()
         cap = registry.list_capabilities(mode="chat", include_debug=False)
         names = {c.name for c in cap}
@@ -88,13 +90,16 @@ class TestToolVisibilityFiltering:
 
         # Should include standard tools
         assert "memory.search" in names
+        assert "memory.list_procedures" in names
+        assert "knowledge.lookup" in names
+        assert "consistency.check" in names
         assert "runtime.status" in names
         assert "system.health" in names
 
-        assert len(names) == 27, f"Chat mode has {len(names)} tools, expected 27"
+        assert len(names) == 30, f"Chat mode has {len(names)} tools, expected 30"
 
-    def test_debug_mode_includes_32_tools(self) -> None:
-        """Debug mode should have all 32 tools (includes debug-only and sensitive mutations)."""
+    def test_debug_mode_includes_35_tools(self) -> None:
+        """Debug mode: all chat tools + debug-only + sensitive mutations (+3 new capabilities)."""
         registry = get_tool_registry()
         cap = registry.list_capabilities(mode="debug", include_debug=True)
         names = {c.name for c in cap}
@@ -107,7 +112,7 @@ class TestToolVisibilityFiltering:
         assert "fs.write_file" in names, "fs.write_file should be in debug mode"
         assert "snapshot.create" in names, "snapshot.create should be in debug mode"
 
-        assert len(names) == 32, f"Debug mode has {len(names)} tools, expected 32"
+        assert len(names) == 35, f"Debug mode has {len(names)} tools, expected 35"
 
     def test_readonly_mode_respects_readonly_flag(self) -> None:
         """Readonly mode should only include read_only=True tools."""

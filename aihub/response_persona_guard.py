@@ -112,3 +112,88 @@ HELPDESK_FORBIDDEN_SUBSTRINGS = (
 def contains_helpdesk_phrase(text: str) -> bool:
     low = (text or "").lower()
     return any(p in low for p in HELPDESK_FORBIDDEN_SUBSTRINGS)
+
+
+_COT_LEAD_RE = re.compile(
+    r"(?is)^\s*("
+    r"we need to|the user (says|asks|wrote)|according to (the )?system|"
+    r"preference:|should be|let'?s|i (need|should|will)|"
+    r"looking at|based on (the )?(system|memory|instructions)|"
+    r"the system (instruction|says)|so we (need|should|are)"
+    r")\b"
+)
+_PL_CHAR_RE = re.compile(r"[ąćęłńóśźżĄĆĘŁŃÓŚŹŻ]")
+_QUOTED_CANDIDATE_RE = re.compile(r'[„"«]([^"»”]{8,280})[”"»]')
+
+
+def looks_like_reasoning_leak(text: str) -> bool:
+    raw = (text or "").strip()
+    if not raw:
+        return False
+    if _COT_LEAD_RE.search(raw):
+        return True
+    low = raw.lower()
+    markers = (
+        "we need to respond",
+        "the user says",
+        "the user asks",
+        "according to system",
+        "max 3 sentences",
+        "system instruction",
+        "provide concise",
+    )
+    hits = sum(1 for m in markers if m in low)
+    return hits >= 2
+
+
+def strip_reasoning_leak(text: str) -> tuple[str, bool]:
+    """Drop planner/CoT prose leaked into assistant content (esp. gpt-oss).
+
+    Returns (cleaned, changed). When only CoT remains without a usable reply,
+    returns empty string so upstream can treat it as empty_response / dry path.
+    """
+    raw = (text or "").strip()
+    if not raw or not looks_like_reasoning_leak(raw):
+        return text, False
+
+    # Quoted draft answer inside CoT (common gpt-oss pattern).
+    quotes = [m.group(1).strip() for m in _QUOTED_CANDIDATE_RE.finditer(raw)]
+    for q in reversed(quotes):
+        if looks_like_reasoning_leak(q):
+            continue
+        low_q = q.lower()
+        # Prefer short Polish greeting ripostes even without diacritics.
+        if any(
+            g in low_q
+            for g in ("elo", "cześć", "czesc", "hej", "siema", "mordo", "u ciebie")
+        ) and len(q.split()) <= 24:
+            return q, True
+        # Skip restated user questions — keep only draft answers.
+        if q.count("?") >= 1 and len(q.split()) <= 12 and not _PL_CHAR_RE.search(q):
+            continue
+        if q.rstrip().endswith("?") and len(q.split()) <= 10:
+            continue
+        if _PL_CHAR_RE.search(q) or any(
+            ch in low_q for ch in ("tak", "nie ", "jest ", "to ")
+        ):
+            return q, True
+
+    # Split paragraphs / sentences; keep trailing Polish-facing answer.
+    chunks = [c.strip() for c in re.split(r"\n{2,}", raw) if c.strip()]
+    if len(chunks) >= 2:
+        tail = chunks[-1]
+        if not looks_like_reasoning_leak(tail) and (
+            _PL_CHAR_RE.search(tail) or len(tail) < 400
+        ):
+            return tail, True
+
+    sentences = [s.strip() for s in _SENTENCE_SPLIT.split(raw) if s and s.strip()]
+    polishish = [
+        s
+        for s in sentences
+        if _PL_CHAR_RE.search(s) and not looks_like_reasoning_leak(s)
+    ]
+    if polishish:
+        return " ".join(polishish[-3:]).strip(), True
+
+    return "", True

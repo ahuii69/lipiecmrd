@@ -39,7 +39,7 @@ export default defineConfig({
         headless: true,
         trace: isCi ? "retain-on-failure" : "on-first-retry",
         screenshot: "only-on-failure",
-        video: realHub ? "off" : "retain-on-failure",
+        video: "off",
         viewport: { width: 1400, height: 900 },
         launchOptions: chromiumExecutable
             ? {

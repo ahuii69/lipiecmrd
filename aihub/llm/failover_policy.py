@@ -78,7 +78,7 @@ def max_retries_before_failover(exc: BaseException) -> int:
         if status in {401, 402, 403}:
             return 0
         if status == 429:
-            return 2
+            return 1
         if status in {408} or status >= 500:
             return 1
         code = str(exc.code or "").lower()

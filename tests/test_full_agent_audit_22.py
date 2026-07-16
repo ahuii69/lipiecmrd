@@ -62,7 +62,7 @@ def test_groq_rate_limit_retry_policy():
         status_code=429,
         retryable=True,
     )
-    assert max_retries_before_failover(exc) == 2
+    assert max_retries_before_failover(exc) == 1
     assert parse_retry_after(exc) is not None
     assert parse_retry_after(exc) >= 9.0
 

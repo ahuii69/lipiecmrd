@@ -88,8 +88,14 @@ def test_chat_turn_includes_writeback_fields(client):
     assert "psyche_v2_event_applied" in trace
     assert "response_outcome_quality" in trace
     
-    # Verify outcome quality is valid
-    assert trace["response_outcome_quality"] in ["success", "degraded", "fallback", "blocked"]
+    # Verify outcome quality is valid (provider_failure_fallback when all LLM providers fail)
+    assert trace["response_outcome_quality"] in [
+        "success",
+        "degraded",
+        "fallback",
+        "blocked",
+        "provider_failure_fallback",
+    ]
 
 
 def test_agent_run_writeback_success_creates_memory(client):

@@ -107,10 +107,22 @@ def _run_once(users: Iterable[str] | None = None) -> dict[str, dict[str, object]
                     decay_exc,
                     exc_info=True,
                 )
+            procedures_extracted = 0
+            try:
+                procs = core.v2_extract_procedures(user_id)
+                procedures_extracted = len(procs or [])
+            except Exception as proc_exc:  # noqa: BLE001
+                log.debug(
+                    "Memory V2 procedural extraction failed for user_id=%s: %s",
+                    user_id,
+                    proc_exc,
+                    exc_info=True,
+                )
             out[user_id] = {
                 "consolidation": consolidation,
                 "forgetting": forgetting,
                 "decay_updated": decay_updated,
+                "procedures_extracted": procedures_extracted,
                 "suppress_threshold": threshold,
             }
         except Exception as exc:  # noqa: BLE001

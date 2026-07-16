@@ -94,6 +94,18 @@ class ChatTurnApplicationService:
         )
         if gate["action"] == "reuse":
             cached = gate.get("result") or {}
+            if isinstance(cached, dict):
+                # Stamp honest replay markers on idempotent reuse (no new provider/write-back).
+                trace_cached = cached.get("trace")
+                if not isinstance(trace_cached, dict):
+                    trace_cached = {}
+                    cached["trace"] = trace_cached
+                trace_cached["replay_mode"] = True
+                trace_cached["idempotent_replay"] = True
+                trace_cached["idempotency_hit"] = True
+                trace_cached["provider_attempt_count"] = 0
+                # Keep historical attempts for diagnostics but mark as not re-executed.
+                trace_cached["provider_attempts_replay_suppressed"] = True
             return ChatTurnResult.model_validate(cached)
         if gate["action"] == "conflict":
             raise TurnConflictError(turn_id=str(gate.get("turn_id") or ctx.turn_id))

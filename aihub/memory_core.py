@@ -196,6 +196,10 @@ class MemoryCanonicalCore:
     def v2_list_procedures(self, user_id: str, limit: int):
         return self._v2.list_procedures(user_id, limit=limit)
 
+    def v2_extract_procedures(self, user_id: str):
+        """Run procedural learning from experiences and persist new procedures."""
+        return self._v2.extract_procedures(user_id)
+
     def v2_list_contradictions(self, user_id: str, limit: int):
         return self._v2.list_contradicted_memories(user_id, limit=limit)
 

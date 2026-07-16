@@ -670,6 +670,12 @@ class PromptContextMixin:
             cleaned, changed = sanitize_persona_leakage(
                 res.response_text, user_message=turn.message
             )
+            cot_cleaned, cot_changed = strip_reasoning_leak(cleaned)
+            if cot_changed:
+                cleaned = cot_cleaned
+                changed = True
+                if isinstance(res.trace, dict):
+                    res.trace["reasoning_leak_sanitized"] = True
             if changed:
                 dry_marker = "model nie oddał treści"
                 if cleaned and dry_marker in cleaned.lower():
@@ -680,6 +686,15 @@ class PromptContextMixin:
                         res.ok = False
                         if isinstance(res.trace, dict):
                             res.trace["persona_guard_empty_after_sanitize"] = True
+                elif not cleaned:
+                    web_fallback = TurnOps._web_synthesis_from_tool_results(res)
+                    if web_fallback:
+                        cleaned = web_fallback
+                    else:
+                        cleaned = dry_fallback_response(user_message=turn.message)
+                        res.ok = False
+                        if isinstance(res.trace, dict):
+                            res.trace["reasoning_leak_empty_after_sanitize"] = True
                 res.response_text = cleaned
                 if isinstance(res.trace, dict):
                     res.trace["persona_leakage_sanitized"] = True

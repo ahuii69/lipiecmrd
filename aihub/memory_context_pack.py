@@ -190,20 +190,31 @@ def memory_contradicts_correction_hints(content: str, correction_hints: str) -> 
         return False
     h_likes, h_dislikes = _extract_pl_preferences(correction_hints)
     c_likes, c_dislikes = _extract_pl_preferences(content)
-    if not h_likes and not h_dislikes:
-        return False
-    for stem in h_likes:
-        if stem and stem in c_dislikes:
+    if h_likes or h_dislikes:
+        for stem in h_likes:
+            if stem and stem in c_dislikes:
+                return True
+        for stem in h_dislikes:
+            if stem and stem in c_likes:
+                return True
+        # Explicit negation flip on shared token (e.g. burz*).
+        if h_likes and c_dislikes:
+            for hs in h_likes:
+                for cs in c_dislikes:
+                    if hs[:4] and hs[:4] == cs[:4]:
+                        return True
+    # Numeric/fact supersession: "korekta … 8080, nie 9000" vs stale "… 9000".
+    import re as _re
+
+    hint_l = " ".join((correction_hints or "").lower().split())
+    cont_l = " ".join((content or "").lower().split())
+    if any(k in hint_l for k in ("korekta", "poprawka", "sprostowanie")) or " nie " in f" {hint_l} ":
+        negated = set(_re.findall(r"\bnie\s+(\d+(?:\.\d+)?)\b", hint_l))
+        all_nums = _re.findall(r"\d+(?:\.\d+)?", hint_l)
+        affirmed = {n for n in all_nums if n not in negated}
+        cont_nums = set(_re.findall(r"\d+(?:\.\d+)?", cont_l))
+        if negated and (cont_nums & negated) and not (cont_nums & affirmed):
             return True
-    for stem in h_dislikes:
-        if stem and stem in c_likes:
-            return True
-    # Explicit negation flip on shared token (e.g. burz*).
-    if h_likes and c_dislikes:
-        for hs in h_likes:
-            for cs in c_dislikes:
-                if hs[:4] and hs[:4] == cs[:4]:
-                    return True
     return False
 
 

@@ -789,11 +789,26 @@ class PipelineMixin:
                         g['decision_core'].get('self_model_influenced_strategy')
                         or g['decision_core'].get('learning_strategy_bias')
                     )
-                    g['trace']['planner_learning_applied'] = bool(g['decision_core'].get('planner_recommended'))
+                    g['trace']['planner_learning_applied'] = any(
+                        str(c).upper().startswith('LEARN_') and 'PLAN' in str(c).upper()
+                        for c in (g['decision_core'].get('reason_codes') or [])
+                    ) or bool(g['decision_core'].get('learning_planner_bias'))
                     g['trace']['provider_learning_applied'] = bool(g['decision_core'].get('provider_learning_preference'))
                     g['trace']['tool_learning_applied'] = 'LEARN_TOOL_ORDER_METRICS' in list(g['decision_core'].get('reason_codes') or [])
                     g['trace']['research_learning_applied'] = bool(g['trace'].get('research_query_variants'))
                     g['trace']['self_model_influenced_strategy'] = bool(g['decision_core'].get('self_model_influenced_strategy'))
+                    # Honest cross-module influence (strategy → response when LLM completed)
+                    for g['_ik'] in (
+                        'simulation_affected_strategy',
+                        'simulation_affected_response',
+                        'policy_feedback_affected_strategy',
+                        'policy_feedback_affected_response',
+                        'cognitive_integration_happened',
+                        'cognitive_integration_affected_strategy',
+                        'cognitive_integration_affected_response',
+                    ):
+                        if g['_ik'] in g['decision_core']:
+                            g['trace'][g['_ik']] = bool(g['decision_core'].get(g['_ik']))
                     g['trace']['confidence_raw'] = g['decision_core'].get('strategy_confidence_raw')
                     g['trace']['confidence_calibrated'] = g['decision_core'].get('strategy_confidence')
                     g['trace']['confidence_calibration_delta'] = g['decision_core'].get('confidence_calibration_delta')
@@ -803,6 +818,33 @@ class PipelineMixin:
                     logger.debug('adaptive learning write-back skipped: %s', learn_err, exc_info=True)
                     g['trace']['learning_degraded'] = True
                     g['trace']['outcome_evaluation_happened'] = False
+                # Procedural extraction (value was previously API-only / never scheduled)
+                try:
+                    msg_l = (g['turn'].message or '').lower()
+                    procedural_cue = any(
+                        k in msg_l
+                        for k in (
+                            'zrób tak',
+                            'zawsze',
+                            'procedure',
+                            'krok po kroku',
+                            'workflow',
+                            'sposób:',
+                            'od teraz',
+                        )
+                    )
+                    if procedural_cue or (
+                        g['memory_v2_snapshot'].get('procedures_count', 0) == 0
+                        and g['memory_v2_snapshot'].get('match_count', 0) >= 3
+                    ):
+                        g['_procs'] = get_memory_core().v2_extract_procedures(g['turn'].user_id)
+                        g['trace']['procedural_extraction_ran'] = True
+                        g['trace']['procedural_extraction_count'] = len(g['_procs'] or [])
+                    else:
+                        g['trace']['procedural_extraction_ran'] = False
+                except Exception as proc_err:
+                    logger.debug('procedural extraction skipped: %s', proc_err, exc_info=True)
+                    g['trace']['procedural_extraction_ran'] = False
                 # World knowledge write-back (claims/evidence/entities) + trace
                 try:
                     from aihub.world_knowledge import process_turn_knowledge, knowledge_trace_fields
@@ -830,8 +872,12 @@ class PipelineMixin:
                         g['trace']['graph_influenced_planner'] = True
                     if g['decision_core'].get('execution_graph_id'):
                         g['trace']['execution_graph_id'] = g['decision_core'].get('execution_graph_id')
+                    # Response influence: claims were injected into prompt (knowledge_decision present).
+                    _kd = (g.get('ctx') and getattr(g['ctx'], 'system_context', None) or {})
+                    _claims = ((g['decision_core'].get('knowledge_context') or {}).get('claims') or [])
                     g['trace']['graph_influenced_response'] = bool(
-                        (g['decision_core'].get('knowledge_context') or {}).get('claims')
+                        g['decision_core'].get('graph_influenced_strategy')
+                        or (isinstance(_kd, dict) and _kd.get('knowledge_decision') and _claims)
                     )
                 except Exception as wk_err:
                     logger.debug('world knowledge write-back skipped: %s', wk_err, exc_info=True)

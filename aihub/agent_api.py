@@ -252,15 +252,48 @@ async def tick(
 
 @router.post("/run", response_model=AgentCycleResponse)
 async def agent_run(data: dict, response: Response) -> AgentCycleResponse:
+    """Canonical agent run — shares ExecutiveController via ``agent_runner`` when possible."""
     text = data.get("text", "")
     user_id = data.get("user_id", "default")
     include_debug = bool(data.get("include_debug", False))
     fs = str(data.get("force_strategy", "") or "").strip()
+    dry_run = bool(data.get("dry_run", False))
+    stamp_agent_endpoint(
+        response, role=ROLE_AGENT_CANONICAL_RUN, canonical_flow=FLOW_RUN
+    )
+    # Sync/async adapter shares one controller path (value previously unused outside this module).
+    if not fs and not dry_run:
+        from aihub.agent_runner import run_agent_async
+
+        wrapped = await run_agent_async(
+            text=text,
+            user_id=user_id,
+            max_steps=int(data.get("max_steps", 8)),
+            timeout_seconds=float(data.get("timeout_seconds", 20.0)),
+        )
+        payload = wrapped.get("result") if isinstance(wrapped.get("result"), dict) else {}
+        if include_debug and isinstance(payload, dict):
+            payload = {
+                **payload,
+                "debug": {
+                    **(payload.get("debug") or {}),
+                    "runner": "agent_runner",
+                    "vector_memory": wrapped.get("vector_memory"),
+                },
+            }
+        try:
+            return AgentCycleResponse(**payload)
+        except Exception as shape_exc:
+            import logging
+
+            logging.getLogger(__name__).debug(
+                "agent_runner payload shape fallback: %s", shape_exc
+            )
     ev: dict[str, Any] = {
         "text": text,
         "max_steps": int(data.get("max_steps", 8)),
         "timeout_seconds": float(data.get("timeout_seconds", 20.0)),
-        "dry_run": bool(data.get("dry_run", False)),
+        "dry_run": dry_run,
     }
     if fs:
         ev["force_strategy"] = fs
@@ -269,9 +302,6 @@ async def agent_run(data: dict, response: Response) -> AgentCycleResponse:
         ev,
         mode="run",
         user_id=user_id,
-    )
-    stamp_agent_endpoint(
-        response, role=ROLE_AGENT_CANONICAL_RUN, canonical_flow=FLOW_RUN
     )
     return AgentCycleResponse(
         **build_agent_cycle_response(cycle, include_debug=include_debug)

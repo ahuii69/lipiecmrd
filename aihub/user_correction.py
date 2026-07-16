@@ -17,6 +17,8 @@ _STRONG_PATTERNS: list[tuple[str, str]] = [
         r"(?iu)^nie\s*,.*\b(lubi|nie\s+lubi|nazywa\s+się|nazywa\s+sie)\b",
         "factual",
     ),
+    (r"(?iu)\b(korekta|poprawka|sprostowanie)\b", "factual"),
+    (r"(?iu)\bto\s+nie\s+\d|\bnie\s+\d{2,}", "factual"),
     (r"nie\s+o\s+to\s+chodzi", "negative"),
     (r"nie\s+o\s+to\s*$", "negative"),
     (r"chodziło\s+o|chodzilo\s+o|miałem\s+na\s+myśli|miałam\s+na\s+myśli|"
@@ -65,8 +67,11 @@ def detect_user_correction(message: str) -> dict[str, Any] | None:
 
     durable = bool(_DURABLE_MARKERS.search(raw))
     if kind == "factual" and re.search(
-        r"(?iu)\b(lubi|nie\s+lubi|nazywa|pies|kot|preferuj)\b", raw
+        r"(?iu)\b(lubi|nie\s+lubi|nazywa|pies|kot|preferuj|port|adres|ip|korekta|poprawka)\b",
+        raw,
     ):
+        durable = True
+    if kind == "factual" and re.search(r"(?iu)\bkorekta\b|\bpoprawka\b", raw):
         durable = True
     # Krótka, jednozdaniowa korekta stylu często jest „regułą” na przyszłość
     if kind == "style" and len(raw) < 160 and not durable:

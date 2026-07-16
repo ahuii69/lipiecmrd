@@ -1170,5 +1170,42 @@ class ExperienceMixin:
                     anti_hallucination_trace["applied"] = True
                     anti_hallucination_trace["reason"] = clamp_reason
 
+        # No silent "Źródło: https://..." when web was not actually used this turn.
+        text_l = text.lower()
+        if (
+            not used_fallback
+            and grounding_mode
+            not in {
+                "tool_verified",
+                "web_verified",
+                "fallback",
+                "deterministic_memory_fact",
+            }
+            and ("http://" in text_l or "https://" in text_l)
+        ):
+            web_ok = False
+            try:
+                if isinstance(getattr(ctx, "system_context", None), dict):
+                    web_ok = bool((ctx.system_context or {}).get("web_used"))
+            except Exception:
+                web_ok = False
+            if not web_ok:
+                cleaned_lines = []
+                for line in text.splitlines():
+                    low = line.lower()
+                    if ("źródło" in low or "source" in low) and (
+                        "http://" in low or "https://" in low
+                    ):
+                        continue
+                    cleaned_lines.append(line)
+                new_text = "\n".join(cleaned_lines).strip()
+                if new_text and new_text != text.strip():
+                    text = (
+                        new_text
+                        + "\n\n(Brak zweryfikowanego źródła web w tej turze — nie podaję linków na ślepo.)"
+                    )
+                    if anti_hallucination_trace is not None:
+                        anti_hallucination_trace["unverified_web_citation_stripped"] = True
+
         return text
 

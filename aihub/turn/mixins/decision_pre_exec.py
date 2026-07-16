@@ -458,4 +458,29 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
         )
     result['strategy_adjustment_log'] = log_entries
     result['selected_strategy'] = final
+    # Honest influence flags (strategy-level; response-level set later if prompt/LLM used them).
+    codes_u = [str(c).upper() for c in (result.get('reason_codes') or [])]
+    result['simulation_affected_strategy'] = 'SIMULATION_OVERRIDE' in codes_u
+    result['simulation_affected_response'] = bool(result.get('simulation_affected_strategy'))
+    result['policy_feedback_affected_strategy'] = bool(result.get('policy_feedback_applied'))
+    result['policy_feedback_affected_response'] = bool(
+        result.get('policy_feedback_applied') and final != base
+    )
+    cog_codes = [c for c in codes_u if c.startswith('COG_') or 'COGNITIVE' in c]
+    result['cognitive_integration_happened'] = bool(
+        result.get('cognitive_integration_happened')
+        or cog_codes
+        or (isinstance(ctx.system_context, dict) and ctx.system_context.get('cognitive_obj') is not None)
+    )
+    result['cognitive_integration_affected_strategy'] = bool(cog_codes) or any(
+        e.get('source') == 'cognitive' for e in log_entries
+    )
+    result['cognitive_integration_affected_response'] = bool(
+        result.get('cognitive_integration_affected_strategy')
+    )
+    result['graph_influenced_response'] = bool(
+        result.get('graph_influenced_strategy')
+        or result.get('graph_influenced_planner')
+        or ((result.get('knowledge_context') or {}).get('claims'))
+    )
     return result

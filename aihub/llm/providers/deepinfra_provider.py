@@ -176,6 +176,14 @@ class DeepInfraProvider(BaseProvider):
                     return text
         return ""
 
+    @classmethod
+    def _prefer_final_answer(cls, text: str) -> str:
+        """If blob looks like planner CoT, keep only a concrete final answer when present."""
+        from aihub.response_persona_guard import strip_reasoning_leak
+
+        cleaned, _changed = strip_reasoning_leak(text or "")
+        return cleaned
+
     def _parse_model_response(
         self,
         *,
@@ -197,14 +205,23 @@ class DeepInfraProvider(BaseProvider):
         first: Dict[str, Any] = first_raw if isinstance(first_raw, dict) else {}
         message_raw = first.get("message")
         message: Dict[str, Any] = message_raw if isinstance(message_raw, dict) else {}
+        # Prefer visible assistant content only. Do not promote raw `reasoning`
+        # fields to user-facing text (gpt-oss / open-weight planner dumps).
         content = (
             self._extract_text_content(message.get("content"))
             or self._extract_text_content(message.get("output_text"))
-            or self._extract_text_content(message.get("reasoning"))
             or self._extract_text_content(first.get("text"))
             or self._extract_text_content(data.get("output_text"))
             or self._extract_text_content(data.get("output"))
         )
+        content = self._prefer_final_answer(content)
+        if not content.strip():
+            # Last resort only when provider put the entire answer in reasoning.
+            reasoning_blob = (
+                self._extract_text_content(message.get("reasoning"))
+                or self._extract_text_content(message.get("reasoning_content"))
+            )
+            content = self._prefer_final_answer(reasoning_blob)
         finish_reason = str(first.get("finish_reason") or "stop")
 
         tool_calls: List[ToolCallRequest] = []
@@ -451,7 +468,9 @@ class DeepInfraProvider(BaseProvider):
         }
         if request.max_tokens is not None:
             if self._use_max_completion_tokens:
-                payload["max_completion_tokens"] = int(request.max_tokens)
+                # gpt-oss spends completion budget on hidden reasoning first —
+                # a too-low floor returns planning prose instead of the answer.
+                payload["max_completion_tokens"] = max(int(request.max_tokens), 768)
             else:
                 payload["max_tokens"] = int(request.max_tokens)
         elif self._use_max_completion_tokens:

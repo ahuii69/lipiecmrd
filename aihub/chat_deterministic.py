@@ -215,18 +215,40 @@ def _collect_memory_fact_candidates(
     """(score, content) z L1/L2, STM user, V2, dense, graph — posortowane malejąco po score."""
     qn = _norm_text(query_text)
     pairs: list[tuple[float, str]] = []
+
+    def _skip_status(it: dict) -> bool:
+        st = str(
+            it.get("status")
+            or it.get("lifecycle_status")
+            or it.get("claim_status")
+            or ""
+        ).lower()
+        return st in {"superseded", "archived", "revoked", "invalid", "deleted"}
+
+    def _correction_boost(text: str) -> float:
+        low = (text or "").lower()
+        boost = 0.0
+        if any(k in low for k in ("korekta", "poprawka", "aktualnie", "od teraz", "nie ")):
+            boost += 0.42
+        if "supersed" in low:
+            boost += 0.2
+        return boost
+
     for key in ("episodic", "semantic"):
         for it in mem_ctx.get(key) or []:
             if not isinstance(it, dict):
+                continue
+            if _skip_status(it):
                 continue
             c = str(it.get("content") or "").strip()
             if len(c) < 3 or is_junk_memory_content(c, query=query_text):
                 continue
             if qn and _norm_text(c) == qn:
                 continue
-            sc = float(it.get("score") or 0.0)
+            sc = float(it.get("score") or 0.0) + _correction_boost(c)
             pairs.append((sc, c))
-    for it in mem_ctx.get("stm") or []:
+    stm_items = list(mem_ctx.get("stm") or [])
+    for idx, it in enumerate(stm_items):
         if not isinstance(it, dict):
             continue
         if str(it.get("role") or "") != "user":
@@ -236,9 +258,13 @@ def _collect_memory_fact_candidates(
             continue
         if qn and _norm_text(c) == qn:
             continue
-        pairs.append((0.18, c))
+        # Later STM messages outrank earlier ones; corrections win harder.
+        sc = 0.18 + 0.02 * idx + _correction_boost(c)
+        pairs.append((sc, c))
     for it in mem_ctx.get("memory_v2_items") or []:
         if not isinstance(it, dict):
+            continue
+        if _skip_status(it):
             continue
         c = str(it.get("content") or "").strip()
         if len(c) < 3 or is_junk_memory_content(c, query=query_text):
@@ -253,9 +279,12 @@ def _collect_memory_fact_candidates(
         )
         if sc <= 0:
             sc = 0.35
+        sc += _correction_boost(c)
         pairs.append((sc, c))
     for it in mem_ctx.get("dense_hits") or []:
         if not isinstance(it, dict):
+            continue
+        if _skip_status(it):
             continue
         c = str(it.get("text") or "").strip()
         if len(c) < 3 or is_junk_memory_content(c, query=query_text):
@@ -263,9 +292,11 @@ def _collect_memory_fact_candidates(
         if qn and _norm_text(c) == qn:
             continue
         sim = float(it.get("similarity") or 0.0)
-        pairs.append((max(0.15, min(0.95, sim)), c))
+        pairs.append((max(0.15, min(0.95, sim)) + _correction_boost(c), c))
     for it in mem_ctx.get("graph_hits") or []:
         if not isinstance(it, dict):
+            continue
+        if _skip_status(it):
             continue
         c = str(it.get("content") or "").strip()
         if len(c) < 3 or is_junk_memory_content(c, query=query_text):
@@ -273,7 +304,7 @@ def _collect_memory_fact_candidates(
         if qn and _norm_text(c) == qn:
             continue
         conf = float(it.get("confidence") or 0.5)
-        pairs.append((max(0.12, min(0.9, conf)), c))
+        pairs.append((max(0.12, min(0.9, conf)) + _correction_boost(c), c))
     pairs.sort(key=lambda x: -x[0])
     return pairs
 
@@ -336,7 +367,23 @@ def _pick_dominant_memory_snippet(
         return None, "no_candidates"
     if len(uniq) == 1:
         return uniq[0][1], "single_distinct_hit"
+
+    def _corr(s: str) -> bool:
+        low = (s or "").lower()
+        return any(k in low for k in ("korekta", "poprawka", "aktualnie", " od teraz", "nie "))
+
+    # Prefer explicit corrections over older conflicting facts.
     top_sc, top_c = uniq[0]
+    for sc, c in uniq[1:6]:
+        if not _corr(c):
+            continue
+        top_digits = set(re.findall(r"\d+(?:\.\d+)?", top_c))
+        corr_digits = set(re.findall(r"\d+(?:\.\d+)?", c))
+        if corr_digits and top_digits and corr_digits != top_digits and not _corr(top_c):
+            return c, "correction_supersedes_conflicting_fact"
+        if _corr(c) and sc >= top_sc * 0.55 and not _corr(top_c):
+            return c, "correction_preferred"
+
     second_sc, _second_c = uniq[1]
     if top_sc >= _DOMINANT_STRONG_SCORE:
         return top_c, "strong_top_score"
@@ -434,6 +481,34 @@ def try_memory_fact_read_turn(
     snippet, pick_reason = _pick_dominant_memory_snippet(mem_ctx, msg)
     if not snippet:
         return None
+    # Corrections must win over stale deterministic short-circuits.
+    try:
+        from aihub.memory_context_pack import memory_contradicts_correction_hints
+        from aihub.user_correction import build_correction_hints_for_prompt
+
+        hints = build_correction_hints_for_prompt(
+            str(getattr(turn, "user_id", "") or ""),
+            str(getattr(turn, "session_id", "") or ""),
+        )
+        if hints and memory_contradicts_correction_hints(snippet, hints):
+            alt = None
+            for _sc, cand in _collect_memory_fact_candidates(mem_ctx, msg)[:16]:
+                if memory_contradicts_correction_hints(cand, hints):
+                    continue
+                alt = cand
+                if any(k in cand.lower() for k in ("korekta", "poprawka")):
+                    break
+            if alt:
+                snippet = alt
+                pick_reason = "correction_hints_override"
+            else:
+                return None
+    except Exception as corr_exc:
+        import logging
+
+        logging.getLogger(__name__).debug(
+            "memory fact correction override skipped: %s", corr_exc
+        )
     if is_junk_memory_content(snippet, query=msg):
         return None
     if _RE_EPISODE_QA_ECHO.search(snippet) or "||" in snippet or snippet.strip().startswith("U:"):
