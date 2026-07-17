@@ -168,15 +168,24 @@ class TestStrategySelector:
         )
 
     def test_select_strategy_agentic_with_active_goals(self) -> None:
-        """Active goals trigger agentic strategy."""
+        """Active goals escalate only when the utterance engages the tracked task."""
         selection = select_strategy(
             user_id="test_user",
-            user_text="Execute the plan",
+            user_text="Jaki jest aktualny stan zadania i co jest następnym krokiem?",
             mode="run",
             active_goals_summary={"active_count": 1, "max_urgency": 0.9},
         )
         assert selection.agentic_recommended is True
         assert "ACTIVE_GOAL_PRESENT" in selection.reason_codes
+
+        unrelated = select_strategy(
+            user_id="test_user",
+            user_text="Backend zwraca 502. Jak mam to zdebugować?",
+            mode="run",
+            active_goals_summary={"active_count": 1, "max_urgency": 0.9},
+        )
+        assert unrelated.selected_strategy != "agentic"
+        assert "ACTIVE_GOAL_PRESENT" in unrelated.reason_codes
 
     def test_strategy_selection_has_confidence(self) -> None:
         """Strategy selection includes confidence score."""

@@ -192,6 +192,36 @@ class DecisionMixin:
                 f"web_decision={web_decision}_overrides_handoff(strategy={strategy})",
             )
 
+        # Plan-only asks stay on chat LLM (agentic budget + planner hints) so the
+        # user receives a real written plan, not an executive telemetry stub.
+        message_lower_early = (message or "").lower()
+        exec_force = any(
+            x in message_lower_early
+            for x in (
+                "wykonaj teraz",
+                "wykonaj migracj",
+                "zrób migracj",
+                "zrob migracj",
+                "odpal migracj",
+            )
+        )
+        plan_only = (not exec_force) and any(
+            x in message_lower_early
+            for x in (
+                "niczego nie wykonuj",
+                "nie wykonuj",
+                "tylko plan",
+                "bez wykonywania",
+                "don't execute",
+                "do not execute",
+                "napisz plan",
+                "rozpisz plan",
+                "wygeneruj plan",
+            )
+        )
+        if plan_only:
+            return False, "plan_only_chat_path"
+
         # Agentic → executive agent runtime by default (planner+reasoning), unless
         # web/research keeps chat tools, or policy/experience strongly vetoes handoff.
         if strategy == "agentic" and not web_overrides_handoff:

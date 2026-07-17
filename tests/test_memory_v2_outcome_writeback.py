@@ -198,13 +198,20 @@ def test_record_chat_outcome_memory_reinforcement(setup_db):
 
     assert result["attempted"] is True
     assert result["succeeded"] is True
-    assert result["new_items_count"] > 0
-    assert result["writeback_kind"] == "memory_reinforcement"
+    # Soft reinforcement: do NOT create "Memory-guided response" pollution items.
+    assert result.get("new_items_count", 0) == 0
+    assert result["writeback_kind"] in (
+        "memory_reinforcement",
+        "memory_reinforcement_soft",
+    )
 
-    # Verify preference item
+    # Preference pollution items must not appear.
     items = search_memory_items(user_id=user_id, memory_types=["preference"], limit=10)
-    assert len(items) > 0
-    assert any("context" in item.content.lower() or "memories" in item.content.lower() for item in items)
+    assert not any(
+        "memory-guided" in (item.content or "").lower()
+        or "memory guided" in (item.content or "").lower()
+        for item in items
+    )
 
 
 def test_record_chat_outcome_fallback(setup_db):

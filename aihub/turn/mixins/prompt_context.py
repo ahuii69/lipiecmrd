@@ -358,10 +358,46 @@ class PromptContextMixin:
                 r"(?iu)\b(mecz|wynik|liga|news|cena|kurs)\b", lower
             ):
                 freshness_needed = False
-        from aihub.strategy_selector import _LOCAL_INFRA_NO_WEB
+        from aihub.strategy_selector import (
+            _IMPERATIVE_NOW_NO_WEB,
+            _LOCAL_INFRA_NO_WEB,
+            _explicit_check_intent,
+            local_howto_no_web_intent,
+        )
+        from aihub.turn.prompt_budget import (
+            looks_correction,
+            looks_procedural,
+            looks_remember,
+        )
 
-        if _LOCAL_INFRA_NO_WEB.search(msg):
+        if _LOCAL_INFRA_NO_WEB.search(msg) or local_howto_no_web_intent(msg):
             freshness_needed = False
+        # Durable preference / procedure / remember writes are not web lookups.
+        if looks_procedural(msg) or looks_correction(msg) or looks_remember(msg):
+            freshness_needed = False
+        # "sprawdzenie" noun / local howto must not trip sprawdz* freshness.
+        if freshness_needed and not _explicit_check_intent(lower, ascii_l):
+            # Drop bare check-stem hits that word-boundary already excluded; keep other markers.
+            check_only = any(
+                _keyword_in_text(tok, lower, ascii_l)
+                for tok in ("sprawdź", "sprawdz", "zbadaj")
+            )
+            other = any(
+                _keyword_in_text(tok, lower, ascii_l)
+                for tok in WEB_REQUIRED_QUERY_KEYWORDS
+                if tok not in {"sprawdź", "sprawdz", "zbadaj"}
+            )
+            if check_only and not other:
+                freshness_needed = False
+        # Imperative "wykonaj teraz" is not a freshness query unless another marker remains.
+        if freshness_needed and _IMPERATIVE_NOW_NO_WEB.search(msg):
+            other = any(
+                _keyword_in_text(tok, lower, ascii_l)
+                for tok in WEB_REQUIRED_QUERY_KEYWORDS
+                if tok != "teraz"
+            )
+            if not other:
+                freshness_needed = False
         # An attached image/file makes the turn about that attachment; do not force web
         # research on top of it (the vision/description path must win).
         if freshness_needed and not has_attachments and not pragmatics_blocks_freshness:
@@ -517,11 +553,13 @@ class PromptContextMixin:
             is_assistant_meta_ask,
             meta_ask_refers_to_prior_conversation,
         )
+        from aihub.turn.prompt_budget import is_casual_smalltalk
 
         pure_meta = is_assistant_meta_ask(turn.message or "") and not meta_ask_refers_to_prior_conversation(
             turn.message or ""
         )
         meta_ask = is_assistant_meta_ask(turn.message or "")
+        casual = is_casual_smalltalk(turn.message or "")
         system_context: dict[str, Any] = {
             "tool_calling_enabled": LLM_TOOL_CALLING_ENABLED,
             "streaming_enabled": LLM_STREAMING_ENABLED,
@@ -529,9 +567,11 @@ class PromptContextMixin:
             "correction_hints_text": hints,
             "assistant_meta_ask": meta_ask,
             "assistant_meta_ask_pure": pure_meta,
+            "casual_smalltalk": casual,
         }
-        if pure_meta:
-            # Hard cost budget: zero retrieval / zero memory pack for pure identity asks.
+        if pure_meta or casual or meta_ask:
+            # Meta (incl. prior-ref) and casual: zero vector / Memory V2 pack.
+            # Prior-ref continuity comes from clipped chat history, not retrieval.
             mem_ctx: dict[str, Any] = {
                 "stm": [],
                 "semantic": [],
@@ -542,7 +582,8 @@ class PromptContextMixin:
                 "total": 0,
                 "memory_lookup_skipped": True,
                 "memory_lookup_happened": False,
-                "meta_ask_lightweight": True,
+                "meta_ask_lightweight": bool(meta_ask),
+                "casual_light_lightweight": bool(casual),
             }
             system_context["memory_context_pack"] = {
                 "selected_ids": [],
@@ -553,16 +594,23 @@ class PromptContextMixin:
             system_context["memory_context_pack_trace"] = {
                 "selected_count": 0,
                 "used_chars": 0,
-                "skipped": "META_ASK_MEMORY_SKIPPED",
+                "skipped": (
+                    "CASUAL_LIGHT_MEMORY_SKIPPED"
+                    if casual and not meta_ask
+                    else "META_ASK_MEMORY_SKIPPED"
+                ),
             }
-            system_context["META_ASK_MEMORY_SKIPPED"] = True
+            if meta_ask:
+                system_context["META_ASK_MEMORY_SKIPPED"] = True
+            if casual:
+                system_context["CASUAL_LIGHT_MEMORY_SKIPPED"] = True
         else:
             mem_ctx = retrieve_context(turn.user_id, turn.message, limit=6)
             try:
                 from aihub.memory_core import get_memory_core
 
-                pack_limit = 4 if meta_ask else 8
-                pack_chars = 1200 if meta_ask else 2400
+                pack_limit = 4 if meta_ask else 6
+                pack_chars = 1200 if meta_ask else 1800
                 pack = get_memory_core().build_context_pack(
                     turn.user_id,
                     turn.message,

@@ -28,7 +28,9 @@ from aihub.psyche_core import get_psyche_core
 logger = logging.getLogger(__name__)
 
 # Optional aggregation backends: failures are soft (Brave remains primary when configured).
-_OPTIONAL_RESEARCH_BACKENDS = frozenset({"Wikipedia", "DuckDuckGo", "Frankfurter"})
+_OPTIONAL_RESEARCH_BACKENDS = frozenset(
+    {"Wikipedia", "DuckDuckGo", "Frankfurter", "OpenMeteo", "PyPI", "EndOfLife"}
+)
 
 
 def _optional_research_backends_enabled() -> bool:
@@ -82,6 +84,13 @@ def _research_query_variants(query: str) -> List[str]:
                 "Euro Polish zloty exchange rate today",
             ]
         )
+    if "pogoda" in ql or "weather" in ql:
+        if "warszaw" in ql or "warsaw" in ql:
+            variants.extend(["Warsaw weather now", "pogoda Warszawa"])
+        else:
+            variants.append("current weather")
+    if "fastapi" in ql and ("release" in ql or "wersj" in ql or "najnow" in ql or "stabil"):
+        variants.extend(["FastAPI latest release PyPI", "fastapi pypi version"])
     seen: set[str] = set()
     out: List[str] = []
     for v in variants:
@@ -97,6 +106,36 @@ def _fx_pair_from_query(query: str) -> tuple[str, str] | None:
     if ("eur" in ql or "euro" in ql) and ("pln" in ql or "złot" in ql or "zlot" in ql):
         return "EUR", "PLN"
     return None
+
+
+def _weather_location_from_query(query: str) -> tuple[float, float, str] | None:
+    """Return (lat, lon, label) for known cities; default None."""
+    ql = query.lower()
+    if "pogoda" not in ql and "weather" not in ql:
+        return None
+    if "warszaw" in ql or "warsaw" in ql:
+        return 52.2297, 21.0122, "Warsaw"
+    return None
+
+
+def _pypi_package_from_query(query: str) -> str | None:
+    ql = query.lower()
+    # FastAPI / package release lookups
+    m = re.search(r"\b([a-z0-9][a-z0-9_.-]{1,40})\b", ql)
+    if "fastapi" in ql and (
+        "release" in ql or "wersj" in ql or "najnow" in ql or "stabil" in ql or "pypi" in ql
+    ):
+        return "fastapi"
+    if m and "pypi" in ql:
+        return m.group(1)
+    return None
+
+
+def _python_version_intent(query: str) -> bool:
+    ql = query.lower()
+    return "python" in ql and (
+        "wersj" in ql or "stable" in ql or "najnow" in ql or "aktualn" in ql
+    )
 
 
 # ---- Hardening constants ----
@@ -514,6 +553,15 @@ class ResearchEngine:
             if _fx_pair_from_query(query):
                 tasks.append(asyncio.to_thread(self._fetch_frankfurter_fx, query))
                 names.append("Frankfurter")
+            if _weather_location_from_query(query):
+                tasks.append(asyncio.to_thread(self._fetch_open_meteo, query))
+                names.append("OpenMeteo")
+            if _pypi_package_from_query(query):
+                tasks.append(asyncio.to_thread(self._fetch_pypi, query))
+                names.append("PyPI")
+            if _python_version_intent(query):
+                tasks.append(asyncio.to_thread(self._fetch_python_endoflife, query))
+                names.append("EndOfLife")
 
         if not tasks:
             logger.info(
@@ -548,7 +596,20 @@ class ResearchEngine:
             logger.info(
                 "ResearchEngine: no results from any source for query=%s", query
             )
-        return results
+            return results
+        # Prefer specialist backends (fresh structured facts) ahead of generic SERP noise.
+        _prio = {
+            "frankfurter": 0,
+            "open_meteo": 0,
+            "pypi": 0,
+            "endoflife": 0,
+            "brave": 1,
+            "wikipedia": 2,
+            "duckduckgo": 3,
+            "duckduckgo_html": 3,
+        }
+        results.sort(key=lambda r: _prio.get(str((r or {}).get("source") or ""), 9))
+        return results[:8]
 
     # ------ real search backends ------
 
@@ -689,6 +750,138 @@ class ResearchEngine:
                 )
         except httpx.HTTPError as exc:
             logger.debug("Frankfurter FX fetch failed: %s", exc)
+        return out
+
+    def _fetch_open_meteo(self, query: str) -> List[Dict[str, Any]]:
+        """Current weather via Open-Meteo (no API key)."""
+        loc = _weather_location_from_query(query)
+        if loc is None:
+            return []
+        lat, lon, label = loc
+        out: List[Dict[str, Any]] = []
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S), follow_redirects=True) as client:
+                resp = _http_get_with_backoff(
+                    client,
+                    "https://api.open-meteo.com/v1/forecast",
+                    params={
+                        "latitude": str(lat),
+                        "longitude": str(lon),
+                        "current": "temperature_2m,weather_code,wind_speed_10m",
+                        "timezone": "auto",
+                    },
+                )
+                data = resp.json()
+                cur = data.get("current") or {}
+                ts = str(cur.get("time") or "")
+                temp = cur.get("temperature_2m")
+                code = cur.get("weather_code")
+                wind = cur.get("wind_speed_10m")
+                if temp is None:
+                    return []
+                content = (
+                    f"Current weather in {label} at {ts}: {temp}°C, "
+                    f"WMO weather_code={code}, wind={wind} km/h. "
+                    f"Source: Open-Meteo."
+                )
+                out.append(
+                    {
+                        "title": f"{label} current weather {ts}".strip(),
+                        "url": (
+                            "https://api.open-meteo.com/v1/forecast"
+                            f"?latitude={lat}&longitude={lon}&current=temperature_2m"
+                        ),
+                        "content": content,
+                        "source": "open_meteo",
+                    }
+                )
+        except httpx.HTTPError as exc:
+            logger.debug("Open-Meteo fetch failed: %s", exc)
+        return out
+
+    def _fetch_pypi(self, query: str) -> List[Dict[str, Any]]:
+        """Latest package version from PyPI JSON API."""
+        pkg = _pypi_package_from_query(query)
+        if not pkg:
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S), follow_redirects=True) as client:
+                resp = _http_get_with_backoff(
+                    client,
+                    f"https://pypi.org/pypi/{pkg}/json",
+                )
+                if resp.status_code >= 400:
+                    return []
+                data = resp.json()
+                info = data.get("info") or {}
+                ver = str(info.get("version") or "").strip()
+                if not ver:
+                    return []
+                url = str(info.get("release_url") or f"https://pypi.org/project/{pkg}/{ver}/")
+                content = (
+                    f"PyPI package {pkg} latest stable release: {ver}. "
+                    f"Source: https://pypi.org/pypi/{pkg}/json"
+                )
+                out.append(
+                    {
+                        "title": f"{pkg} {ver} on PyPI",
+                        "url": url,
+                        "content": content,
+                        "source": "pypi",
+                    }
+                )
+        except httpx.HTTPError as exc:
+            logger.debug("PyPI fetch failed: %s", exc)
+        return out
+
+    def _fetch_python_endoflife(self, query: str) -> List[Dict[str, Any]]:
+        """Current Python releases via endoflife.date (no API key)."""
+        if not _python_version_intent(query):
+            return []
+        out: List[Dict[str, Any]] = []
+        try:
+            with httpx.Client(**_http_client_kwargs(HTTP_TIMEOUT_S), follow_redirects=True) as client:
+                resp = _http_get_with_backoff(
+                    client,
+                    "https://endoflife.date/api/python.json",
+                )
+                if resp.status_code >= 400:
+                    return []
+                rows = resp.json()
+                if not isinstance(rows, list) or not rows:
+                    return []
+                # Prefer the newest cycle that is not EOL.
+                stable = None
+                for row in rows:
+                    if not isinstance(row, dict):
+                        continue
+                    if row.get("eol") is False or (
+                        isinstance(row.get("eol"), str) and row.get("eol") > "2026-01-01"
+                    ):
+                        stable = row
+                        break
+                if stable is None:
+                    stable = rows[0] if isinstance(rows[0], dict) else None
+                if not stable:
+                    return []
+                cycle = str(stable.get("cycle") or "")
+                latest = str(stable.get("latest") or cycle)
+                content = (
+                    f"Python latest stable release per endoflife.date: {latest} "
+                    f"(cycle {cycle}, releaseDate={stable.get('releaseDate')}, "
+                    f"lts={stable.get('lts')}). Source: https://endoflife.date/api/python.json"
+                )
+                out.append(
+                    {
+                        "title": f"Python {latest} (endoflife.date)",
+                        "url": "https://endoflife.date/python",
+                        "content": content,
+                        "source": "endoflife",
+                    }
+                )
+        except httpx.HTTPError as exc:
+            logger.debug("endoflife.date Python fetch failed: %s", exc)
         return out
 
     def _fetch_duckduckgo_html(self, query: str) -> List[Dict[str, Any]]:

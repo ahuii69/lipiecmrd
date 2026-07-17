@@ -269,10 +269,14 @@ class MemoryV2Service:
                             }
                         )
 
-        # Find relevant procedures if query present
+        # Find relevant procedures if query present (ranked, not top-confidence dump)
         related_procedures = []
         if request.query:
-            related_procedures = get_procedures_for_user(request.user_id, limit=5)
+            from aihub.memory_v2_procedural import rank_procedures_for_query
+
+            related_procedures = rank_procedures_for_query(
+                request.user_id, request.query, limit=3
+            )
 
         return MemoryV2SearchResponse(
             items=items,
@@ -845,24 +849,15 @@ class MemoryV2Service:
                     result["writeback_kind"] = "web_grounded"
                     logger.info(f"V2 chat write-back: web-grounded for user {user_id}")
 
-            # Memory match reinforcement
+            # Memory match reinforcement — reinforce existing hits only.
+            # Do NOT create "Memory-guided response" meta-items: they pollute
+            # retrieval with preference-ranked junk and starve real facts.
             if memory_matches > 0 and not fallback:
-                # If memory influenced response and outcome was successful, reinforce
-                reinforce_item = self.create_memory_item(
-                    user_id=user_id,
-                    memory_type="preference",
-                    scope="interaction",
-                    title="Memory-guided response",
-                    content=f"Context from {memory_matches} memories helped: {query_text[:80]}",
-                    source_kind="chat_turn",
-                    source_ref=turn_id,
-                    importance_score=0.5,
-                    confidence_score=0.7,
-                    auto_detect_contradictions=False,
+                result["writeback_kind"] = result.get("writeback_kind") or "memory_reinforcement_soft"
+                logger.debug(
+                    "V2 chat write-back: skip Memory-guided meta item (matches=%s)",
+                    memory_matches,
                 )
-                if reinforce_item:
-                    result["new_items_count"] += 1
-                    result["writeback_kind"] = "memory_reinforcement"
 
             # Degraded/fallback outcome
             if degraded or fallback:

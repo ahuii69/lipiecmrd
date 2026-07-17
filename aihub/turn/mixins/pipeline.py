@@ -93,15 +93,18 @@ class PipelineMixin:
                 is_assistant_meta_ask,
                 meta_ask_refers_to_prior_conversation,
             )
+            from aihub.turn.prompt_budget import is_casual_smalltalk
 
             g['assistant_meta_ask'] = is_assistant_meta_ask(g['turn'].message or '')
             g['assistant_meta_ask_pure'] = bool(
                 g['assistant_meta_ask']
                 and not meta_ask_refers_to_prior_conversation(g['turn'].message or '')
             )
+            g['casual_smalltalk'] = is_casual_smalltalk(g['turn'].message or '')
         except Exception:
             g['assistant_meta_ask'] = False
             g['assistant_meta_ask_pure'] = False
+            g['casual_smalltalk'] = False
         if g.get('assistant_meta_ask'):
             # Cap completion budget for identity/meta asks.
             cur = self._turn_max_completion_tokens
@@ -110,7 +113,7 @@ class PipelineMixin:
             except (TypeError, ValueError):
                 cur_i = 256
             self._turn_max_completion_tokens = max(160, min(cur_i, 256))
-        if g.get('assistant_meta_ask'):
+        if g.get('assistant_meta_ask') or g.get('casual_smalltalk'):
             # Skip heavy memory V2 / identity retrieval; keep light psyche for tone.
             g['memory_v2_snapshot'] = {
                 'loaded': False,
@@ -121,8 +124,12 @@ class PipelineMixin:
                 'actionable_contradictions_count': 0,
                 'transient_contradiction_count': 0,
                 'procedures_count': 0,
-                'top_reason_codes': ['META_ASK_HEAVY_STAGES_SKIPPED'],
-                'retrieval_strategy': 'skipped_meta_ask',
+                'top_reason_codes': [
+                    'META_ASK_HEAVY_STAGES_SKIPPED'
+                    if g.get('assistant_meta_ask')
+                    else 'CASUAL_LIGHT_HEAVY_STAGES_SKIPPED'
+                ],
+                'retrieval_strategy': 'skipped_meta_ask' if g.get('assistant_meta_ask') else 'skipped_casual_light',
             }
             g['memory_v2_runtime_ctx'] = None
             g['identity_bridge_snapshot'] = None
@@ -136,9 +143,12 @@ class PipelineMixin:
                 g['psyche_v2_behavior_ctx'] = build_psyche_v2_behavior_context(g['turn'].user_id)
             except Exception as bridge_error:
                 g['bridge_error'] = bridge_error
-                logger.debug('meta ask light psyche skipped: %s', bridge_error)
+                logger.debug('light psyche skipped: %s', bridge_error)
             if isinstance(g['ctx'].system_context, dict):
-                g['ctx'].system_context['META_ASK_HEAVY_STAGES_SKIPPED'] = True
+                if g.get('assistant_meta_ask'):
+                    g['ctx'].system_context['META_ASK_HEAVY_STAGES_SKIPPED'] = True
+                if g.get('casual_smalltalk'):
+                    g['ctx'].system_context['CASUAL_LIGHT_HEAVY_STAGES_SKIPPED'] = True
                 g['ctx'].system_context['identity_bridge_snapshot'] = None
         else:
             try:
@@ -165,9 +175,10 @@ class PipelineMixin:
                 g['consistency_error'] = consistency_error
                 logger.debug('Self-consistency pass skipped: %s', consistency_error, exc_info=True)
         g['mem_truth'] = memory_truth_for_prompt(g['ctx'].memory_context)
-        g['memory_lookup_flag'] = bool(g['mem_truth']['memory_retrieval_has_rows']) and not g.get('assistant_meta_ask_pure')
-        g['memory_substantive_flag'] = bool(g['mem_truth']['memory_substantive_in_prompt']) and not g.get('assistant_meta_ask_pure')
-        if g.get('assistant_meta_ask_pure'):
+        g['_light_memory_skip'] = bool(g.get('assistant_meta_ask') or g.get('casual_smalltalk'))
+        g['memory_lookup_flag'] = bool(g['mem_truth']['memory_retrieval_has_rows']) and not g['_light_memory_skip']
+        g['memory_substantive_flag'] = bool(g['mem_truth']['memory_substantive_in_prompt']) and not g['_light_memory_skip']
+        if g.get('_light_memory_skip'):
             g['memory_lookup_flag'] = False
             g['memory_substantive_flag'] = False
             g['memory_brief'] = ''
@@ -190,9 +201,9 @@ class PipelineMixin:
             )
         if stream_session_active():
             await emit_status('thinking', label_pl='Analizuję…')
-            if not g.get('assistant_meta_ask_pure'):
+            if not g.get('_light_memory_skip'):
                 await emit_status('memory', label_pl='Sprawdzam kontekst…')
-            g['mem_total'] = memory_results_count_for_trace(g['ctx'].memory_context) if not g.get('assistant_meta_ask_pure') else 0
+            g['mem_total'] = memory_results_count_for_trace(g['ctx'].memory_context) if not g.get('_light_memory_skip') else 0
             if g['memory_lookup_flag'] and g['mem_total'] > 0:
                 await emit_memory_used(count=g['mem_total'])
         g['psyche_brief'] = self._build_psyche_brief(g['psyche_snapshot'])
@@ -352,6 +363,35 @@ class PipelineMixin:
                 if not g['result_obj'].ok:
                     g['errors'].append({'type': 'controlled_web_error', 'error': g['result_obj'].error or 'unknown', 'tool': g['web_prefetch'].get('tool_name')})
             g['controlled_web'] = {'triggered': True, 'reason': g['web_prefetch'].get('reason'), 'tool_name': g['web_prefetch'].get('tool_name'), 'ok': g['result_obj'].ok if isinstance(g['result_obj'], ToolCallResult) else None, 'has_results': self._assess_web_result_quality(g['result_obj']), 'provider_info': self._extract_web_provider_info(g['result_obj']), 'query': self._extract_web_query(g['call_obj'] if isinstance(g['call_obj'], ToolCallRequest) else None), 'source_count': self._count_web_sources(g['result_obj'] if isinstance(g['result_obj'], ToolCallResult) else None), 'freshness_needed': self._is_freshness_needed(g['decision_core'].get('reason_codes', []))}
+            # Research already grounded via prefetch: drop tool schemas to stay within TPM.
+            # Also flatten tool-call pre_messages — providers reject tool_calls when tools=[].
+            if g['controlled_web'].get('has_results') and str(g['decision_core'].get('web_decision') or '') == 'required':
+                g['tools'] = []
+                if g.get('prompt_budget') is not None and g['prompt_budget'].profile == 'research':
+                    g['memory_brief'] = (g.get('memory_brief') or '')[:240]
+                    if isinstance(g['ctx'].system_context, dict):
+                        g['ctx'].system_context['memory_context_pack_prompt'] = ''
+                preview = ''
+                try:
+                    preview = self._safe_preview(
+                        getattr(g.get('result_obj'), 'output', None),
+                        max_chars=700,
+                    )
+                except Exception:
+                    preview = ''
+                if preview:
+                    from aihub.chat_contracts import ChatMessage as _CM
+
+                    g['web_prefetch']['messages'] = [
+                        _CM(
+                            role='user',
+                            content=(
+                                'Zweryfikowane źródła z tej tury (prefetch research.query):\n'
+                                + preview
+                                + '\nOdpowiedz wyłącznie na podstawie tych źródeł; podaj źródło i świeżość.'
+                            ),
+                        )
+                    ]
         g['pre_messages'] = g['web_prefetch'].get('messages') or []
         from aihub.chat_attachment_vision import enrich_image_attachments_for_turn
         g['effective_attached_ids'] = self._effective_attached_file_ids(g['turn'])
@@ -855,15 +895,36 @@ class PipelineMixin:
         g['trace']['response_outcome_quality'] = 'success'
         # Budget / turn-value writeback policy
         try:
-            from aihub.turn.prompt_budget import writebacks_for_policy
+            from aihub.turn.prompt_budget import classify_turn_value_class, resolve_writeback_plan
             _pol = str((g.get('prompt_budget').writeback_policy if g.get('prompt_budget') else None) or g['decision_core'].get('writeback_policy') or 'standard')
-            _tvc = str((g.get('prompt_budget').turn_value_class if g.get('prompt_budget') else None) or g['decision_core'].get('turn_value_class') or 'conversational')
+            _tvc = classify_turn_value_class(
+                user_text=g['turn'].message or '',
+                budget=g.get('prompt_budget'),
+                has_tool_results=bool(g.get('tool_results')),
+                has_web=bool(g.get('controlled_web', {}).get('triggered')),
+                has_correction=bool(
+                    (g.get('pragmatics') and getattr(g.get('pragmatics'), 'speech_act', '') == 'correction')
+                ),
+            )
             g['trace']['turn_value_class'] = _tvc
             g['trace']['writeback_policy'] = _pol
-            _allowed, _skipped = writebacks_for_policy(_pol)  # type: ignore[arg-type]
-            g['trace']['writebacks_skipped'] = list(_skipped)
+            _plan = resolve_writeback_plan(
+                policy=_pol,  # type: ignore[arg-type]
+                turn_value_class=_tvc,
+                runtime_mode=str(getattr(g['turn'], 'runtime_mode', '') or ''),
+                replay_mode=bool(g['trace'].get('idempotency_hit') or g.get('idempotency_hit')),
+                success=len(g.get('errors') or []) == 0,
+                has_user_feedback=_tvc == 'feedback',
+                has_source_evidence=bool(g.get('controlled_web', {}).get('ok')),
+                has_tool_evidence=any(getattr(r, 'ok', False) for r in (g.get('tool_results') or [])),
+            )
+            g['trace']['writebacks_skipped'] = list(_plan.get('skipped') or [])
             g['trace']['writebacks_executed'] = []
-            g['_wb_minimal'] = _pol == 'minimal'
+            g['trace']['writeback_skip_reasons'] = dict(_plan.get('skip_reasons') or {})
+            g['trace']['stages_included'] = list(getattr(g.get('prompt_budget'), 'layers_included', None) or [])
+            g['trace']['stages_skipped'] = list(getattr(g.get('prompt_budget'), 'layers_skipped', None) or [])
+            g['_wb_minimal'] = _pol == 'minimal' or _tvc == 'trivial'
+            g['_wb_plan'] = _plan
         except Exception:
             g['_wb_minimal'] = False
             g['trace'].setdefault('writeback_policy', 'standard')
@@ -880,7 +941,7 @@ class PipelineMixin:
             g['trace']['experience_write_back_succeeded'] = False
             g['trace']['knowledge_writeback_attempted'] = False
             g['trace']['reflection_ran'] = False
-            # Feedback meta: allow user-model length preference update only.
+            # Feedback: allow user-model length preference update only.
             if str(g['trace'].get('turn_value_class') or '') == 'feedback':
                 try:
                     from aihub.turn.cognitive_integration import update_user_model_from_turn
@@ -923,6 +984,23 @@ class PipelineMixin:
                 g['trace']['memory_v2_writeback_succeeded'] = g['memory_wb'].get('succeeded', False)
                 g['trace']['memory_v2_new_items_count'] = g['memory_wb'].get('new_items_count', 0)
                 g['trace']['memory_v2_new_lessons_count'] = g['memory_wb'].get('new_lessons_count', 0)
+                try:
+                    from aihub.turn.prompt_budget import looks_procedural
+                    from aihub.memory_v2_procedural import upsert_user_declared_procedure
+
+                    if looks_procedural(g['turn'].message or ''):
+                        g['_user_proc'] = upsert_user_declared_procedure(
+                            g['turn'].user_id, g['turn'].message or ''
+                        )
+                        if g['_user_proc'] is not None:
+                            g['trace']['procedural_memory_stored'] = True
+                            g['trace']['procedural_memory_id'] = g['_user_proc'].id
+                            g['trace']['writebacks_executed'] = list(
+                                g['trace'].get('writebacks_executed') or []
+                            ) + ['procedural']
+                except Exception as proc_store_err:
+                    logger.debug('user procedure upsert skipped: %s', proc_store_err, exc_info=True)
+                    g['trace']['procedural_memory_stored'] = False
                 g['outcome_kind'] = g['trace']['response_outcome_quality']
                 g['psyche_wb'] = g['_psy_svc'].apply_outcome_event(user_id=g['turn'].user_id, outcome_kind=g['outcome_kind'] if g['outcome_kind'] != 'blocked' else 'failure', source_ref=g['turn_id_for_wb'], context={'contradictions_present': g['memory_v2_snapshot'].get('contradictions_count', 0), 'grounding_mode': g['grounding_mode'], 'tool_calls_count': len(g['tool_calls'])})
                 g['trace']['psyche_v2_writeback_attempted'] = g['psyche_wb'].get('attempted', False)

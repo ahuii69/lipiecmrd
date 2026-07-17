@@ -235,8 +235,12 @@ class TestPsycheModulation:
         )
         memory = MemoryRoutingSummary(has_relevant_memory=False)
         _apply_psyche_modulation_select_dict(raw, psyche, memory)
-        assert raw["strategy"] == "contextual"
+        # Tone/confidence only — never demote agentic → contextual/research.
+        assert raw["strategy"] == "agentic"
         assert raw["requires_research"] is False
+        assert raw["requires_planning"] is True
+        assert "psyche:" in raw["reason"]
+        assert float(raw["confidence"]) < 0.82
 
 
 class TestFinalizeEscalationTrace:

@@ -152,6 +152,16 @@ def is_junk_memory_content(text: str, *, query: str = "") -> bool:
         return True
     if _EPISODE_ECHO.search(raw) or "||" in raw or raw.strip().startswith("U:"):
         return True
+    # Question-shaped "facts" (ingested recall questions) are not usable memory.
+    if raw.endswith("?") and len(raw.split()) <= 12:
+        return True
+    if re.match(r"(?iu)^(czego|czym|jak|jaki|jaka|jakie|czy)\b", raw) and "lubi" in low:
+        return True
+    # Near-echo of the current query is not evidence.
+    qn = re.sub(r"\s+", " ", (query or "").strip().lower())
+    rn = re.sub(r"\s+", " ", low)
+    if qn and rn and (qn == rn or qn.rstrip("?") == rn.rstrip("?")):
+        return True
     # Single-token shout / nonverbal noise
     if len(raw.split()) <= 2 and low in {"elo", "gówno", "gowno", "ok", "działa", "dziala", "siema", "hej"}:
         return True
@@ -188,7 +198,16 @@ def memory_contradicts_correction_hints(content: str, correction_hints: str) -> 
     """Drop stale memory when durable user correction flips like/dislike on same topic."""
     if not (content or "").strip() or not (correction_hints or "").strip():
         return False
-    h_likes, h_dislikes = _extract_pl_preferences(correction_hints)
+    cont_l = " ".join((content or "").lower().split())
+    # The correction statement itself must stay injectable.
+    if any(k in cont_l for k in ("poprawka", "korekta", "sprostowanie", "nie, jednak", "nie, ")):
+        return False
+    # Prefer the newest preference-bearing hint lines (tail), not the whole history dump.
+    hint_lines = [
+        ln for ln in (correction_hints or "").splitlines() if ln.strip() and ("lubi" in ln.lower())
+    ]
+    recent_hints = "\n".join(hint_lines[-3:]) if hint_lines else correction_hints
+    h_likes, h_dislikes = _extract_pl_preferences(recent_hints)
     c_likes, c_dislikes = _extract_pl_preferences(content)
     if h_likes or h_dislikes:
         for stem in h_likes:
@@ -197,17 +216,10 @@ def memory_contradicts_correction_hints(content: str, correction_hints: str) -> 
         for stem in h_dislikes:
             if stem and stem in c_likes:
                 return True
-        # Explicit negation flip on shared token (e.g. burz*).
-        if h_likes and c_dislikes:
-            for hs in h_likes:
-                for cs in c_dislikes:
-                    if hs[:4] and hs[:4] == cs[:4]:
-                        return True
     # Numeric/fact supersession: "korekta … 8080, nie 9000" vs stale "… 9000".
     import re as _re
 
-    hint_l = " ".join((correction_hints or "").lower().split())
-    cont_l = " ".join((content or "").lower().split())
+    hint_l = " ".join((recent_hints or "").lower().split())
     if any(k in hint_l for k in ("korekta", "poprawka", "sprostowanie")) or " nie " in f" {hint_l} ":
         negated = set(_re.findall(r"\bnie\s+(\d+(?:\.\d+)?)\b", hint_l))
         all_nums = _re.findall(r"\d+(?:\.\d+)?", hint_l)
@@ -274,10 +286,11 @@ def _from_v2(item: MemoryV2Item) -> MemoryContextPackItem:
 def _from_proc(proc: MemoryV2Procedure) -> MemoryContextPackItem:
     tools = ", ".join(proc.recommended_tools)
     avoid = "; ".join(proc.avoid_patterns)
-    content = proc.recommended_strategy
+    # User-declared procedures store the ordered steps in recommended_strategy.
+    content = (proc.recommended_strategy or "").strip() or proc.name
     if tools:
         content += f" | tools: {tools}"
-    if avoid:
+    if avoid and "user_declared" not in avoid:
         content += f" | avoid: {avoid}"
     return MemoryContextPackItem(
         id=proc.id,
@@ -288,7 +301,7 @@ def _from_proc(proc: MemoryV2Procedure) -> MemoryContextPackItem:
         score=float(proc.confidence_score or proc.success_rate or 0.0),
         confidence=float(proc.confidence_score or 0.0),
         salience=float(proc.success_rate or 0.0),
-        reason_codes=["procedure", "experience_pattern"],
+        reason_codes=["procedure", "user_declared" if "user_declared" in (proc.avoid_patterns or []) else "experience_pattern"],
         metadata={
             "trigger_pattern": proc.trigger_pattern,
             "success_rate": proc.success_rate,
@@ -392,15 +405,28 @@ def build_memory_context_pack(
             "lesson": 0.11,
             "contradiction": 0.20,
         }.get(item.memory_type, 0.0)
-        return (item.score + item.salience * 0.35 + item.confidence * 0.20 + type_boost, item.salience, item.confidence)
+        # Exact marker / rare token overlap with the query beats stale similar facts.
+        q_tokens = {
+            t.lower()
+            for t in re.findall(r"[A-Za-z0-9_-]{5,}", query or "")
+        }
+        c_low = f"{item.title} {item.content}".lower()
+        overlap = sum(1 for t in q_tokens if t in c_low)
+        overlap_boost = min(0.45, 0.12 * overlap)
+        return (
+            item.score + item.salience * 0.35 + item.confidence * 0.20 + type_boost + overlap_boost,
+            item.salience,
+            item.confidence,
+        )
 
     query = str(outcome.query or "")
     for item in sorted(candidates, key=candidate_score, reverse=True):
         if item.id in seen_ids:
             excluded.append(item.id)
             continue
-        if is_junk_memory_content(item.content, query=query) or is_junk_memory_content(
-            item.title, query=query
+        if is_junk_memory_content(item.content, query=query) or (
+            (item.title or "").strip()
+            and is_junk_memory_content(item.title, query=query)
         ):
             excluded.append(item.id)
             continue

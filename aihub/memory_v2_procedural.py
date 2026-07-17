@@ -6,6 +6,7 @@ Extracts procedural patterns from experiences and builds learned workflows.
 """
 
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -13,12 +14,152 @@ from typing import Any
 from aihub.db import get_experiences_by_user
 from aihub.memory_v2_models import MemoryV2Procedure
 from aihub.memory_v2_repository import (
+    get_procedures_for_user,
     insert_memory_procedure,
     update_memory_procedure,
     find_matching_procedures,
 )
 
 logger = logging.getLogger(__name__)
+
+_USER_PROC_MARKERS = (
+    "procedur",
+    "zapamiętaj procedur",
+    "zapamietaj procedur",
+    "odpowiadaj zawsze",
+    "gdy proszę",
+    "gdy prosze",
+    "zmień procedur",
+    "zmien procedur",
+    "nie stosuj już",
+    "nie stosuj juz",
+)
+_PROC_TRIGGER_TOKENS = (
+    "debug",
+    "502",
+    "backend",
+    "serwer",
+    "server",
+    "nginx",
+    "logi",
+    "port",
+)
+
+
+def _norm_tokens(text: str) -> set[str]:
+    return {
+        t
+        for t in re.findall(r"[a-z0-9ąćęłńóśźż_-]{3,}", (text or "").lower())
+        if t not in {"oraz", "potem", "najpierw", "zawsze", "dla", "tego", "testow"}
+    }
+
+
+def rank_procedures_for_query(
+    user_id: str, query: str, *, limit: int = 3
+) -> list[MemoryV2Procedure]:
+    """Prefer query-overlapping, high-confidence, recently updated procedures."""
+    procs = get_procedures_for_user(user_id, limit=50)
+    if not procs:
+        return []
+    q_tokens = _norm_tokens(query)
+    scored: list[tuple[float, MemoryV2Procedure]] = []
+    for p in procs:
+        if float(p.confidence_score or 0) < 0.15:
+            continue
+        blob = f"{p.name} {p.trigger_pattern} {p.recommended_strategy}".lower()
+        p_tokens = _norm_tokens(blob)
+        overlap = len(q_tokens & p_tokens) if q_tokens else 0
+        # User-declared procedures (evidence_count==1, explicit steps) get a boost
+        # when any debug/backend token matches.
+        user_declared = p.evidence_count <= 2 and any(
+            k in blob for k in ("najpierw", "potem", "→", "->", "logi", "port")
+        )
+        trigger_hit = any(t in blob for t in _PROC_TRIGGER_TOKENS if t in (query or "").lower())
+        score = (
+            float(p.confidence_score or 0) * 2.0
+            + overlap * 0.35
+            + (0.8 if user_declared and (trigger_hit or overlap > 0) else 0.0)
+            + min(0.4, max(0.0, (float(p.updated_ts or 0) / 1e12)))
+        )
+        if q_tokens and overlap == 0 and not trigger_hit and not user_declared:
+            # Avoid dumping unrelated learned workflows into every turn.
+            continue
+        scored.append((score, p))
+    scored.sort(key=lambda x: (x[0], float(x[1].updated_ts or 0)), reverse=True)
+    if scored:
+        return [p for _, p in scored[:limit]]
+    # Fallback: newest high-confidence only (still bounded).
+    alive = [p for p in procs if float(p.confidence_score or 0) >= 0.4]
+    alive.sort(key=lambda p: float(p.updated_ts or 0), reverse=True)
+    return alive[:limit]
+
+
+def upsert_user_declared_procedure(user_id: str, text: str) -> MemoryV2Procedure | None:
+    """Persist explicit user procedure / supersede prior matching procedure."""
+    raw = (text or "").strip()
+    if not raw:
+        return None
+    low = raw.lower()
+    if not any(m in low for m in _USER_PROC_MARKERS):
+        return None
+
+    now = time.time()
+    supersede = any(
+        m in low
+        for m in (
+            "zmień procedur",
+            "zmien procedur",
+            "nie stosuj już",
+            "nie stosuj juz",
+            "poprawk",
+        )
+    )
+    trigger_bits = [t for t in _PROC_TRIGGER_TOKENS if t in low]
+    if "profile26" in low or "profile26" in low.replace("-", ""):
+        trigger_bits.append("profile26")
+    if not trigger_bits:
+        trigger_bits = ["procedure", "workflow"]
+    trigger_pattern = " ".join(dict.fromkeys(trigger_bits))
+
+    # Supersede older overlapping user procedures.
+    if supersede or "zapamiętaj" in low or "zapamietaj" in low:
+        for old in get_procedures_for_user(user_id, limit=30):
+            old_blob = f"{old.trigger_pattern} {old.name}".lower()
+            if any(t in old_blob for t in trigger_bits):
+                if float(old.confidence_score or 0) >= 0.2:
+                    old.confidence_score = 0.05
+                    old.success_rate = min(old.success_rate, 0.1)
+                    old.updated_ts = now
+                    update_memory_procedure(old)
+
+    name = raw[:120].rstrip(".")
+    if "profile26" in low:
+        name = "Profile26 debug serwera: " + raw[:90]
+    proc = MemoryV2Procedure(
+        id=f"proc-user-{uuid.uuid4().hex[:16]}",
+        user_id=user_id,
+        name=name,
+        trigger_pattern=trigger_pattern,
+        recommended_strategy=raw[:900],
+        recommended_tools=[],
+        avoid_patterns=["user_declared"],
+        success_rate=0.9,
+        failure_rate=0.0,
+        confidence_score=0.92,
+        evidence_count=1,
+        last_validated_ts=now,
+        created_ts=now,
+        updated_ts=now,
+    )
+    if insert_memory_procedure(proc):
+        logger.info(
+            "user_declared_procedure stored id=%s trigger=%s supersede=%s",
+            proc.id,
+            trigger_pattern,
+            supersede,
+        )
+        return proc
+    return None
 
 
 def extract_procedures_from_experiences(

@@ -176,6 +176,21 @@ def synthesize_chat_handoff_user_text(
     if is_casual_greeting(user_message):
         return "Siema — lecimy z tematem, o co chodzi?"
 
+    um = (user_message or "").lower()
+    if any(
+        x in um
+        for x in (
+            "wykonaj teraz",
+            "wykonaj migracj",
+            "zrób migracj",
+            "zrob migracj",
+        )
+    ):
+        return (
+            "Nie wykonałem migracji na Twoim serwerze — nie mam dostępu SSH ani "
+            "potwierdzonego tool result. Mogę podać bezpieczny plan i komendy weryfikacyjne."
+        )
+
     return (
         "Z planu wyszło coś jak suchy meldunek — napisz krócej, czego potrzebujesz, "
         "albo poproś wprost o raport wykonania."

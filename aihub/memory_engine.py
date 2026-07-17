@@ -424,7 +424,10 @@ def process_turn(
         explicit_fact_match = re.search(
             r"(?is)(?:zapamiętaj\s+ważny\s+fakt|zapamietaj\s+wazny\s+fakt|"
             r"zapamiętaj,\s*że|zapamietaj,\s*ze|zapamiętaj:\s*|zapamietaj:\s*|"
+            r"zapamiętaj\s+że|zapamietaj\s+ze|"
             r"zapamiętaj\s+to\s+|zapamietaj\s+to\s+|"
+            r"zapamiętaj,\s*że\s+|zapamiętaj\s+że\s+|"
+            r"zapamiętaj,?\s+że\s+|zapamietaj,?\s+ze\s+|"
             r"(?:mój|moja)\s+\S+\s+to\s+|"
             r"(?:testowe)\s+\S+\s+to\s+|"
             r"(?:ulubiony|ulubiona)\s+\S+\s+to\s+"
@@ -472,16 +475,26 @@ def process_turn(
                     ),
                 )
             )
-        elif any(
-            k in t
-            for k in [
-                "lubię",
-                "nie lubię",
-                "preferuję",
-                "wolę",
-                "mój ulubiony",
-                "moja ulubiona",
-            ]
+        elif (
+            any(
+                k in t
+                for k in [
+                    "lubię",
+                    "nie lubię",
+                    "preferuję",
+                    "wolę",
+                    "mój ulubiony",
+                    "moja ulubiona",
+                ]
+            )
+            or (
+                re.search(r"(?iu)\b(?:nie\s+lubi|lubi)\b", user_msg)
+                and not user_msg.strip().endswith("?")
+                and not re.match(
+                    r"(?iu)^(czego|czym|jak|jaki|jaka|jakie|czy|ile|gdzie)\b",
+                    user_msg.strip(),
+                )
+            )
         ):
             fact_ids.append(
                 _core.ingest_fact(

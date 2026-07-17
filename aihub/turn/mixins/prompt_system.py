@@ -35,6 +35,80 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
                 layer_chars={'meta_light': len(text)},
             )
         return text
+    if _budget is not None and getattr(_budget, 'profile', None) == 'casual_light':
+        from aihub.turn.prompt_budget import build_casual_light_system_prompt, build_prompt_budget_trace
+
+        text = build_casual_light_system_prompt()
+        # Keep a short psyche tone hint when available — not the full handbook.
+        if psyche_v2_context and getattr(psyche_v2_context, 'loaded', False):
+            if getattr(psyche_v2_context, 'directness_bias', 0) > 0.7:
+                text += "\nTon: bardziej bezpośredni."
+            if getattr(psyche_v2_context, 'friction', 0) > 0.5:
+                text += "\nTon: precyzyjny, bez zbędnych pytań."
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['prompt_budget'] = build_prompt_budget_trace(
+                decision=_budget,
+                system_text=text,
+                history_messages=[],
+                tool_schema_chars=0,
+                layer_chars={'casual_light': len(text)},
+            )
+        return text
+    if _budget is not None and getattr(_budget, 'profile', None) == 'contextual':
+        from aihub.turn.prompt_budget import (
+            build_contextual_bounded_system_prompt,
+            build_prompt_budget_trace,
+        )
+
+        pack = str((ctx.system_context or {}).get('memory_context_pack_prompt') or '').strip()
+        mem = (memory_brief or '').strip()
+        if pack:
+            mem = (mem + "\n" + pack).strip() if mem else pack
+        procs = ""
+        if memory_v2_context and getattr(memory_v2_context, 'loaded', False) and memory_v2_context.top_procedures:
+            bits = []
+            for p in memory_v2_context.top_procedures[:2]:
+                if not isinstance(p, dict):
+                    continue
+                steps = str(p.get('steps') or p.get('recommended_strategy') or '').strip()
+                label = str(p.get('name') or 'procedure')
+                conf = float(p.get('confidence') or 0)
+                if steps and steps != label:
+                    bits.append(f"{label} [id={p.get('id')}]: {steps[:400]} (conf={conf:.2f})")
+                else:
+                    bits.append(f"{label} [id={p.get('id')}] (conf={conf:.2f})")
+            procs = "; ".join(bits)
+        text = build_contextual_bounded_system_prompt(
+            memory_brief=mem,
+            psyche_brief=psyche_brief or "",
+            correction_hints=correction_hints or "",
+            procedures_brief=procs,
+        )
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['prompt_budget'] = build_prompt_budget_trace(
+                decision=_budget,
+                system_text=text,
+                history_messages=[],
+                tool_schema_chars=0,
+                layer_chars={'contextual_bounded': len(text)},
+            )
+        return text
+    if _budget is not None and getattr(_budget, 'profile', None) == 'research':
+        from aihub.turn.prompt_budget import (
+            build_research_bounded_system_prompt,
+            build_prompt_budget_trace,
+        )
+
+        text = build_research_bounded_system_prompt(memory_brief=memory_brief or "")
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['prompt_budget'] = build_prompt_budget_trace(
+                decision=_budget,
+                system_text=text,
+                history_messages=[],
+                tool_schema_chars=0,
+                layer_chars={'research_bounded': len(text)},
+            )
+        return text
     caps = [f'- {c.name}: {c.description}' for c in ctx.capabilities]
     capabilities_text = '\n'.join(caps) if caps else '- brak dostępnych narzędzi'
     behavior_instructions = ''
@@ -76,7 +150,14 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
         if evs and max(evs) < 3:
             proc_floor = 0.66
         if memory_v2_context.top_procedures and memory_v2_context.confidence_modifier > proc_floor:
-            procs_text = '; '.join([f"{p['name']} (conf={p['confidence']:.2f}, n={p.get('evidence_count', 0)})" for p in memory_v2_context.top_procedures[:2]])
+            proc_bits = []
+            for p in memory_v2_context.top_procedures[:2]:
+                steps = str(p.get('steps') or p.get('recommended_strategy') or '').strip()
+                base = f"{p['name']} (conf={p['confidence']:.2f}, n={p.get('evidence_count', 0)}, id={p.get('id')})"
+                if steps:
+                    base += f" steps={steps[:350]}"
+                proc_bits.append(base)
+            procs_text = '; '.join(proc_bits)
             ctx_parts.append(f'Procedury: {procs_text}')
         if memory_v2_context.contradiction_alerts:
             ctx_parts.append(f"UWAGA SPRZECZNOŚCI: {'; '.join(memory_v2_context.contradiction_alerts)}")

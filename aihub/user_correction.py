@@ -123,12 +123,28 @@ def _persist_factual_correction_memory(
     user_id: str, session_id: str, message: str, det: dict[str, Any]
 ) -> None:
     """Write durable correction to Memory V2 and supersede conflicting items."""
+    import logging
+
+    log = logging.getLogger(__name__)
     try:
         from aihub.memory_core import get_memory_core
+        from aihub.memory_engine import add_fact
         from aihub.memory_v2_contradictions import (
             detect_contradictions,
             resolve_contradiction_supersede,
         )
+
+        summary = _normalize_summary(message, 480)
+        # L2 semantic fact — required for context-pack / graph retrieval.
+        try:
+            add_fact(
+                user_id,
+                summary,
+                tags=["fact", "user_correction", "explicit_memory"],
+                meta={"source": "user_correction", "session_id": session_id},
+            )
+        except Exception as l2_exc:
+            log.debug("correction L2 fact skipped: %s", l2_exc)
 
         core = get_memory_core()
         item = core.v2_create_item(
@@ -136,7 +152,7 @@ def _persist_factual_correction_memory(
             memory_type="preference",
             scope="long_term",
             title="Korekta użytkownika",
-            content=_normalize_summary(message, 480),
+            content=summary,
             source_kind="explicit_learning",
             source_ref=session_id,
             session_id=session_id,
@@ -150,9 +166,7 @@ def _persist_factual_correction_memory(
             if older_id and older_id != item.id:
                 resolve_contradiction_supersede(item.id, older_id, user_id)
     except Exception as exc:
-        import logging
-
-        logging.getLogger(__name__).debug("correction memory persist skipped: %s", exc)
+        log.debug("correction memory persist skipped: %s", exc)
 
 
 def _event_row_applies(data: dict[str, Any], session_id: str) -> bool:

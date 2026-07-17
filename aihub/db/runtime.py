@@ -3,6 +3,7 @@
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -1865,33 +1866,127 @@ def search_nodes_fts(
         q = (query or "").strip()
         if not q:
             return []
-        try:
-            rows = fetch_all(
+
+        def _pg_fts(expr: str) -> list[Any]:
+            return fetch_all(
                 """
             SELECT mn.id, mn.layer, mn.content, mn.tags, mn.meta, mn.ts, mn.importance, mn.confidence,
-                   ts_rank_cd(mf.content_tsv, plainto_tsquery('simple', ?)) AS rank
+                   ts_rank_cd(mf.content_tsv, plainto_tsquery('simple', %s)) AS rank
             FROM memory_fts mf
             INNER JOIN memory_nodes mn ON mn.id = mf.node_id
-            WHERE mf.user_id = ? AND mf.layer = ? AND mn.deleted = 0
-              AND mf.content_tsv @@ plainto_tsquery('simple', ?)
+            WHERE mf.user_id = %s AND mf.layer = %s AND mn.deleted = 0
+              AND mf.content_tsv @@ plainto_tsquery('simple', %s)
             ORDER BY rank DESC
-            LIMIT ?
+            LIMIT %s
             """,
-                (q, user_id, layer, q, limit),
+                (expr, user_id, layer, expr, limit),
             )
-        except Exception:
-            logger.exception("search_nodes_fts postgres FTS failed; falling back to LIKE")
-            rows = fetch_all(
-                """
+
+        def _pg_like_tokens(tokens: list[str]) -> list[Any]:
+            if not tokens:
+                return []
+            # Prefer distinctive tokens (IDs, nouns) over stopwords.
+            clauses = []
+            params: list[Any] = [user_id, layer]
+            for tok in tokens[:6]:
+                clauses.append("content ILIKE %s")
+                params.append(f"%{tok}%")
+            params.append(limit)
+            sql = f"""
             SELECT id, layer, content, tags, meta, ts, importance, confidence,
                    0.0 AS rank
             FROM memory_nodes
-            WHERE user_id=? AND layer=? AND deleted=0 AND content LIKE ?
+            WHERE user_id=%s AND layer=%s AND deleted=0
+              AND ({' OR '.join(clauses)})
             ORDER BY importance DESC, confidence DESC, ts DESC
-            LIMIT ?
-            """,
-                (user_id, layer, f"%{q}%", limit),
-            )
+            LIMIT %s
+            """
+            return fetch_all(sql, tuple(params))
+
+        # plainto_tsquery ANDs all tokens — Polish question wrappers ("Czego…?")
+        # zero out hits when stopwords are absent from stored facts.
+        stop = {
+            "czego",
+            "jaki",
+            "jaka",
+            "jakie",
+            "jak",
+            "czy",
+            "ile",
+            "gdzie",
+            "kiedy",
+            "ktory",
+            "który",
+            "ktora",
+            "która",
+            "the",
+            "what",
+            "who",
+            "how",
+            "does",
+            "did",
+            "is",
+            "are",
+            "nie",
+            "lub",
+            "oraz",
+            "dla",
+            "do",
+            "na",
+            "po",
+            "od",
+            "za",
+            "to",
+            "ten",
+            "ta",
+            "te",
+        }
+        raw_tokens = re.findall(r"[A-Za-z0-9ĄąĆćĘęŁłŃńÓóŚśŹźŻż_-]{3,}", q)
+        distinctive = [
+            t
+            for t in raw_tokens
+            if t.lower() not in stop and not t.isdigit()
+        ]
+        variants: list[str] = [q]
+        if distinctive:
+            # OR-ish: plainto still ANDs; use space-joined distinctive only.
+            variants.append(" ".join(distinctive[:8]))
+            # Also try the single most specific token (IDs / proper nouns).
+            distinctive_sorted = sorted(distinctive, key=len, reverse=True)
+            variants.append(distinctive_sorted[0])
+
+        rows: list[Any] = []
+        seen_q: set[str] = set()
+        try:
+            for variant in variants:
+                key = variant.strip().lower()
+                if not key or key in seen_q:
+                    continue
+                seen_q.add(key)
+                cand = _pg_fts(variant)
+                # Prefer hits that look like declarative facts, not question echoes.
+                useful = [
+                    r
+                    for r in cand
+                    if not str(r.get("content") or "").strip().endswith("?")
+                ]
+                rows = useful or cand
+                if useful:
+                    break
+            if not rows and distinctive:
+                rows = _pg_like_tokens(distinctive)
+            elif distinctive:
+                # Merge lexical hits so a question-shaped FTS hit cannot hide real facts.
+                like_rows = _pg_like_tokens(distinctive)
+                seen_ids = {str(r.get("id")) for r in rows}
+                for r in like_rows:
+                    rid = str(r.get("id"))
+                    if rid and rid not in seen_ids:
+                        rows.append(r)
+                        seen_ids.add(rid)
+        except Exception:
+            logger.exception("search_nodes_fts postgres FTS failed; falling back to LIKE")
+            rows = _pg_like_tokens(distinctive or raw_tokens or [q[:80]])
     else:
         from aihub.db.fts5_query import build_fts5_match_query, build_lexical_like_pattern
 

@@ -122,7 +122,7 @@ class WebMixin:
                 "name": call.name if call else "research.query",
                 "reason": reason,
                 "error": getattr(result, "error", None),
-                "output_preview": self._safe_preview(getattr(result, "output", None), max_chars=2200),
+                "output_preview": self._safe_preview(getattr(result, "output", None), max_chars=700),
                 "research_query_used": used_query,
                 "research_query_variants_tried": ranked[:4],
                 "research_fallback_count": fallback_tried,
@@ -193,7 +193,7 @@ class WebMixin:
             "name": call.name,
             "reason": reason,
             "error": result.error,
-            "output_preview": self._safe_preview(result.output, max_chars=2200),
+            "output_preview": self._safe_preview(result.output, max_chars=900),
         }
 
         messages = [

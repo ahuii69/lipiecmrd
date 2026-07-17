@@ -32,8 +32,20 @@ _LOCAL_INFRA_NO_WEB = re.compile(
     r"health\s+(?:\w+\s+){0,4}backend\w*|"
     r"/ops/ready|/system/ping|"
     r"ma\s+(?:teraz\s+)?adres\s+\d{1,3}(?:\.\d{1,3}){3}|"
-    r"adres\s+\d{1,3}(?:\.\d{1,3}){3}"
+    r"adres\s+\d{1,3}(?:\.\d{1,3}){3}|"
+    # Local Linux/ops how-to — not a live web freshness lookup.
+    r"proces\s+(?:\w+\s+){0,4}port(?:cie|u)?\s+\d{2,5}|"
+    r"port(?:cie|u)?\s+\d{2,5}|"
+    r"ss\s+-|"
+    r"lsof\s+-|"
+    r"netstat\s+"
     r")\b"
+)
+
+# Imperative "do it now" — bare "teraz" must not force research/web.
+_IMPERATIVE_NOW_NO_WEB = re.compile(
+    r"(?iu)\b(wykonaj|zrób|zrob|uruchom|odpal|wdroż|wdroz|migruj)\b.{0,40}\bteraz\b"
+    r"|\bteraz\b.{0,40}\b(wykonaj|zrób|zrob|uruchom|odpal|wdroż|wdroz|migracj)\w*"
 )
 
 # Stable reason codes for classification (extended for rule-trace contract)
@@ -58,7 +70,9 @@ REASON_CODES = {
     "TIMEOUT_FALLBACK": "Timeout during selection, degraded routing",
     "CONFLICT_SIGNAL_DETECTED": "Memory has conflicting signals",
     "PSYCHE_TENSION_DOWNGRADE": "High tension/frustration triggered strategy downgrade",
+    "PSYCHE_TENSION_TONE": "High tension modulates tone/confidence without demoting strategy",
     "PSYCHE_LOW_ENERGY_DOWNGRADE": "Low energy triggered strategy simplification",
+    "PSYCHE_LOW_ENERGY_TONE": "Low energy modulates tone/confidence without demoting strategy",
     "PSYCHE_HIGH_FOCUS_BOOST": "High focus boosted confidence for complex strategy",
     "STRATEGY_RULE_INSTANT": "Deterministic short-path classification",
     "STRATEGY_RULE_DIRECT_META": "Meta/prior-ref lightweight direct path",
@@ -277,20 +291,71 @@ def _normalize_requires_for_strategy(d: dict[str, Any]) -> None:
 
 
 def _keyword_in_text(keyword: str, text_lower: str, text_ascii: str) -> bool:
-    """Match a research/time trigger without substring false positives (e.g. ``now`` in ``nowego``)."""
+    """Match a research/time trigger without substring false positives (e.g. ``now`` in ``nowego``).
+
+    Always use word-ish boundaries so stems like ``sprawdz`` do not match
+    ``sprawdzenie`` / ``sprawdzanie`` inside procedural instructions.
+    """
+    import re
+
     kl = keyword.lower()
     ka = _strip_diacritics(kl)
-    # Short pure-ASCII tokens need a word boundary — otherwise Polish morphology trips them.
-    if len(ka) <= 4 and ka.isascii():
-        import re
-
-        pat = re.compile(rf"(?<![\w/]){re.escape(ka)}(?![\w/])", re.IGNORECASE)
-        return bool(pat.search(text_ascii))
-    return kl in text_lower or ka in text_ascii
+    # Multi-word phrases: keep substring (already specific).
+    if " " in ka:
+        return kl in text_lower or ka in text_ascii
+    pat = re.compile(rf"(?<![\w/]){re.escape(ka)}(?![\w/])", re.IGNORECASE)
+    if pat.search(text_ascii):
+        return True
+    if ka != _strip_diacritics(kl) or any(ord(c) > 127 for c in kl):
+        pat_u = re.compile(rf"(?<![\w/]){re.escape(kl)}(?![\w/])", re.IGNORECASE)
+        return bool(pat_u.search(text_lower))
+    return False
 
 
 def _text_has_marker(text_lower: str, text_ascii: str, markers: tuple[str, ...]) -> bool:
     return any(_keyword_in_text(m, text_lower, text_ascii) for m in markers)
+
+
+def _explicit_check_intent(text_lower: str, text_ascii: str) -> bool:
+    """Imperative/infinitive check verbs only — not nouns like ``sprawdzenie``."""
+    import re
+
+    return bool(
+        re.search(
+            r"(?iu)\b(sprawd[źz](ić|ic)?|zbadaj)\b",
+            text_lower,
+        )
+        or re.search(r"(?iu)\b(sprawdz(ic)?|zbadaj)\b", text_ascii)
+    )
+
+
+def local_howto_no_web_intent(user_text: str) -> bool:
+    """Local ops / Linux how-to that must not escalate to web research."""
+    t = (user_text or "").strip()
+    if not t:
+        return False
+    if _LOCAL_INFRA_NO_WEB.search(t):
+        return True
+    low = t.lower()
+    ascii_l = _strip_diacritics(low)
+    howto = any(
+        m in ascii_l
+        for m in (
+            "jak sprawdzic",
+            "jak sprawdzić",
+            "jaki proces",
+            "nasluch",
+            "nasłuch",
+            "listening on",
+            "w linuxie",
+            "w linuksie",
+        )
+    )
+    local_topic = any(
+        m in ascii_l
+        for m in ("port", "proces", "ss -", "lsof", "netstat", "systemd", "journalctl")
+    )
+    return howto and local_topic
 
 
 def research_trigger_reason_codes(user_text: str) -> list[str]:
@@ -301,14 +366,26 @@ def research_trigger_reason_codes(user_text: str) -> list[str]:
     lower = t.lower()
     ascii_l = _strip_diacritics(lower)
     codes: list[str] = []
-    if _text_has_marker(lower, ascii_l, ("sprawdź", "sprawdz", "zbadaj")):
+    if _explicit_check_intent(lower, ascii_l) and not local_howto_no_web_intent(t):
         codes.append("EXPLICIT_CHECK_REQUEST")
-    if _text_has_marker(lower, ascii_l, _TIME_SENSITIVE_MARKERS):
+    time_sensitive = _text_has_marker(lower, ascii_l, _TIME_SENSITIVE_MARKERS)
+    if time_sensitive and _IMPERATIVE_NOW_NO_WEB.search(t):
+        # "Wykonaj teraz X" is urgency, not a freshness/web lookup.
+        time_sensitive = _text_has_marker(
+            lower,
+            ascii_l,
+            tuple(m for m in _TIME_SENSITIVE_MARKERS if m not in {"teraz"}),
+        )
+    if time_sensitive:
         codes.append("TIME_SENSITIVE_QUERY")
     if _text_has_marker(lower, ascii_l, _SPORTS_RESULT_MARKERS):
         codes.append("SPORTS_RESULT_QUERY")
     if _text_has_marker(lower, ascii_l, ("news", "newsy")) and (
-        _text_has_marker(lower, ascii_l, ("najnowsze", "najświeższe", "najswiezsze", "latest"))
+        _text_has_marker(
+            lower,
+            ascii_l,
+            ("najnowsze", "najnowszy", "najnowsza", "najświeższe", "najswiezsze", "latest"),
+        )
         or "openai" in ascii_l
     ):
         if "TIME_SENSITIVE_QUERY" not in codes:
@@ -457,6 +534,9 @@ AGENTIC_KEYWORD_TOKENS = (
     "porównaj",
     "porownaj",
     "zaplanuj",
+    "napisz plan",
+    "rozpisz plan",
+    "plan migracji",
     "wykonaj",
     "wygeneruj plan",
     "wieloetapow",
@@ -630,9 +710,14 @@ RESEARCH_INTENT_TOKENS = (
     "aktualnie",
     "ostatnio",
     "najnowsze",
+    "najnowszy",
+    "najnowsza",
     "najświeższe",
     "najswiezsze",
     "latest",
+    "release",
+    "wersja stabilna",
+    "stabilna wersja",
     "today",
     "yesterday",
     "tomorrow",
@@ -649,7 +734,7 @@ RESEARCH_INTENT_TOKENS = (
     "kto wygral",
     "terminarz",
     "mistrzostw",
-    # News / prices
+    # News / prices / weather
     "news",
     "newsy",
     "kurs",
@@ -657,6 +742,8 @@ RESEARCH_INTENT_TOKENS = (
     "ceny",
     "price",
     "kosztuje",
+    "pogoda",
+    "weather",
     # Availability / status checks
     "czy działa",
     "czy dziala",
@@ -690,9 +777,12 @@ _TIME_SENSITIVE_MARKERS = (
     "aktualnie",
     "ostatnio",
     "najnowsze",
+    "najnowszy",
+    "najnowsza",
     "najświeższe",
     "najswiezsze",
     "latest",
+    "release",
     "today",
     "yesterday",
     "tomorrow",
@@ -812,14 +902,19 @@ class StrategySelector:
             )
 
         # ── 1) Agentic (highest priority) ─────────────────────────────
-        if ag_count > 0 and max_urg >= 0.25:
+        # Memory-store / procedure-declaration turns stay contextual even when
+        # multi-step wording or unrelated active goals are present.
+        from aihub.turn.prompt_budget import looks_procedural, looks_remember, looks_correction
+
+        memory_store_turn = looks_procedural(text) or looks_remember(text) or looks_correction(text)
+        if memory_store_turn:
             return _out(
-                "agentic",
+                "contextual",
                 0.86,
                 True,
                 False,
-                True,
-                f"Active goals present (count={ag_count}, max_urgency={max_urg:.2f})",
+                False,
+                "User memory/procedure store or correction — contextual write path",
             )
 
         multi_step = _text_has_marker(lower, ascii_l, AGENTIC_MULTISTEP_MARKERS)
@@ -838,6 +933,36 @@ class StrategySelector:
                 "Multi-step or explicit analysis/planning wording detected",
             )
 
+        # Active goals escalate only when the utterance engages the tracked task.
+        # Unrelated small talk / debug / recall must not inherit planner handoff.
+        goal_engage = any(
+            t in ascii_l
+            for t in (
+                "zadani",
+                "profile26",
+                "migracj",
+                "nastepn",
+                "następn",
+                "stan planu",
+                "stan zadania",
+                "long-term",
+                "dlugotermin",
+                "długotermin",
+                "rollback",
+                "wykonaj plan",
+                "kontynuuj plan",
+            )
+        )
+        if ag_count > 0 and max_urg >= 0.25 and goal_engage:
+            return _out(
+                "agentic",
+                0.86,
+                True,
+                False,
+                True,
+                f"Active goals present (count={ag_count}, max_urgency={max_urg:.2f})",
+            )
+
         # ── 2) Research (web / verification; never instant) ─────────────
         if has_url:
             return _out(
@@ -852,8 +977,10 @@ class StrategySelector:
         research_intent = _has_kw(self._RESEARCH_INTENT_TOKENS) or _has_kw(
             self._RESEARCH_INTENT_ALIASES
         )
-        instant_blocked = _has_kw(self._INSTANT_BLOCKLIST_TOKENS)
-        if research_intent or instant_blocked:
+        instant_blocked = _explicit_check_intent(lower, ascii_l) and not local_howto_no_web_intent(
+            text
+        )
+        if (research_intent or instant_blocked) and not local_howto_no_web_intent(text):
             return _out(
                 "research",
                 0.84,
@@ -864,14 +991,31 @@ class StrategySelector:
             )
 
         # ── 3) Contextual ────────────────────────────────────────────
-        if _has_kw(self._CONTEXT_KEYWORDS_PL) or hist >= 2 or mem_rel or mem_task:
+        procedure_apply = any(
+            t in ascii_l
+            for t in (
+                "debug",
+                "zdebug",
+                "502",
+                "bad gateway",
+                "procedur",
+                "workflow",
+            )
+        )
+        if (
+            procedure_apply
+            or _has_kw(self._CONTEXT_KEYWORDS_PL)
+            or hist >= 2
+            or mem_rel
+            or mem_task
+        ):
             return _out(
                 "contextual",
                 0.78,
                 True,
                 False,
                 False,
-                "Dialogue history, memory hit, or explicit back-reference",
+                "Dialogue history, memory hit, procedure apply, or explicit back-reference",
             )
 
         # ── 4) Instant ───────────────────────────────────────────────
@@ -1011,27 +1155,24 @@ def _apply_psyche_modulation_select_dict(
     psyche_summary: PsycheRoutingSummary,
     memory_summary: MemoryRoutingSummary,
 ) -> None:
+    """Modulate tone/confidence only — never demote research/agentic strategy."""
     if not psyche_summary.snapshot_succeeded:
         return
 
     if psyche_summary.tension_signal > 0.55 or psyche_summary.frustration_signal > 0.35:
-        if d["strategy"] == "agentic":
-            d["strategy"] = "contextual"
-            d["reason"] += " [psyche: tension->contextual]"
-            d["confidence"] = max(0.5, float(d["confidence"]) * 0.85)
-        elif d["strategy"] == "research":
+        # Tone/confidence only: keep planner and web paths available under frustration.
+        if d["strategy"] in ("agentic", "research"):
+            d["reason"] += " [psyche: tension->direct_tone]"
             d["confidence"] = max(0.5, float(d["confidence"]) * 0.88)
-        _normalize_requires_for_strategy(d)
+        elif d["strategy"] == "contextual":
+            d["confidence"] = max(0.5, float(d["confidence"]) * 0.9)
 
     if psyche_summary.energy < 0.35:
-        if d["strategy"] == "agentic":
-            d["strategy"] = "contextual"
-            d["reason"] += " [psyche: low_energy->contextual]"
-            d["confidence"] = max(0.45, float(d["confidence"]) * 0.85)
-            _normalize_requires_for_strategy(d)
-        elif d["strategy"] == "research":
-            d["reason"] += " [psyche: low_energy->lower_confidence]"
-            d["confidence"] = max(0.5, float(d["confidence"]) * 0.9)
+        if d["strategy"] in ("agentic", "research"):
+            d["reason"] += " [psyche: low_energy->concise]"
+            d["confidence"] = max(0.45, float(d["confidence"]) * 0.9)
+        elif d["strategy"] == "contextual":
+            d["confidence"] = max(0.45, float(d["confidence"]) * 0.9)
 
     if psyche_summary.focus > 0.70 and d["strategy"] in ("research", "agentic"):
         d["confidence"] = min(0.97, float(d["confidence"]) * 1.08)
@@ -1176,7 +1317,7 @@ def select_strategy(
     lower_ut = ut.lower()
     ascii_ut = _strip_diacritics(lower_ut)
     explicit_freshness = any(
-        tok in lower_ut or _strip_diacritics(tok) in ascii_ut
+        _keyword_in_text(tok, lower_ut, ascii_ut)
         for tok in (
             "dzis",
             "dziś",
@@ -1189,7 +1330,7 @@ def select_strategy(
         )
     )
     explicit_research_intent = any(
-        tok in lower_ut or _strip_diacritics(tok) in ascii_ut
+        _keyword_in_text(tok, lower_ut, ascii_ut)
         for tok in (
             *RESEARCH_INTENT_TOKENS,
             *RESEARCH_INTENT_ALIASES,
@@ -1198,6 +1339,24 @@ def select_strategy(
             "zbadaj",
         )
     )
+    # Bare "teraz" inside an imperative execution command is urgency, not web research.
+    if explicit_research_intent and _IMPERATIVE_NOW_NO_WEB.search(ut):
+        other = any(
+            _keyword_in_text(tok, lower_ut, ascii_ut)
+            for tok in (
+                *RESEARCH_INTENT_TOKENS,
+                *RESEARCH_INTENT_ALIASES,
+                "sprawdź",
+                "sprawdz",
+                "zbadaj",
+            )
+            if tok != "teraz"
+        )
+        if not other:
+            explicit_research_intent = False
+    if local_howto_no_web_intent(ut):
+        explicit_research_intent = False
+        explicit_freshness = False
     if raw.get("strategy") == "agentic" and (
         "://" in ut or explicit_freshness or explicit_research_intent
     ):
@@ -1244,9 +1403,9 @@ def select_strategy(
                 selection.reason_codes.append(code)
 
     if "[psyche: tension->" in raw["reason"]:
-        selection.reason_codes.append("PSYCHE_TENSION_DOWNGRADE")
+        selection.reason_codes.append("PSYCHE_TENSION_TONE")
     if "[psyche: low_energy->" in raw["reason"]:
-        selection.reason_codes.append("PSYCHE_LOW_ENERGY_DOWNGRADE")
+        selection.reason_codes.append("PSYCHE_LOW_ENERGY_TONE")
 
     if (
         psyche_summary.snapshot_succeeded
@@ -1271,13 +1430,28 @@ def select_strategy(
             if listing_local
             else "short_followup_no_web"
         )
-    elif "://" in _text_for_url:
-        selection.web_decision = "required"
-        selection.web_decision_reason = "explicit_url_in_query"
-    elif _LOCAL_INFRA_NO_WEB.search(_text_for_url):
+    elif local_howto_no_web_intent(_text_for_url) or _LOCAL_INFRA_NO_WEB.search(_text_for_url):
         selection.web_decision = "off"
         selection.web_decision_reason = "local_infra_or_fact_no_web"
         selection.research_needed = False
+        if selection.selected_strategy == "research":
+            selection.selected_strategy = (
+                "contextual" if _history_turn_count(history) >= 2 else "instant"
+            )
+            if isinstance(selection.selector_output, dict):
+                selection.selector_output = dict(selection.selector_output)
+                selection.selector_output["strategy"] = selection.selected_strategy
+                selection.selector_output["requires_research"] = False
+                selection.selector_output["requires_memory"] = selection.selected_strategy in (
+                    "contextual",
+                    "agentic",
+                )
+                selection.selector_output["requires_planning"] = (
+                    selection.selected_strategy == "agentic"
+                )
+    elif "://" in _text_for_url:
+        selection.web_decision = "required"
+        selection.web_decision_reason = "explicit_url_in_query"
     elif selection.research_needed:
         selection.web_decision = "required"
         selection.web_decision_reason = "research_keywords_match"
@@ -1318,8 +1492,10 @@ def select_strategy(
             "psyche_influenced_strategy": any(
                 c in selection.reason_codes
                 for c in (
+                    "PSYCHE_TENSION_TONE",
                     "PSYCHE_TENSION_DOWNGRADE",
                     "PSYCHE_CONTEXT_IMPORTANT",
+                    "PSYCHE_LOW_ENERGY_TONE",
                     "PSYCHE_LOW_ENERGY_DOWNGRADE",
                     "PSYCHE_HIGH_FOCUS_BOOST",
                 )

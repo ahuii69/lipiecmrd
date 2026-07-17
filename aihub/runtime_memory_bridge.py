@@ -57,8 +57,10 @@ def build_memory_v2_runtime_snapshot(
         )
         search_result = _core_v2_search(request)
 
-        # Get procedures
-        procedures = _canonical_v2().list_procedures(user_id, limit=5)
+        # Query-ranked procedures (user-declared debug flows beat stale dumps)
+        from aihub.memory_v2_procedural import rank_procedures_for_query
+
+        procedures = rank_procedures_for_query(user_id, query_text or "", limit=5)
 
         # Count contradictions - use direct query not filtered search results
         all_items = search_memory_items(
@@ -224,8 +226,9 @@ def build_memory_v2_runtime_context(
         )
         search_result = _core_v2_search(request)
 
-        # Get procedures
-        procedures = _canonical_v2().list_procedures(user_id, limit=10)
+        from aihub.memory_v2_procedural import rank_procedures_for_query
+
+        procedures = rank_procedures_for_query(user_id, query_text or "", limit=10)
 
         # Get contradictions (independently of search results)
         contradicted_items = _canonical_v2().list_contradicted_memories(
@@ -316,6 +319,8 @@ def build_memory_v2_runtime_context(
                     "id": proc.id,
                     "name": proc.name,
                     "trigger_pattern": proc.trigger_pattern,
+                    "steps": (proc.recommended_strategy or "")[:500],
+                    "recommended_strategy": proc.recommended_strategy,
                     "confidence": effective_procedure_confidence(
                         proc.confidence_score,
                         proc.evidence_count,
