@@ -77,6 +77,15 @@ class PromptContextMixin:
                 if _line_ok(body):
                     dense_lines.append(f"- {body[:160]}")
 
+        graph_lines = []
+        for item in graph[:4]:
+            if isinstance(item, dict):
+                body = str(item.get("content") or item.get("text") or "")
+                ntype = str(item.get("type") or "").strip()
+                if _line_ok(body):
+                    prefix = f"[{ntype}] " if ntype else ""
+                    graph_lines.append(f"- {prefix}{body[:160]}")
+
         if include_stm:
             stm_block = (
                 "STM (ostatnia sesja, chronologicznie — najniższy priorytet faktów):\n"
@@ -88,14 +97,15 @@ class PromptContextMixin:
                 "poniżej tylko LTM / retrieval.\n"
             )
 
-        # Priorytet odczytu dla modelu: L2 (fakty) → wektor → epizody → STM na końcu.
+        # Priorytet: L2 → vector → graph → episodic → STM.
         return (
             f"total={total}; stm={len(stm)}; episodic={len(episodic)}; semantic={len(semantic)}; "
             f"dense={len(dense)}; graph={len(graph)}\n"
-            f"PRIORYTET: najpierw FAKTY (L2), potem VECTOR, potem EPISODIC; nie używaj epizodu jeśli "
+            f"PRIORYTET: najpierw FAKTY (L2), potem VECTOR, potem GRAPH, potem EPISODIC; nie używaj epizodu jeśli "
             f"jest trafienie L2 na to samo pytanie.\n"
             f"Semantic (L2 fakty) top:\n{chr(10).join(sem_lines) if sem_lines else '- brak'}\n"
             f"Dense (vector) top:\n{chr(10).join(dense_lines) if dense_lines else '- brak'}\n"
+            f"Graph (knowledge) top:\n{chr(10).join(graph_lines) if graph_lines else '- brak'}\n"
             f"Episodic (L1) top:\n{chr(10).join(epi_lines) if epi_lines else '- brak'}\n"
             f"{stm_block}"
         )
@@ -292,10 +302,11 @@ class PromptContextMixin:
         # replies. Psyche now only hints at *tone modulation* (directness / brevity / warmth); it must
         # never justify fake biography, aggression, or mirroring the user's hostile tone.
         return (
-            f"style={style}, mood={mood}, energy={energy}, focus={focus}, directness={directness}. "
-            "Traktuj to wyłącznie jako subtelną modulację tonu (bezpośredniość, ciepło, zwięzłość) — "
-            "nie zmieniaj przez to faktów, nie personifikuj się i nie kopiuj agresywnego tonu użytkownika "
-            "(zakaz kopiowania tonu wcześniejszej kłótni)."
+            f"[Psyche V1 — snapshot stanu] style={style}, mood={mood}, energy={energy}, "
+            f"focus={focus}, directness={directness}. "
+            "To tylko kompaktowy label stanu (mood/energy) — nie polityka zachowania. "
+            "Gdy dostępne są wskazówki Psyche V2, one mają pierwszeństwo nad tym snapshotem. "
+            "Nigdy nie zmieniaj faktów, nie personifikuj się i nie kopiuj agresywnego tonu użytkownika."
         )
 
     def _build_system_prompt(
@@ -327,7 +338,9 @@ class PromptContextMixin:
         """
         msg = str(turn.message or "")
         hist = list(turn.history or [])
-        has_attachments = bool(turn.attached_file_ids or [])
+        # Use the same effective attachment set as the prompt/attachment pipeline
+        # (request IDs + recent session uploads), not only the current request field.
+        has_attachments = bool(PromptContextMixin._effective_attached_file_ids(turn))
         listing_local = listing_copy_no_web_intent(msg) and "://" not in msg
         followup_local = short_followup_no_web_intent(msg, hist)
         # Word-boundary matching: naive substring match forced web for messages like
@@ -336,6 +349,32 @@ class PromptContextMixin:
 
         lower = msg.lower()
         ascii_l = _strip_diacritics(lower)
+
+        from aihub.strategy_selector import (
+            is_assistant_meta_ask,
+            meta_ask_refers_to_prior_conversation,
+        )
+
+        if is_assistant_meta_ask(msg):
+            decision_core["selected_strategy"] = (
+                "direct"
+                if meta_ask_refers_to_prior_conversation(msg)
+                else "instant"
+            )
+            decision_core["web_decision"] = "off"
+            decision_core["web_decision_reason"] = "assistant_meta_guardrail"
+
+            for code in (
+                "META_ASK_LIGHTWEIGHT_PATH",
+                "META_ASK_MEMORY_SKIPPED",
+                "META_ASK_GOAL_SKIPPED",
+                "META_ASK_HEAVY_STAGES_SKIPPED",
+            ):
+                if code not in decision_core["reason_codes"]:
+                    decision_core["reason_codes"].append(code)
+
+            return
+
         freshness_needed = any(
             _keyword_in_text(tok, lower, ascii_l) for tok in WEB_REQUIRED_QUERY_KEYWORDS
         )
@@ -677,6 +716,16 @@ class PromptContextMixin:
             )
             for c in ctx.capabilities
         ]
+
+    @staticmethod
+    def _debug_context_payload(turn: ChatTurnInput, ctx: ChatTurnContext) -> dict[str, Any] | None:
+        """Operator-only debug blob. Never used as response_text."""
+        if not turn.include_debug:
+            return None
+        from aihub.response_runtime_guard import debug_context_dump
+
+        dump = debug_context_dump(ctx)
+        return {"context": dump} if dump is not None else None
 
     @staticmethod
     def _sse_tool_display_name(name: str) -> str:

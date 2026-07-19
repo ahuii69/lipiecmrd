@@ -105,6 +105,8 @@ class AgentExecutor:
         return {"ok": True, "action": "research", **result}
 
     async def _exec_action(self, params: dict, user_id: str) -> Dict[str, Any]:
+        from aihub.tools.executive_dispatch import dispatch_executive_tool
+
         tool = params.get("tool", params.get("action", ""))
         tool_params = params.get("params", {})
         if not isinstance(tool_params, dict):
@@ -114,41 +116,55 @@ class AgentExecutor:
         if not tool:
             instruction = str(params.get("instruction", ""))
             if re.search(r"https?://", instruction, re.IGNORECASE):
-                tool = "web_fetch"
+                tool = "web.fetch_url"
                 if "url" not in tool_params:
                     match = re.search(r"(https?://[^\s]+)", instruction)
                     if match:
                         tool_params["url"] = match.group(1)
             elif "snapshot" in instruction.lower() or "backup" in instruction.lower():
-                tool = "snapshot"
+                tool = "snapshot.create"
             elif "zapisz" in instruction.lower() or "write" in instruction.lower():
-                tool = "fs_write"
+                tool = "fs.write_file"
+            elif "ingest" in instruction.lower():
+                tool = "web.ingest_url"
+            elif "szukaj" in instruction.lower() or "search" in instruction.lower():
+                tool = "memory.search"
+            elif "obraz" in instruction.lower() or "image" in instruction.lower():
+                tool = "image.generate"
 
-        if tool == "web_fetch":
-            from aihub.web_tools import fetch_url
+        if not tool:
+            return {"ok": False, "error": "unknown tool: (empty)"}
 
-            result = await fetch_url(user_id, tool_params.get("url", ""))
-            return {"ok": True, "action": "tool", "tool": tool, "result": result}
+        confirmed = bool(
+            params.get("_confirmed")
+            or tool_params.get("_confirmed")
+            or params.get("confirmed")
+        )
+        # Merge top-level confirmed into args for MutationPolicy tools.
+        args = {**tool_params}
+        if "url" in params and "url" not in args:
+            args["url"] = params["url"]
+        if "path" in params and "path" not in args:
+            args["path"] = params["path"]
+        if "content" in params and "content" not in args:
+            args["content"] = params["content"]
+        if "query" in params and "query" not in args:
+            args["query"] = params["query"]
+        if "prompt" in params and "prompt" not in args:
+            args["prompt"] = params["prompt"]
+        if "reason" in params and "reason" not in args:
+            args["reason"] = params.get("reason", "agent")
+        if "fact" in params and "fact" not in args:
+            args["fact"] = params["fact"]
 
-        if tool == "fs_write":
-            from aihub.fs_tools import write_file
-
-            result = write_file(
-                user_id,
-                tool_params.get("path", ""),
-                tool_params.get("content", ""),
-                overwrite=bool(tool_params.get("overwrite", True)),
-            )
-            return {"ok": True, "action": "tool", "tool": tool, "result": result}
-
-        if tool in {"snapshot", "system_snapshot"}:
-            from aihub.system_ops import create_snapshot
-
-            result = create_snapshot(user_id, tool_params.get("reason", "agent"))
-            return {"ok": True, "action": "tool", "tool": tool, "result": result}
-
-        logger.warning("Unknown tool in action: %s", tool)
-        return {"ok": False, "error": f"unknown tool: {tool}"}
+        return await dispatch_executive_tool(
+            user_id=user_id,
+            tool_name=str(tool),
+            arguments=args,
+            session_id=str(params.get("session_id") or "agent_executor"),
+            mode="agent",
+            confirmed=confirmed,
+        )
 
     async def _exec_reason(self, params: dict, user_id: str) -> Dict[str, Any]:
         """Reasoning step used by task-graph loop.

@@ -7,13 +7,22 @@ import os
 # These must be set before importing aihub.main/agent_worker, because worker
 # autostart flags are read at module import time.  Tests must never inherit
 # production background workers or production Postgres from a real .env.
+#
+# Force ENV=test (not setdefault): a real `.env` often has ENV=production.
+# If that value remains, `aihub.config._validate_production_secrets()` runs on
+# every `importlib.reload(aihub.config)` in `isolated_db` after hub auth keys
+# are cleared for isolation — and the whole suite aborts before any assertion.
+os.environ["ENV"] = "test"
 os.environ.setdefault("AGENT_AUTOSTART", "0")
 os.environ.setdefault("AIHUB_BACKGROUND_AGENT_LOOP_ENABLED", "0")
 os.environ.setdefault("AIHUB_CONSOLIDATION_WORKER", "0")
 os.environ.setdefault("DB_BACKEND", "sqlite")
 os.environ.setdefault("AIHUB_DISABLE_REMOTE_EMBEDDINGS", "1")
 os.environ.setdefault("AIHUB_DETERMINISTIC_EMBEDDING_FALLBACK", "1")
+os.environ.setdefault("AIHUB_ALLOW_EMBEDDING_PROVIDER_FALLBACK", "0")
 os.environ.setdefault("AIHUB_ALLOW_NUMPY_VECTOR_FALLBACK", "1")
+os.environ.setdefault("AIHUB_HEALTH_LIVE_PROVIDER_PROBE", "0")
+os.environ.setdefault("EMBEDDING_HEALTHCHECK_LIVE_PROBE", "0")
 os.environ.setdefault("AIHUB_BFF_PRINCIPAL_SECRET", "test-principal-secret-value-123456")
 # Unit tests use fake LLM providers; never hit live Groq/DeepInfra reserve in pytest.
 os.environ.setdefault("GROQ_API_KEY", "")
@@ -226,6 +235,10 @@ def isolated_db(tmp_path, monkeypatch, request):
 
     db_file = tmp_path / "test_aihub.sqlite3"
     db_file.parent.mkdir(parents=True, exist_ok=True)
+    # Keep reload outside production secret validation even if a test or shell
+    # previously set ENV=production (production-secret tests monkeypatch ENV
+    # themselves when they call `_validate_production_secrets` directly).
+    monkeypatch.setenv("ENV", "test")
     monkeypatch.setenv("DB_BACKEND", "sqlite")
     monkeypatch.setenv("DB_PATH", str(db_file.resolve()))
     monkeypatch.setenv("DATA_DIR", str(tmp_path))

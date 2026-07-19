@@ -2,22 +2,24 @@
 
 import { useMutation } from "@tanstack/react-query";
 import { UploadCloud } from "lucide-react";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useRef, useState } from "react";
 
-import {
-    ChatComposer,
-    type ChatDraftAttachment,
-} from "@/features/chat/ChatComposer";
+import { ChatComposer, type ChatDraftAttachment } from "@/features/chat/ChatComposer";
+import { ChatConfirmationBar } from "@/features/chat/ChatConfirmationBar";
 import { ChatDrawer } from "@/features/chat/ChatDrawer";
 import { ChatHeader } from "@/features/chat/ChatHeader";
 import { ChatSidebar } from "@/features/chat/ChatSidebar";
 import { ChatStage } from "@/features/chat/ChatStage";
 import { useChatUiStore } from "@/features/chat/chat-ui-store";
 import { Button } from "@/components/ui/button";
-import { streamChatTurn } from "@/lib/api/chat-turn-stream";
+import {
+    streamChatTurn,
+    type PendingConfirmation,
+} from "@/lib/api/chat-turn-stream";
 import { uploadChatFile } from "@/lib/api/chat-upload";
 import { ApiClientError } from "@/lib/api/client";
 import { formatChatTurnErrorMessage } from "@/lib/api/hub-auth-errors";
+import { chatSessionRuntime } from "@/lib/chat/chat-session-runtime";
 import {
     clearDraftAttachments,
     readyDraftFileIds,
@@ -25,6 +27,8 @@ import {
 import { toChatHistoryPayload } from "@/lib/chat/payload-history";
 import { resolveAttachedFileIdsForSend } from "@/lib/chat/resolve-attached-file-ids";
 import { isPlaceholderSessionTitle } from "@/lib/chat/session-title";
+import { useChatUrlSync } from "@/lib/chat/use-chat-url-sync";
+import { subscribeSessionsSync } from "@/lib/chat/sessions-sync";
 import {
     logoutAndRedirect,
     useAuthPrincipal,
@@ -52,36 +56,77 @@ function makeMessageId(): string {
     return `m_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`;
 }
 
-export function ChatShell() {
+export type ChatShellProps = {
+    /**
+     * fullscreen — user `/` (sidebar + URL sync).
+     * embedded — admin AppShell chat section (no ChatSidebar; parent nav).
+     */
+    layout?: "fullscreen" | "embedded";
+    /** Admin cockpit: session.mode + include_debug for debug mode. */
+    adminCapabilities?: boolean;
+};
+
+function ChatUrlSyncBridge({ userId }: { userId: string }) {
+    useChatUrlSync({ userId });
+    return null;
+}
+
+export function ChatShell({
+    layout = "fullscreen",
+    adminCapabilities = false,
+}: ChatShellProps = {}) {
     const { principal, loading: authLoading, error: authError } =
         useAuthPrincipal();
-    const {
-        sessions,
-        activeSessionId,
-        appendMessage,
-        appendMessageContent,
-        patchMessage,
-        truncateSessionMessagesTail,
-        retryPayloadForLastFailedMessage,
-        setLastFailedUserMessage,
-        apiKeyOverride,
-        mergeServerSessions,
-        authUserId,
-    } = useCockpitStore();
-    const session = sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
+    const sessions = useCockpitStore((s) => s.sessions);
+    const activeSessionId = useCockpitStore((s) => s.activeSessionId);
+    const appendMessage = useCockpitStore((s) => s.appendMessage);
+    const appendMessageContent = useCockpitStore((s) => s.appendMessageContent);
+    const patchMessage = useCockpitStore((s) => s.patchMessage);
+    const truncateSessionMessagesTail = useCockpitStore(
+        (s) => s.truncateSessionMessagesTail,
+    );
+    const retryPayloadForLastFailedMessage = useCockpitStore(
+        (s) => s.retryPayloadForLastFailedMessage,
+    );
+    const setLastFailedUserMessage = useCockpitStore(
+        (s) => s.setLastFailedUserMessage,
+    );
+    const apiKeyOverride = useCockpitStore((s) => s.apiKeyOverride);
+    const mergeServerSessions = useCockpitStore((s) => s.mergeServerSessions);
+    const authUserId = useCockpitStore((s) => s.authUserId);
+    const createSession = useCockpitStore((s) => s.createSession);
+    const setActiveSession = useCockpitStore((s) => s.setActiveSession);
+
+    const session =
+        sessions.find((s) => s.id === activeSessionId) ?? sessions[0];
     const userId = authUserId || principal?.userId || session.userId;
 
     const { setSidebarMobileOpen, openDrawer } = useChatUiStore();
 
     const [liveActivity, setLiveActivity] = useState<string | null>(null);
     const [draftFiles, setDraftFiles] = useState<ChatDraftAttachment[]>([]);
+    const [pendingConfirmation, setPendingConfirmation] =
+        useState<PendingConfirmation | null>(null);
     const [dropActive, setDropActive] = useState(false);
     const [suggestion, setSuggestion] = useState<string | null>(null);
-    const abortRef = useRef<AbortController | null>(null);
+    const [sessionsSyncing, setSessionsSyncing] = useState(false);
     const streamingAssistantIdRef = useRef<string | null>(null);
     const dragDepthRef = useRef(0);
-    /** Per-session idempotency key for in-flight / retryable sends. */
     const idempotencyKeyRef = useRef<Map<string, string>>(new Map());
+    const turnGenerationRef = useRef<number>(0);
+    const [inflightSessionId, setInflightSessionId] = useState<string | null>(
+        null,
+    );
+
+    useEffect(() => {
+        chatSessionRuntime.setFlushHandler((sid, mid, chunk) => {
+            appendMessageContent(sid, mid, chunk);
+        });
+        return () => {
+            chatSessionRuntime.abortAll();
+            chatSessionRuntime.setFlushHandler(() => undefined);
+        };
+    }, [appendMessageContent]);
 
     useSessionHistoryFromServer({
         sessionId: session.id,
@@ -89,26 +134,104 @@ export function ChatShell() {
         apiKeyOverride,
     });
 
-    useEffect(() => {
-        let cancelled = false;
-        if (!userId || userId === "default") return () => { cancelled = true; };
-        void (async () => {
+    const syncSessionsFromServer = useCallback(
+        async (opts?: { silent?: boolean }) => {
+            if (!userId || userId === "default") return;
+            if (!opts?.silent) setSessionsSyncing(true);
             try {
                 const response = await apiClient.getSessions(
                     userId,
                     apiKeyOverride || undefined,
                 );
-                if (!cancelled) mergeServerSessions(response.sessions, userId);
+                mergeServerSessions(response.sessions, userId);
+                const serverArchived = response.sessions
+                    .filter((s) => s.archived === true)
+                    .map((s) => s.id);
+                const localArchived =
+                    useChatUiStore.getState().archivedSessionIds;
+                const serverIds = new Set(response.sessions.map((s) => s.id));
+                const toMigrate = localArchived.filter(
+                    (id) => serverIds.has(id) && !serverArchived.includes(id),
+                );
+                for (const id of toMigrate) {
+                    try {
+                        await apiClient.archiveSession(
+                            { user_id: userId, session_id: id },
+                            apiKeyOverride || undefined,
+                        );
+                        serverArchived.push(id);
+                    } catch (err) {
+                        console.error("[chat-shell] archive migrate failed", err);
+                    }
+                }
+                useChatUiStore
+                    .getState()
+                    .replaceArchivedSessionIds(serverArchived);
             } catch (err) {
                 console.error("[chat-shell] session sync failed", err);
+            } finally {
+                if (!opts?.silent) setSessionsSyncing(false);
             }
+        },
+        [userId, apiKeyOverride, mergeServerSessions],
+    );
+
+    useEffect(() => {
+        let cancelled = false;
+        if (!userId || userId === "default") {
+            return () => {
+                cancelled = true;
+            };
+        }
+        void (async () => {
+            await syncSessionsFromServer();
+            if (cancelled) return;
         })();
-        return () => { cancelled = true; };
-    }, [userId, apiKeyOverride, mergeServerSessions]);
+        return () => {
+            cancelled = true;
+        };
+    }, [userId, syncSessionsFromServer]);
+
+    // Multi-tab + focus: no SSE/WebSocket cache for session list — refetch HTTP.
+    useEffect(() => {
+        if (!userId || userId === "default") return;
+        const unsub = subscribeSessionsSync((ev) => {
+            if (ev.userId !== userId) return;
+            void syncSessionsFromServer({ silent: true });
+        });
+        const onVisible = () => {
+            if (document.visibilityState === "visible") {
+                void syncSessionsFromServer({ silent: true });
+            }
+        };
+        document.addEventListener("visibilitychange", onVisible);
+        return () => {
+            unsub();
+            document.removeEventListener("visibilitychange", onVisible);
+        };
+    }, [userId, syncSessionsFromServer]);
 
     useEffect(() => {
         setDraftFiles((prev) => clearDraftAttachments(prev));
+        setLiveActivity(null);
+        setSuggestion(null);
     }, [activeSessionId]);
+
+    const finalizeStreamingBubble = useCallback(
+        (sessionId: string) => {
+            const aid = streamingAssistantIdRef.current;
+            streamingAssistantIdRef.current = null;
+            if (!aid) return;
+            const current = useCockpitStore
+                .getState()
+                .sessions.find((s) => s.id === sessionId)
+                ?.messages.find((m) => m.id === aid);
+            if (current?.streaming) {
+                patchMessage(sessionId, aid, { streaming: false });
+            }
+        },
+        [patchMessage],
+    );
 
     const sendMutation = useMutation<
         void,
@@ -126,6 +249,10 @@ export function ChatShell() {
             sttUsed,
             idempotencyKey,
         }) => {
+            const turn = chatSessionRuntime.beginTurn(sessionId);
+            turnGenerationRef.current = turn.generation;
+            setInflightSessionId(sessionId);
+
             if (retry) truncateSessionMessagesTail(sessionId, 1);
             if (!retry) {
                 appendMessage(sessionId, {
@@ -147,75 +274,160 @@ export function ChatShell() {
                 createdAt: Date.now(),
                 streaming: true,
             });
-            const controller = new AbortController();
-            abortRef.current = controller;
+
+            const liveSession = useCockpitStore
+                .getState()
+                .sessions.find((s) => s.id === sessionId);
+            const turnMode =
+                adminCapabilities && liveSession?.mode
+                    ? liveSession.mode
+                    : "chat";
+            const includeDebug =
+                adminCapabilities && turnMode === "debug";
+
             const idemKey =
                 idempotencyKey ||
-                idempotencyKeyRef.current.get(sessionId) ||
                 (typeof crypto !== "undefined" && "randomUUID" in crypto
                     ? crypto.randomUUID()
                     : `idem_${Date.now()}_${Math.random().toString(16).slice(2)}`);
             idempotencyKeyRef.current.set(sessionId, idemKey);
-            await streamChatTurn(
-                {
-                    user_id: uid,
-                    session_id: sessionId,
-                    message: text,
-                    mode: "chat",
-                    include_debug: false,
-                    history,
-                    idempotency_key: idemKey,
-                    request_id: idemKey,
-                    ...(attachedFileIds.length > 0
-                        ? { attached_file_ids: attachedFileIds }
-                        : {}),
-                    ...(sttUsed === true ? { input_via_stt: true } : {}),
-                },
-                controller.signal,
-                {
-                    includeTurnResult: false,
-                    onDelta: (chunk) =>
-                        appendMessageContent(sessionId, assistantId, chunk),
-                    onReplace: (full) =>
-                        patchMessage(sessionId, assistantId, { content: full }),
-                    onStatus: (_stage, labelPl) => {
-                        if (labelPl) setLiveActivity(labelPl);
+
+            try {
+                await streamChatTurn(
+                    {
+                        user_id: uid,
+                        session_id: sessionId,
+                        message: text,
+                        mode: turnMode,
+                        include_debug: includeDebug,
+                        history,
+                        idempotency_key: idemKey,
+                        request_id: idemKey,
+                        ...(attachedFileIds.length > 0
+                            ? { attached_file_ids: attachedFileIds }
+                            : {}),
+                        ...(sttUsed === true ? { input_via_stt: true } : {}),
                     },
-                    onTool: (name, status) =>
-                        setLiveActivity(
-                            status === "start"
-                                ? `Narzędzie: ${name}`
-                                : "Przetwarzam wynik…",
-                        ),
-                    onMemory: (count) =>
-                        setLiveActivity(`Pamięć: ${count} dopasowań`),
-                    onDone: (_result, attachmentsSummary, contextChips) => {
-                        setLiveActivity(null);
-                        patchMessage(sessionId, assistantId, {
-                            streaming: false,
-                            ...(attachmentsSummary
-                                ? {
-                                      attachmentsSummary,
-                                      attachmentsUsedCount:
-                                          attachedFileIds.length > 0
-                                              ? attachedFileIds.length
-                                              : 1,
-                                  }
-                                : {}),
-                            ...(contextChips && contextChips.length > 0
-                                ? { contextChips }
-                                : {}),
-                        });
-                        void reloadSessionHistoryFromServer({
-                            sessionId,
-                            userId: uid,
-                            apiKeyOverride: keyOverride ?? "",
-                        });
+                    turn.signal,
+                    {
+                        includeTurnResult: adminCapabilities,
+                        onDelta: (chunk) => {
+                            if (
+                                !chatSessionRuntime.isCurrent(
+                                    sessionId,
+                                    turn.generation,
+                                )
+                            ) {
+                                return;
+                            }
+                            chatSessionRuntime.queueDelta(
+                                sessionId,
+                                assistantId,
+                                chunk,
+                                turn.generation,
+                            );
+                        },
+                        onReplace: (full) => {
+                            if (
+                                !chatSessionRuntime.isCurrent(
+                                    sessionId,
+                                    turn.generation,
+                                )
+                            ) {
+                                return;
+                            }
+                            patchMessage(sessionId, assistantId, {
+                                content: full,
+                            });
+                        },
+                        onStatus: (_stage, labelPl) => {
+                            if (
+                                !chatSessionRuntime.isCurrent(
+                                    sessionId,
+                                    turn.generation,
+                                )
+                            ) {
+                                return;
+                            }
+                            if (labelPl) setLiveActivity(labelPl);
+                        },
+                        onTool: (name, status) => {
+                            if (
+                                !chatSessionRuntime.isCurrent(
+                                    sessionId,
+                                    turn.generation,
+                                )
+                            ) {
+                                return;
+                            }
+                            setLiveActivity(
+                                status === "start"
+                                    ? `Narzędzie: ${name}`
+                                    : "Przetwarzam wynik…",
+                            );
+                        },
+                        onMemory: (count) => {
+                            if (
+                                !chatSessionRuntime.isCurrent(
+                                    sessionId,
+                                    turn.generation,
+                                )
+                            ) {
+                                return;
+                            }
+                            setLiveActivity(`Pamięć: ${count} dopasowań`);
+                        },
+                        onDone: (result, attachmentsSummary, contextChips, pendingConfirmations) => {
+                            if (
+                                !chatSessionRuntime.isCurrent(
+                                    sessionId,
+                                    turn.generation,
+                                )
+                            ) {
+                                return;
+                            }
+                            setLiveActivity(null);
+                            if (pendingConfirmations && pendingConfirmations.length > 0) {
+                                setPendingConfirmation(pendingConfirmations[0]);
+                            } else {
+                                setPendingConfirmation(null);
+                            }
+                            patchMessage(sessionId, assistantId, {
+                                streaming: false,
+                                ...(adminCapabilities && result
+                                    ? { diagnostics: result }
+                                    : {}),
+                                ...(attachmentsSummary
+                                    ? {
+                                          attachmentsSummary,
+                                          attachmentsUsedCount:
+                                              attachedFileIds.length > 0
+                                                  ? attachedFileIds.length
+                                                  : 1,
+                                      }
+                                    : {}),
+                                ...(contextChips && contextChips.length > 0
+                                    ? { contextChips }
+                                    : {}),
+                            });
+                            void reloadSessionHistoryFromServer({
+                                sessionId,
+                                userId: uid,
+                                apiKeyOverride: keyOverride ?? "",
+                                generation: turn.generation,
+                            });
+                        },
                     },
-                },
-                keyOverride,
-            );
-            streamingAssistantIdRef.current = null;
+                    keyOverride,
+                );
+            } finally {
+                chatSessionRuntime.endTurn(sessionId, turn.generation);
+                if (
+                    chatSessionRuntime.currentGeneration() === turn.generation
+                ) {
+                    streamingAssistantIdRef.current = null;
+                }
+            }
         },
         onSuccess: (_data, { sessionId, text, retry }) => {
             setLastFailedUserMessage(sessionId, null);
@@ -237,10 +449,10 @@ export function ChatShell() {
             }
         },
         onError: (err, { sessionId, text }) => {
+            idempotencyKeyRef.current.delete(sessionId);
+
             if (err instanceof DOMException && err.name === "AbortError") {
-                const aid = streamingAssistantIdRef.current;
-                streamingAssistantIdRef.current = null;
-                if (aid) patchMessage(sessionId, aid, { streaming: false });
+                finalizeStreamingBubble(sessionId);
                 return;
             }
             console.error("[chat-turn]", err);
@@ -269,8 +481,8 @@ export function ChatShell() {
             setLastFailedUserMessage(sessionId, text);
         },
         onSettled: () => {
-            abortRef.current = null;
             setLiveActivity(null);
+            setInflightSessionId(null);
         },
     });
 
@@ -348,26 +560,38 @@ export function ChatShell() {
         [draftFiles.length, uploadOneFile],
     );
 
-    const handleSend = async (text: string, opts?: { sttUsed?: boolean }) => {
-        const snap =
-            useCockpitStore.getState().sessions.find((s) => s.id === session.id) ??
-            session;
-        const uid = authUserId || principal?.userId || snap.userId;
-        const attachedFileIds = resolveAttachedFileIdsForSend(
-            readyDraftFileIds(draftFiles),
-        );
-        await sendMutation.mutateAsync({
-            text,
-            sessionId: snap.id,
-            userId: uid,
-            history: toChatHistoryPayload(snap.messages),
-            attachedFileIds,
-            keyOverride: apiKeyOverride || undefined,
-            sttUsed: opts?.sttUsed === true,
-        });
-    };
+    const handleSend = useCallback(
+        async (text: string, opts?: { sttUsed?: boolean }) => {
+            const snap =
+                useCockpitStore
+                    .getState()
+                    .sessions.find((s) => s.id === session.id) ?? session;
+            const uid = authUserId || principal?.userId || snap.userId;
+            const attachedFileIds = resolveAttachedFileIdsForSend(
+                readyDraftFileIds(draftFiles),
+            );
+            // Fire-and-forget from composer perspective — mutation owns the turn.
+            await sendMutation.mutateAsync({
+                text,
+                sessionId: snap.id,
+                userId: uid,
+                history: toChatHistoryPayload(snap.messages),
+                attachedFileIds,
+                keyOverride: apiKeyOverride || undefined,
+                sttUsed: opts?.sttUsed === true,
+            });
+        },
+        [
+            apiKeyOverride,
+            authUserId,
+            draftFiles,
+            principal?.userId,
+            sendMutation,
+            session,
+        ],
+    );
 
-    const handleRetry = async () => {
+    const handleRetry = useCallback(async () => {
         const payload = retryPayloadForLastFailedMessage(session.id);
         if (!payload) return;
         const snap =
@@ -388,7 +612,50 @@ export function ChatShell() {
             keyOverride: apiKeyOverride || undefined,
             retry: true,
         });
-    };
+    }, [
+        apiKeyOverride,
+        authUserId,
+        principal?.userId,
+        retryPayloadForLastFailedMessage,
+        sendMutation,
+        session,
+    ]);
+
+    const handleStop = useCallback(() => {
+        const sid = session.id;
+        chatSessionRuntime.abortSession(sid);
+        finalizeStreamingBubble(sid);
+        setLiveActivity(null);
+    }, [finalizeStreamingBubble, session.id]);
+
+    const handleNewChat = useCallback(() => {
+        chatSessionRuntime.resetForNewChat();
+        useCockpitStore.getState().clearAllStreamingFlags();
+        streamingAssistantIdRef.current = null;
+        setInflightSessionId(null);
+        setLiveActivity(null);
+        setDraftFiles((prev) => clearDraftAttachments(prev));
+        setSuggestion(null);
+        createSession();
+        setSidebarMobileOpen(false);
+    }, [createSession, setSidebarMobileOpen]);
+
+    const handleSelectSession = useCallback(
+        (sessionId: string) => {
+            if (sessionId === activeSessionId) {
+                setSidebarMobileOpen(false);
+                return;
+            }
+            chatSessionRuntime.abortAll();
+            useCockpitStore.getState().clearAllStreamingFlags();
+            streamingAssistantIdRef.current = null;
+            setInflightSessionId(null);
+            setLiveActivity(null);
+            setActiveSession(sessionId);
+            setSidebarMobileOpen(false);
+        },
+        [activeSessionId, setActiveSession, setSidebarMobileOpen],
+    );
 
     const onDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
         event.preventDefault();
@@ -407,16 +674,15 @@ export function ChatShell() {
         handlePickFiles(event.dataTransfer.files);
     };
 
-    const loading = sendMutation.isPending;
+    const sessionStreaming = session.messages.some((m) => m.streaming === true);
+    const loading =
+        sessionStreaming ||
+        (sendMutation.isPending && inflightSessionId === session.id);
     const userScopedReady =
         Boolean(userId) && userId !== "default" && !authLoading;
-    const lastMsg = session.messages[session.messages.length - 1];
-    const streamingActive =
-        loading &&
-        lastMsg?.role === "assistant" &&
-        lastMsg.streaming === true;
+    const streamingActive = sessionStreaming;
 
-    if (authError && !principal) {
+    if (authError && !principal && layout === "fullscreen") {
         return (
             <div className="chat-shell flex min-h-[100dvh] items-center justify-center px-4">
                 <div className="max-w-md space-y-3 text-center">
@@ -438,43 +704,76 @@ export function ChatShell() {
         );
     }
 
+    const shellClass =
+        layout === "embedded"
+            ? "chat-shell relative flex h-full min-h-0 w-full min-w-0 overflow-hidden antialiased"
+            : "chat-shell relative flex h-[100dvh] w-full min-w-0 overflow-hidden antialiased";
+
     return (
         <div
-            className="chat-shell relative flex h-[100dvh] w-full min-w-0 overflow-hidden antialiased"
-            data-testid="user-shell"
+            className={shellClass}
+            data-testid={layout === "embedded" ? "admin-chat-shell" : "user-shell"}
             data-user-id={userId}
             onDragEnter={onDragEnter}
             onDragOver={(e) => e.preventDefault()}
             onDragLeave={onDragLeave}
             onDrop={onDrop}
         >
-            <ChatSidebar
-                username={principal?.username}
-                onSelectSession={() => setSidebarMobileOpen(false)}
-                onOpenMemory={() => {
-                    openDrawer("pamiec");
-                    setSidebarMobileOpen(false);
-                }}
-                onOpenFiles={() => {
-                    setLiveActivity(
-                        "Pliki dołączysz ikoną spinacza w polu wiadomości.",
-                    );
-                    window.setTimeout(() => setLiveActivity(null), 4000);
-                    setSidebarMobileOpen(false);
-                }}
-            />
+            {layout === "fullscreen" ? (
+                <Suspense fallback={null}>
+                    <ChatUrlSyncBridge userId={userId} />
+                </Suspense>
+            ) : null}
+
+            {layout === "fullscreen" ? (
+                <ChatSidebar
+                    username={principal?.username}
+                    sessionsSyncing={sessionsSyncing}
+                    onNewChat={handleNewChat}
+                    onSelectSession={handleSelectSession}
+                    onOpenMemory={() => {
+                        openDrawer("pamiec");
+                        setSidebarMobileOpen(false);
+                    }}
+                    onOpenFiles={() => {
+                        setLiveActivity(
+                            "Pliki dołączysz ikoną spinacza w polu wiadomości.",
+                        );
+                        setSidebarMobileOpen(false);
+                    }}
+                />
+            ) : null}
 
             <div className="flex min-h-0 min-w-0 flex-1">
                 <main className="relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden">
-                    <ChatHeader
-                        title={session.title}
-                        apiKeyOverride={apiKeyOverride || undefined}
-                        insightDisabled={!userScopedReady}
-                    />
+                    {layout === "fullscreen" ? (
+                        <ChatHeader
+                            title={session.title}
+                            apiKeyOverride={apiKeyOverride || undefined}
+                            insightDisabled={!userScopedReady}
+                        />
+                    ) : (
+                        <div className="flex shrink-0 items-center justify-between gap-2 border-b border-[var(--chat-border)] px-3 py-2">
+                            <p className="truncate text-sm font-medium text-[var(--chat-text)]">
+                                {session.title}
+                            </p>
+                            <Button
+                                type="button"
+                                size="sm"
+                                variant="outline"
+                                onClick={handleNewChat}
+                            >
+                                Nowa rozmowa
+                            </Button>
+                        </div>
+                    )}
 
                     <div className="relative min-h-0 flex-1 overflow-hidden">
                         <ChatStage
                             key={session.id}
+                            sessionId={session.id}
+                            historyNonce={session.historyNonce ?? 0}
+                            historyStatus={session.historyStatus ?? "idle"}
                             messages={session.messages}
                             loading={loading}
                             onSuggestion={(text) => setSuggestion(text)}
@@ -496,10 +795,33 @@ export function ChatShell() {
                                 Przygotowanie sesji…
                             </p>
                         ) : null}
+                        {pendingConfirmation ? (
+                            <ChatConfirmationBar
+                                pending={pendingConfirmation}
+                                userId={userId}
+                                sessionId={session.id}
+                                mode={
+                                    adminCapabilities && session.mode
+                                        ? session.mode
+                                        : "chat"
+                                }
+                                apiKeyOverride={apiKeyOverride || undefined}
+                                onDismiss={() => setPendingConfirmation(null)}
+                                onConfirmed={(summary) => {
+                                    setPendingConfirmation(null);
+                                    appendMessage(session.id, {
+                                        id: makeMessageId(),
+                                        role: "assistant",
+                                        content: summary,
+                                        createdAt: Date.now(),
+                                    });
+                                }}
+                            />
+                        ) : null}
                         <ChatComposer
                             onSend={handleSend}
                             onRetry={handleRetry}
-                            onStop={() => abortRef.current?.abort()}
+                            onStop={handleStop}
                             disabled={loading || !userScopedReady}
                             retryDisabled={!session.lastFailedUserMessage}
                             stopVisible={streamingActive}
@@ -521,11 +843,14 @@ export function ChatShell() {
                     </div>
                 </main>
 
-                <ChatDrawer
-                    userId={userId}
-                    apiKeyOverride={apiKeyOverride || undefined}
-                    messages={session.messages}
-                />
+                {layout === "fullscreen" ? (
+                    <ChatDrawer
+                        userId={userId}
+                        sessionId={session.id}
+                        apiKeyOverride={apiKeyOverride || undefined}
+                        messages={session.messages}
+                    />
+                ) : null}
             </div>
 
             {dropActive ? (

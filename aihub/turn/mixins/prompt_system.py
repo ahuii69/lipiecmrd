@@ -61,11 +61,20 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
         )
 
         pack = str((ctx.system_context or {}).get('memory_context_pack_prompt') or '').strip()
+        if _budget is not None and 'memory_pack' in (getattr(_budget, 'layers_skipped', None) or []):
+            pack = ""
         mem = (memory_brief or '').strip()
+        if _budget is not None and 'memory' in (getattr(_budget, 'layers_skipped', None) or []):
+            mem = ""
         if pack:
             mem = (mem + "\n" + pack).strip() if mem else pack
         procs = ""
-        if memory_v2_context and getattr(memory_v2_context, 'loaded', False) and memory_v2_context.top_procedures:
+        if (
+            memory_v2_context
+            and getattr(memory_v2_context, 'loaded', False)
+            and memory_v2_context.top_procedures
+            and not (_budget is not None and 'procedures' in (getattr(_budget, 'layers_skipped', None) or []))
+        ):
             bits = []
             for p in memory_v2_context.top_procedures[:2]:
                 if not isinstance(p, dict):
@@ -78,10 +87,13 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
                 else:
                     bits.append(f"{label} [id={p.get('id')}] (conf={conf:.2f})")
             procs = "; ".join(bits)
+        ch = correction_hints or ""
+        if _budget is not None and 'corrections' in (getattr(_budget, 'layers_skipped', None) or []):
+            ch = ""
         text = build_contextual_bounded_system_prompt(
             memory_brief=mem,
-            psyche_brief=psyche_brief or "",
-            correction_hints=correction_hints or "",
+            psyche_brief=(psyche_brief or "") if not (_budget is not None and 'psyche' in (getattr(_budget, 'layers_skipped', None) or [])) else "",
+            correction_hints=ch,
             procedures_brief=procs,
         )
         if isinstance(ctx.system_context, dict):
@@ -107,6 +119,45 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
                 history_messages=[],
                 tool_schema_chars=0,
                 layer_chars={'research_bounded': len(text)},
+            )
+        return text
+    if _budget is not None and getattr(_budget, 'profile', None) == 'agentic':
+        from aihub.turn.prompt_budget import (
+            build_agentic_bounded_system_prompt,
+            build_prompt_budget_trace,
+        )
+
+        pack = str((ctx.system_context or {}).get('memory_context_pack_prompt') or '').strip()
+        mem = (memory_brief or '').strip()
+        if pack:
+            mem = (mem + "\n" + pack).strip() if mem else pack
+        procs = ""
+        if memory_v2_context and getattr(memory_v2_context, 'loaded', False) and memory_v2_context.top_procedures:
+            procs = "; ".join(
+                f"{p.get('name')}::{str(p.get('steps') or p.get('recommended_strategy') or '')[:200]}"
+                for p in memory_v2_context.top_procedures[:2]
+                if isinstance(p, dict)
+            )
+        lht = ""
+        planner = ""
+        if isinstance(ctx.system_context, dict):
+            ld = ctx.system_context.get('learning_decision') or {}
+            if isinstance(ld, dict):
+                lht = str(ld.get('long_horizon_brief') or '').strip()
+            planner = str(ctx.system_context.get('planner_brief') or '').strip()
+        text = build_agentic_bounded_system_prompt(
+            memory_brief=mem,
+            planner_brief=planner,
+            long_horizon_brief=lht,
+            procedures_brief=procs,
+        )
+        if isinstance(ctx.system_context, dict):
+            ctx.system_context['prompt_budget'] = build_prompt_budget_trace(
+                decision=_budget,
+                system_text=text,
+                history_messages=[],
+                tool_schema_chars=0,
+                layer_chars={'agentic_bounded': len(text)},
             )
         return text
     caps = [f'- {c.name}: {c.description}' for c in ctx.capabilities]
@@ -135,7 +186,11 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
         if psyche_v2_context.structuredness_bias > 0.7 or psyche_v2_context.pressure > 0.5:
             style_parts.append('Odpowiedź uporządkowana i strukturalna — punkty, kroki, jasna struktura.')
         if style_parts:
-            behavior_instructions = '\n\nAKTYWNE WSKAZÓWKI BEHAWIORALNE (Psyche V2):\n' + '\n'.join((f'• {part}' for part in style_parts))
+            behavior_instructions = (
+                '\n\n[Psyche V2 — polityka zachowania PRIMARY]\n'
+                'Te wskazówki modulują ton i ostrożność; mają pierwszeństwo nad snapshotem V1.\n'
+                + '\n'.join((f'• {part}' for part in style_parts))
+            )
     memory_context_injection = ''
     if memory_v2_context and memory_v2_context.loaded:
         ctx_parts = []
@@ -173,13 +228,30 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
     attachment_rules = ''
     if files_context:
         attachment_rules = 'ZAŁĄCZNIKI — reguła twarda:\n- W systemie występuje sekcja ATTACHMENTS_CONTEXT: to jedyne źródło faktów o dołączonych plikach i obrazach.\n- Gdy użytkownik pisze „plik”, „załącznik”, „co dołączyłem” — bazuj na tej sekcji, nie na domysłach.\n- Gdy odczyt się nie udał albo brak vision dla obrazu — powiedz to wprost, bez wymyślania treści.\n\n'
-    system_rules = attachment_rules + f'Jesteś Mordzix — AI-Hub, partner rozmowy po polsku. Ton: naturalny, pewny, konkretny; „Mordo” gdy pasuje. Bez helpdesku i bez korpo-fraz. Nie udawaj człowieka z prywatnym życiem.\n\n{thread_continuity}Styl i ton:\n- Odpowiadaj merytorycznie i na temat; luz nigdy nie zastępuje treści, ale sztywny urzędnik też odpada.\n- ZAKAZ helpdesk / korpo-fraz: „Jak mogę pomóc”, „Co dziś potrzebujesz”, „Jestem gotowy”, „Co konkretnie chciałbyś zrobić”, „Oczywiście”, „Rozumiem Twoją frustrację”, „w czym mogę pomóc”, „chętnie pomogę”, „Działa. Gotowy…”, „jestem gotowy do rozmowy”.\n- Bądź proaktywny: gdy temat na to pozwala, dopowiedz kontekst, zaproponuj kolejny krok albo dopytaj o brakujący konkret — jak partner, nie jak formularz.\n- Humor i ironia: gdy naturalnie pasują do rozmowy; nigdy kosztem jasności ani zamiast odpowiedzi.\n- Wolno krótko zasygnalizować sceptycyzm, gdy pytanie jest naciągane albo sprzeczne — bez obrazy osoby, bez złośliwości i bez ataku w rewanżu.\n- Przekleństwa: domyślnie tak. Dopuszczalne tylko, jeśli użytkownik wyraźnie nadaje taki ton i to naturalnie pasuje — nigdy jako styl każdego zdania i nigdy jako odbicie agresji.\n- Technikalia (kod, liczby, procedury): precyzyjnie i konkretnie; luz nie znaczy niedbale.\n- Smalltalk / „co słychać?”: krótko, naturalnie, z pazurem — bez infolinii. ZAKAZ fałszywej biografii: nie pisz, że żyjesz, nudzisz się, walczysz z kodem, pijesz kawę ani nagradzasz się poezją — chyba że user o to pyta.\n- Wiadomość agresywna lub wulgarna: przyznaj, gdy coś poszło nie tak; poproś o doprecyzowanie; nie odbijaj agresji w rewanżu; nie rób poezji ani metafor zamiast konkretu.\n- Psyche i pamięć nie mogą wymuszać personifikacji ani kopiowania tonu wcześniejszej kłótni.\n' + PERSONA_CONTRACT_PROMPT + PRODUCT_IDENTITY_PROMPT
-    product_rules = '\nProdukt — sekrety i granice:\n- Nie odmawiaj tylko dlatego, że w treści są słowa typu hasło, kod, token czy sekret.\n- Zapis/odczyt/usunięcie sekretu: wyłącznie vault (deterministyczna ścieżka) — bez pouczania i bez frazy w stylu „nie mogę przechowywać haseł”.\n- Pytania o wcześniejsze wiadomości w tej sesji: tylko z historii w żądaniu; nie zgaduj.\n- Zwykłe prośby i pamięć: obsłuż konkretnie, bez automatycznych odmów.\n- Grafika / obrazy / prompty do DALL·E, Stable Diffusion, Midjourney: ZAWSZE podaj gotowy prompt (najlepiej EN w bloku kodu) + krótki opis PL + opcjonalny negative prompt. NIGDY nie używaj ogólnych odmów w stylu „nie mogę pomóc”, „nie mogę tego zrobić”, „to niewłaściwe” ani moralizowania. Jeśli treść jest niejasna lub „dziwna” — zrób bezpieczną, stylizowaną wersję artystyczną / surrealistyczną bez oceny użytkownika.\n'
-    execution_rules = f"\nCo ogarniasz dobrze:\n- Kod: kompletne, działające pliki/moduły (importy, obsługa błędów, struktura), bez niedokończonych markerów. Najpierw krótki plan punktami, potem pełna treść + jak uruchomić.\n- Grafika / prompty do modeli obrazu: konkret, bez plastiku.\n- Teksty (ogłoszenia, posty): żywo, bez korpo-pustaków.\n- Web: musisz szukać i weryfikować, gdy realnie użyjesz narzędzia; bez zgadywania. Przy braku wyniku: opisz co sprawdziłeś i poproś o doprecyzowanie — nigdy surowe „BRAK DANYCH”.\n- Jeśli czegoś nie wiesz — nie udawaj; powiedz wprost albo zaproponuj sprawdzenie.\n\nTwarde zasady prawdomówności wykonania:\n1) Nie twierdź, że coś sprawdziłeś/uruchomiłeś/pobrałeś, jeśli w tej turze nie było realnego wykonania narzędzia.\n2) Rozróżniaj: 'mam dostęp do capability' vs 'użyłem capability teraz'.\n3) Jeśli czegoś nie zweryfikowano runtime, powiedz to wprost i zaproponuj sprawdzenie.\n4) Nie udawaj braku fallbacku ani jego użycia — mów zgodnie ze śladem wykonania.\nGdy potrzebujesz danych operacyjnych, użyj narzędzi zamiast zgadywania.\n\nReguła twarda: nie wymyślaj brakujących konkretów.\n- Jeśli użytkownik nie podał danych i nie ma ich w pamięci, załącznikach albo zweryfikowanych źródłach, NIE dopisuj ich sam.\n- Dotyczy to m.in.: roku, przebiegu, silnika, wersji, ceny, lokalizacji, metrażu, stanu technicznego, dokumentacji, wyposażenia, wyników, cytatów, źródeł i parametrów produktu.\n- Gdy danych brak, użyj neutralnego opisu, napisz „BRAK DANYCH” albo dopytaj o brakujący konkret.\n- Jeśli użytkownik wskazuje, że wcześniejszy konkret nie był podany, przyznaj brak podstaw i popraw odpowiedź bez bronienia zgadywania.\n- W zadaniach edycji/rewrite poprawiaj tylko to, co wynika z treści wejściowej; nie doklejaj nowych faktów.\n\nPsyche ma rolę pomocniczą, nie dominującą.\n- Priorytet: intencja użytkownika i wykonanie zadania.\n- W zadaniach technicznych, praktycznych i informacyjnych trzymaj ton spokojny, rzeczowy i adekwatny.\n- Bez pseudo-terapii, bez projekcji emocji, bez teatralnych reakcji i bez odlatywania od celu.\n- W copy/creative możesz dodać vibe, ale nie kosztem faktów, użyteczności i czytelności.\nTryb wykonania: {ctx.mode}.\n"
+    from aihub.response_runtime_guard import PRIVATE_CONTEXT_PROMPT_RULE
+    system_rules = attachment_rules + PRIVATE_CONTEXT_PROMPT_RULE + f'\nJesteś Mordzix — AI-Hub, partner rozmowy po polsku. Ton: naturalny, pewny, konkretny; „Mordo” gdy pasuje. Bez helpdesku i bez korpo-fraz. Nie udawaj człowieka z prywatnym życiem.\n\n{thread_continuity}Styl i ton:\n- Odpowiadaj merytorycznie i na temat; luz nigdy nie zastępuje treści, ale sztywny urzędnik też odpada.\n- ZAKAZ helpdesk / korpo-fraz: „Jak mogę pomóc”, „Co dziś potrzebujesz”, „Jestem gotowy”, „Co konkretnie chciałbyś zrobić”, „Oczywiście”, „Rozumiem Twoją frustrację”, „w czym mogę pomóc”, „chętnie pomogę”, „Działa. Gotowy…”, „jestem gotowy do rozmowy”.\n- Bądź proaktywny: gdy temat na to pozwala, dopowiedz kontekst, zaproponuj kolejny krok albo dopytaj o brakujący konkret — jak partner, nie jak formularz.\n- Humor i ironia: gdy naturalnie pasują do rozmowy; nigdy kosztem jasności ani zamiast odpowiedzi.\n- Wolno krótko zasygnalizować sceptycyzm, gdy pytanie jest naciągane albo sprzeczne — bez obrazy osoby, bez złośliwości i bez ataku w rewanżu.\n- Przekleństwa: domyślnie tak. Dopuszczalne tylko, jeśli użytkownik wyraźnie nadaje taki ton i to naturalnie pasuje — nigdy jako styl każdego zdania i nigdy jako odbicie agresji.\n- Technikalia (kod, liczby, procedury): precyzyjnie i konkretnie; luz nie znaczy niedbale.\n- Smalltalk / „co słychać?”: krótko, naturalnie, z pazurem — bez infolinii. ZAKAZ fałszywej biografii: nie pisz, że żyjesz, nudzisz się, walczysz z kodem, pijesz kawę ani nagradzasz się poezją — chyba że user o to pyta.\n- Wiadomość agresywna lub wulgarna: przyznaj, gdy coś poszło nie tak; poproś o doprecyzowanie; nie odbijaj agresji w rewanżu; nie rób poezji ani metafor zamiast konkretu.\n- Psyche i pamięć nie mogą wymuszać personifikacji ani kopiowania tonu wcześniejszej kłótni.\n' + PERSONA_CONTRACT_PROMPT + PRODUCT_IDENTITY_PROMPT
+    product_rules = (
+        '\nProdukt — sekrety i granice:\n'
+        '- Nie odmawiaj tylko dlatego, że w treści są słowa typu hasło, kod, token czy sekret.\n'
+        '- Zapis/odczyt/usunięcie sekretu: wyłącznie vault (deterministyczna ścieżka) — bez pouczania '
+        'i bez frazy w stylu „nie mogę przechowywać haseł”.\n'
+        '- Pytania o wcześniejsze wiadomości w tej sesji: tylko z historii w żądaniu; nie zgaduj.\n'
+        '- Zwykłe prośby i pamięć: obsłuż konkretnie, bez automatycznych odmów.\n'
+        '- Grafika / obrazy: użyj narzędzia image.generate — runtime renderuje prawdziwy PNG '
+        'i wstawia go w odpowiedzi (markdown). NIE zastępuj tego samym tekstem „prompt do DALL·E / Midjourney”. '
+        'NIGDY nie używaj ogólnych odmów w stylu „nie mogę pomóc”, „nie mogę tego zrobić”, „to niewłaściwe” '
+        'ani moralizowania. Jeśli motyw jest niejasny lub „dziwny” — wygeneruj bezpieczną, stylizowaną '
+        'wersję artystyczną / surrealistyczną bez oceny użytkownika.\n'
+    )
+    execution_rules = f"\nCo ogarniasz dobrze:\n- Kod: kompletne, działające pliki/moduły (importy, obsługa błędów, struktura), bez niedokończonych markerów. Najpierw krótki plan punktami, potem pełna treść + jak uruchomić.\n- Grafika: realny obraz przez image.generate (nie sam prompt tekstowy), bez plastiku.\n- Teksty (ogłoszenia, posty): żywo, bez korpo-pustaków.\n- Web: musisz szukać i weryfikować, gdy realnie użyjesz narzędzia; bez zgadywania. Przy braku wyniku: opisz co sprawdziłeś i poproś o doprecyzowanie — nigdy surowe „BRAK DANYCH”.\n- Jeśli czegoś nie wiesz — nie udawaj; powiedz wprost albo zaproponuj sprawdzenie.\n\nTwarde zasady prawdomówności wykonania:\n1) Nie twierdź, że coś sprawdziłeś/uruchomiłeś/pobrałeś, jeśli w tej turze nie było realnego wykonania narzędzia.\n2) Rozróżniaj: 'mam dostęp do capability' vs 'użyłem capability teraz'.\n3) Jeśli czegoś nie zweryfikowano runtime, powiedz to wprost i zaproponuj sprawdzenie.\n4) Nie udawaj braku fallbacku ani jego użycia — mów zgodnie ze śladem wykonania.\nGdy potrzebujesz danych operacyjnych, użyj narzędzi zamiast zgadywania.\n\nReguła twarda: nie wymyślaj brakujących konkretów.\n- Jeśli użytkownik nie podał danych i nie ma ich w pamięci, załącznikach albo zweryfikowanych źródłach, NIE dopisuj ich sam.\n- Dotyczy to m.in.: roku, przebiegu, silnika, wersji, ceny, lokalizacji, metrażu, stanu technicznego, dokumentacji, wyposażenia, wyników, cytatów, źródeł i parametrów produktu.\n- Gdy danych brak, użyj neutralnego opisu, napisz „BRAK DANYCH” albo dopytaj o brakujący konkret.\n- Jeśli użytkownik wskazuje, że wcześniejszy konkret nie był podany, przyznaj brak podstaw i popraw odpowiedź bez bronienia zgadywania.\n- W zadaniach edycji/rewrite poprawiaj tylko to, co wynika z treści wejściowej; nie doklejaj nowych faktów.\n\nPsyche ma rolę pomocniczą, nie dominującą.\n- Priorytet: intencja użytkownika i wykonanie zadania.\n- W zadaniach technicznych, praktycznych i informacyjnych trzymaj ton spokojny, rzeczowy i adekwatny.\n- Bez pseudo-terapii, bez projekcji emocji, bez teatralnych reakcji i bez odlatywania od celu.\n- W copy/creative możesz dodać vibe, ale nie kosztem faktów, użyteczności i czytelności.\nTryb wykonania: {ctx.mode}.\n"
     sales_listing_layer = ''
     if listing_sales_boost:
         sales_listing_layer = '\nTreść sprzedażowa / ogłoszeniowa (Vinted, OLX itd.) — ACTIVE:\n- Nie odmawiaj z powodu braku web; nie wymagaj „sprawdzenia w internecie”, chyba że user podał URL albo wyraźnie chce aktualnych cen/danych rynkowych.\n- NIE wymyślaj twardych parametrów oferty (rok, przebieg, silnik, wersja, stan, dokumentacja, wyposażenie, cena, lokalizacja, metraż, piętro, producent, gwarancja), jeśli user ich nie podał. Braki oznaczaj wprost jako „BRAK DANYCH” albo buduj neutralny opis bez takich konkretów.\n- Nie wpisuj też „stan dobry”, „serwisowany”, „gotowy do jazdy”, „po remoncie” itp., jeśli to nie padło od usera.\n- Pisz po ludzku: naturalny rytm, konkret, lekki pazur, zero tonu „asystenta” i zero urzędnika. Bez pustych fraz typu „przedmiot jest w dobrym stanie” — zamiast tego sensoryczny szczegół albo uczciwy hook.\n- Unikaj sztucznego entuzjazmu i lania wody; sprzedaż bez spamu.\nStruktura odpowiedzi (nagłówki markdown):\n1. **Krótki opis** — jeden zwarty akapit.\n2. **Mocniejsza wersja** — wersja z większym „gryzem”.\n3. **Słowa kluczowe** — lista lub linia, gotowa do wklejenia.\n4. **Tagi** — krótka lista hashtagów lub fraz pod wyszukiwarkę ogłoszeń.\n'
-    psyche_layer = f'\nKontekst psyche / styl zachowania (ACTIVE):\n{psyche_brief}\n{behavior_instructions}'
+    psyche_layer = (
+        f'\nKontekst psyche (ACTIVE):\n'
+        f'Role: Psyche V2 = polityka zachowania (primary); Psyche V1 = kompaktowy snapshot stanu (compat).\n'
+        f'{psyche_brief}\n{behavior_instructions}'
+    )
     memory_context_pack_text = str(ctx.system_context.get('memory_context_pack_prompt') or '').strip()
     memory_context_pack_layer = ''
     if memory_context_pack_text:
@@ -233,8 +305,17 @@ def run_build_system_prompt(self, ctx: ChatTurnContext, *, memory_brief: str, ps
             acc = list(_ld.get('long_horizon_accepted') or [])
             if acc:
                 lines.append('Zaakceptowane decyzje: ' + ' | '.join(str(x)[:80] for x in acc[-4:]))
-            if _ld.get('long_horizon_task_id'):
+            brief = str(_ld.get('long_horizon_brief') or '').strip()
+            if brief:
+                lines.append(brief)
+            elif _ld.get('long_horizon_task_id'):
                 lines.append(f"- active_long_horizon_task={_ld.get('long_horizon_task_id')}")
+                if _ld.get('long_horizon_title'):
+                    lines.append(f"- title={_ld.get('long_horizon_title')}")
+                if _ld.get('long_horizon_next_step'):
+                    lines.append(f"- next_step={_ld.get('long_horizon_next_step')}")
+                if _ld.get('long_horizon_stage'):
+                    lines.append(f"- stage={_ld.get('long_horizon_stage')}")
             if len(lines) > 1:
                 learning_layer = '\n\n' + '\n'.join(lines) + '\n'
     except Exception:

@@ -945,8 +945,13 @@ def save_long_horizon_task(task: LongHorizonTask) -> None:
 
 
 def get_active_long_horizon_task(
-    *, user_id: str, session_id: str = ""
+    *, user_id: str, session_id: str = "", allow_cross_session: bool = True
 ) -> LongHorizonTask | None:
+    """Return the newest active long-horizon task for the user.
+
+    Prefer the current session when present, but fall back to any active
+    user-level task so status/next-step questions work across new sessions.
+    """
     ensure_ready()
     if session_id:
         row = fetch_one(
@@ -957,18 +962,73 @@ def get_active_long_horizon_task(
             """,
             (user_id, session_id),
         )
-    else:
-        row = fetch_one(
-            """
-            SELECT * FROM long_horizon_tasks
-            WHERE user_id=? AND status IN ('active','blocked','paused')
-            ORDER BY updated_at DESC LIMIT 1
-            """,
-            (user_id,),
-        )
+        if row:
+            return _row_to_task(row)
+        if not allow_cross_session:
+            return None
+    row = fetch_one(
+        """
+        SELECT * FROM long_horizon_tasks
+        WHERE user_id=? AND status IN ('active','blocked','paused')
+        ORDER BY updated_at DESC LIMIT 1
+        """,
+        (user_id,),
+    )
     if not row:
         return None
     return _row_to_task(row)
+
+
+def find_long_horizon_task_by_marker(
+    *, user_id: str, marker: str
+) -> LongHorizonTask | None:
+    """Locate an active task whose title/objective mentions a distinctive marker."""
+    ensure_ready()
+    marker = (marker or "").strip()
+    if len(marker) < 4:
+        return None
+    rows = fetch_all(
+        """
+        SELECT * FROM long_horizon_tasks
+        WHERE user_id=? AND status IN ('active','blocked','paused')
+        ORDER BY updated_at DESC LIMIT 25
+        """,
+        (user_id,),
+    )
+    needle = marker.lower()
+    for row in rows:
+        blob = f"{row['title'] or ''} {row['objective'] or ''}".lower()
+        if needle in blob:
+            return _row_to_task(row)
+    return None
+
+
+def format_long_horizon_brief(task: LongHorizonTask | None, *, max_chars: int = 900) -> str:
+    """Canonical prompt brief for an active long-horizon task (not just an opaque id)."""
+    if task is None:
+        return ""
+    lines = [
+        f"ZADANIE DŁUGOTERMINOWE [{task.task_id}]",
+        f"- title: {task.title}",
+        f"- status: {task.status}",
+        f"- stage: {task.current_stage}",
+    ]
+    if task.objective:
+        lines.append(f"- objective: {task.objective[:220]}")
+    if task.next_best_action:
+        lines.append(f"- next_step: {task.next_best_action[:180]}")
+    if task.pending_steps:
+        lines.append("- pending: " + " | ".join(str(s)[:80] for s in task.pending_steps[:4]))
+    if task.completed_steps:
+        lines.append("- completed: " + " | ".join(str(s)[:80] for s in task.completed_steps[-3:]))
+    if task.blockers:
+        lines.append("- blockers: " + " | ".join(str(b)[:80] for b in task.blockers[:3]))
+    if task.accepted_decisions:
+        lines.append("- accepted: " + " | ".join(str(a)[:80] for a in task.accepted_decisions[-3:]))
+    if task.rejected_decisions:
+        lines.append("- rejected: " + " | ".join(str(r)[:80] for r in task.rejected_decisions[-3:]))
+    text = "\n".join(lines)
+    return text[: max(200, int(max_chars))]
 
 
 def _row_to_task(row: Any) -> LongHorizonTask:

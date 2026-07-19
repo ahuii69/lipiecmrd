@@ -608,7 +608,7 @@ class WebMixin:
             usage=ProviderUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
             trace=trace,
             errors=errors,
-            debug={"context": ctx.model_dump()} if turn.include_debug else None,
+            debug=self._debug_context_payload(turn, ctx),
             attachments_summary=attachments_summary,
         )
         _TRACE_CACHE[turn.user_id].append(result.trace)

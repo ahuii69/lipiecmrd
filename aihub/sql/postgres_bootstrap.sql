@@ -12,6 +12,8 @@ CREATE TABLE IF NOT EXISTS chat_sessions (
             title TEXT NOT NULL,
             created_at DOUBLE PRECISION NOT NULL,
             updated_at DOUBLE PRECISION NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            archived_at DOUBLE PRECISION,
             PRIMARY KEY (user_id, id)
         );
 CREATE TABLE IF NOT EXISTS chat_uploaded_files (
@@ -415,6 +417,9 @@ CREATE INDEX IF NOT EXISTS idx_nodes_user_imp ON memory_nodes(user_id, importanc
 CREATE INDEX IF NOT EXISTS idx_stm_user_ts ON stm_messages(user_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_event_user_ts ON event_log(user_id, ts DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_updated ON chat_sessions(user_id, updated_at DESC);
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS archived INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE chat_sessions ADD COLUMN IF NOT EXISTS archived_at DOUBLE PRECISION;
+CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_archived ON chat_sessions(user_id, archived, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_chat_uploads_session ON chat_uploaded_files(user_id, session_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_user_vault_user ON user_vault_entries(user_id);
 CREATE INDEX IF NOT EXISTS idx_chat_sess_msg_session ON chat_session_messages(user_id, session_id, created_at ASC, id ASC);

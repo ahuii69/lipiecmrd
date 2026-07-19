@@ -370,10 +370,7 @@ def capability_matrix() -> dict[str, Any]:
         row = layers.get(name) if isinstance(layers.get(name), dict) else {}
         return str(row.get("status") or "unknown")
 
-    return {
-        "ok": health.get("status") != "error",
-        "status": health.get("status"),
-        "capabilities": {
+    caps = {
             "chat": layer_status("llm") != "error" and layer_status("database") != "error",
             "memory": layer_status("memory_v1") != "error" and layer_status("memory_v2") != "error",
             "memory_semantic_index": layer_status("vector") != "error" and layer_status("embeddings") != "error",
@@ -383,7 +380,28 @@ def capability_matrix() -> dict[str, Any]:
             "stt": layer_status("stt") == "ok",
             "vision": layer_status("vision") == "ok",
             "frontend_toolchain": layer_status("frontend_toolchain") == "ok",
-        },
+            "cost_ledger": True,
+            "adaptive_runtime": True,
+            "continuous_self_eval": True,
+            "response_variants": True,
+            "simulation": True,
+            "planner": True,
+            "agent_workers": _env_bool("AIHUB_BACKGROUND_AGENT_LOOP_ENABLED", "0")
+            or _env_bool("AGENT_AUTOSTART", "0"),
+        }
+    # Agent worker observability for cockpit
+    agent_info: dict[str, Any] = {
+        "enabled": bool(caps["agent_workers"]),
+        "interval_s": float(os.getenv("AGENT_INTERVAL_S", "3.5") or 3.5),
+        "user_id": (os.getenv("AGENT_USER_ID") or "system:maintenance")[:64],
+    }
+    return {
+        "ok": health.get("status") != "error",
+        "status": health.get("status"),
+        "environment": os.getenv("ENV", "development"),
+        "frontend_environment_expected": "production" if os.getenv("ENV") == "production" else os.getenv("ENV", "development"),
+        "capabilities": caps,
+        "agent_workers": agent_info,
         "layers": {name: layer_status(name) for name in sorted(layers)},
         "ts": health.get("ts", time.time()),
     }

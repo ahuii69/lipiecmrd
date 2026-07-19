@@ -89,22 +89,22 @@ export function ChatComposer({
         [],
     );
 
-    const submitMessage = async (text: string) => {
+    const submitMessage = (text: string) => {
         const previous = value;
-        try {
-            await onSend(text, { sttUsed: lastInputViaSttRef.current });
-            lastInputViaSttRef.current = false;
-            setValue("");
-        } catch {
-            setValue(previous);
-        }
+        const viaStt = lastInputViaSttRef.current;
+        // Natychmiast wyczyść composer — bańka pojawia się w stage, nie w ramce.
+        setValue("");
+        lastInputViaSttRef.current = false;
+        void onSend(text, { sttUsed: viaStt }).catch(() => {
+            setValue((current) => (current.trim() ? current : previous));
+        });
     };
 
-    const submit = async (e: FormEvent) => {
+    const submit = (e: FormEvent) => {
         e.preventDefault();
         const text = value.trim();
         if (!text || disabled) return;
-        await submitMessage(text);
+        submitMessage(text);
     };
 
     const startRecording = async () => {
@@ -279,7 +279,7 @@ export function ChatComposer({
                             setValue(e.target.value);
                         }}
                         placeholder={COMPOSER_PLACEHOLDER}
-                        onKeyDown={async (e: KeyboardEvent<HTMLTextAreaElement>) => {
+                        onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
                             if (
                                 e.key === "Enter" &&
                                 !e.shiftKey &&
@@ -290,7 +290,7 @@ export function ChatComposer({
                                 e.preventDefault();
                                 const text = value.trim();
                                 if (!text || disabled) return;
-                                await submitMessage(text);
+                                submitMessage(text);
                             }
                         }}
                         rows={1}

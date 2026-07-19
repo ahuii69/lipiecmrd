@@ -369,6 +369,24 @@ def research_trigger_reason_codes(user_text: str) -> list[str]:
     if _explicit_check_intent(lower, ascii_l) and not local_howto_no_web_intent(t):
         codes.append("EXPLICIT_CHECK_REQUEST")
     time_sensitive = _text_has_marker(lower, ascii_l, _TIME_SENSITIVE_MARKERS)
+
+    # Dynamic relative freshness windows, e.g.:
+    # "z ostatnich 48 godzin", "z ostatnich 7 dni",
+    # "w ciągu ostatnich 2 tygodni".
+    import re
+    relative_freshness_window = bool(
+        re.search(
+            r"(?iu)\b(?:z|w\s+ciągu|w\s+ciagu)?\s*"
+            r"ostatni(?:ch|e|ą|a|ego|ej)?\s+"
+            r"(?:\d+|kilku|paru)\s+"
+            r"(?:minut(?:y|ach)?|godzin(?:y|ach)?|dni(?:ach)?|"
+            r"tygodni(?:e|ach)?|miesięcy|miesiecy)\b",
+            lower,
+        )
+    )
+    if relative_freshness_window:
+        time_sensitive = True
+
     if time_sensitive and _IMPERATIVE_NOW_NO_WEB.search(t):
         # "Wykonaj teraz X" is urgency, not a freshness/web lookup.
         time_sensitive = _text_has_marker(
@@ -563,6 +581,17 @@ AGENTIC_MULTISTEP_MARKERS = (
 _ASSISTANT_META_ASK_MARKERS = (
     "kim jesteś",
     "kim jestes",
+    "czym jesteś",
+    "czym jestes",
+    "jakie masz możliwości",
+    "jakie masz mozliwosci",
+    "jakie posiadasz możliwości",
+    "jakie posiadasz mozliwosci",
+    "jakie masz funkcje",
+    "jakimi funkcjami dysponujesz",
+    "co umiesz",
+    "co możesz zrobić",
+    "co mozesz zrobic",
     "jak działasz",
     "jak dzialasz",
     "jak działacie",
@@ -630,6 +659,25 @@ def is_assistant_meta_ask(user_text: str) -> bool:
         return False
     if any(m in lower or _strip_diacritics(m) in ascii_l for m in _ASSISTANT_META_ASK_MARKERS):
         return True
+
+    capability_meta = bool(
+        re.search(
+            r"(?iu)\b("
+            r"czym\s+jesteś|"
+            r"czym\s+jestes|"
+            r"jakie(?:\s+\w+){0,3}\s+masz"
+            r"(?:\s+\w+){0,3}\s+możliwości|"
+            r"jakie(?:\s+\w+){0,3}\s+masz"
+            r"(?:\s+\w+){0,3}\s+mozliwosci|"
+            r"co(?:\s+obecnie|\s+aktualnie)?\s+umiesz|"
+            r"co(?:\s+obecnie|\s+aktualnie)?\s+potrafisz"
+            r")\b",
+            lower,
+        )
+    )
+    if capability_meta:
+        return True
+
     # "powiedz krótko" + self-reference without execute verbs
     short_ask = (
         "powiedz krotko" in ascii_l
@@ -951,6 +999,8 @@ class StrategySelector:
                 "rollback",
                 "wykonaj plan",
                 "kontynuuj plan",
+                "sledz",
+                "śledź",
             )
         )
         if ag_count > 0 and max_urg >= 0.25 and goal_engage:
@@ -1114,6 +1164,11 @@ def _bounded_memory_retrieval(
 
 
 def _bounded_psyche_snapshot(user_id: str) -> PsycheRoutingSummary:
+    """Psyche V1 snapshot for routing: mood/energy/focus only (tone modulation).
+
+    Behavior policy (directness, caution, web_bias) comes from Psyche V2 elsewhere
+    in the turn pipeline — strategy_selector must not treat V1 as full psyche policy.
+    """
     try:
         psyche_state = get_psyche_core().ensure_user(user_id)
 
@@ -1357,6 +1412,30 @@ def select_strategy(
     if local_howto_no_web_intent(ut):
         explicit_research_intent = False
         explicit_freshness = False
+
+    # Canonical research triggers must affect routing, not only observability.
+    # Previously TIME_SENSITIVE_QUERY was appended only after raw strategy
+    # had already become research, so relative windows such as
+    # "z ostatnich 48 godzin" were detected but ignored.
+    research_trigger_codes = research_trigger_reason_codes(ut)
+    force_research_from_trigger = bool(research_trigger_codes) and not (
+        listing_local
+        or followup_local
+        or local_howto_no_web_intent(ut)
+        or _LOCAL_INFRA_NO_WEB.search(ut)
+    )
+
+    if force_research_from_trigger and raw.get("strategy") != "research":
+        raw = dict(raw)
+        raw["strategy"] = "research"
+        _normalize_requires_for_strategy(raw)
+        raw["reason"] = (
+            str(raw.get("reason") or "")
+            + " [canonical_research_trigger: "
+            + ",".join(research_trigger_codes)
+            + "]"
+        )
+
     if raw.get("strategy") == "agentic" and (
         "://" in ut or explicit_freshness or explicit_research_intent
     ):

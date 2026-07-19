@@ -12,6 +12,7 @@ interface ChatUiState {
     drawerTab: ChatDrawerTab;
     searchQuery: string;
     pinnedSessionIds: string[];
+    archivedSessionIds: string[];
     setSidebarCollapsed: (v: boolean) => void;
     toggleSidebarCollapsed: () => void;
     setSidebarMobileOpen: (v: boolean) => void;
@@ -20,6 +21,10 @@ interface ChatUiState {
     openDrawer: (tab: ChatDrawerTab) => void;
     setSearchQuery: (q: string) => void;
     togglePinSession: (sessionId: string) => void;
+    archiveSession: (sessionId: string) => void;
+    unarchiveSession: (sessionId: string) => void;
+    /** Replace archive set from server (authoritative after sync). */
+    replaceArchivedSessionIds: (ids: string[]) => void;
 }
 
 export const useChatUiStore = create<ChatUiState>()(
@@ -31,6 +36,7 @@ export const useChatUiStore = create<ChatUiState>()(
             drawerTab: "pamiec",
             searchQuery: "",
             pinnedSessionIds: [],
+            archivedSessionIds: [],
             setSidebarCollapsed: (v) => set({ sidebarCollapsed: v }),
             toggleSidebarCollapsed: () =>
                 set({ sidebarCollapsed: !get().sidebarCollapsed }),
@@ -47,6 +53,32 @@ export const useChatUiStore = create<ChatUiState>()(
                         : [...pinned, sessionId],
                 });
             },
+            archiveSession: (sessionId) => {
+                const archived = get().archivedSessionIds;
+                if (archived.includes(sessionId)) return;
+                set({
+                    archivedSessionIds: [...archived, sessionId],
+                    pinnedSessionIds: get().pinnedSessionIds.filter(
+                        (id) => id !== sessionId,
+                    ),
+                });
+            },
+            unarchiveSession: (sessionId) => {
+                set({
+                    archivedSessionIds: get().archivedSessionIds.filter(
+                        (id) => id !== sessionId,
+                    ),
+                });
+            },
+            replaceArchivedSessionIds: (ids) => {
+                const unique = [...new Set(ids.filter(Boolean))];
+                set({
+                    archivedSessionIds: unique,
+                    pinnedSessionIds: get().pinnedSessionIds.filter(
+                        (id) => !unique.includes(id),
+                    ),
+                });
+            },
         }),
         {
             name: "aihub-chat-ui-v3",
@@ -54,6 +86,7 @@ export const useChatUiStore = create<ChatUiState>()(
             partialize: (s) => ({
                 sidebarCollapsed: s.sidebarCollapsed,
                 pinnedSessionIds: s.pinnedSessionIds,
+                archivedSessionIds: s.archivedSessionIds,
             }),
         },
     ),

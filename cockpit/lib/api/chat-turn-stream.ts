@@ -7,11 +7,19 @@ export interface ChatTurnStreamHandlers {
         result: ChatTurnResponse | undefined,
         attachmentsSummary?: string,
         contextChips?: string[],
+        pendingConfirmations?: PendingConfirmation[],
     ) => void;
     onStatus?: (stage: string, labelPl?: string) => void;
     onTool?: (name: string, status: "start" | "done") => void;
     onMemory?: (count: number) => void;
     onReplace?: (fullText: string) => void;
+}
+
+export interface PendingConfirmation {
+    tool_name: string;
+    arguments?: Record<string, unknown>;
+    tool_call_id?: string | null;
+    message?: string;
 }
 
 export interface StreamChatTurnOptions extends ChatTurnStreamHandlers {
@@ -53,6 +61,11 @@ function dispatchEvent(
         const contextChips = Array.isArray(ev.context_chips)
             ? (ev.context_chips as string[])
             : undefined;
+        const pendingRaw = Array.isArray(ev.pending_confirmations)
+            ? (ev.pending_confirmations as PendingConfirmation[])
+            : Array.isArray((r as { pending_confirmations?: unknown } | undefined)?.pending_confirmations)
+              ? ((r as { pending_confirmations: PendingConfirmation[] }).pending_confirmations)
+              : undefined;
         // HTTP 200 + ok=false is a runtime failure — raise so ChatShell shows error.
         const okFlag = ev.ok;
         if (okFlag === false) {
@@ -79,6 +92,7 @@ function dispatchEvent(
                 : undefined,
             attachmentsSummary,
             contextChips,
+            pendingRaw,
         );
     }
 }

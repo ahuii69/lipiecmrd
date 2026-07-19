@@ -8,6 +8,7 @@ import os
 import re
 import ssl
 import time
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Any, Awaitable, Dict, List, Optional
 from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
@@ -29,7 +30,15 @@ logger = logging.getLogger(__name__)
 
 # Optional aggregation backends: failures are soft (Brave remains primary when configured).
 _OPTIONAL_RESEARCH_BACKENDS = frozenset(
-    {"Wikipedia", "DuckDuckGo", "Frankfurter", "OpenMeteo", "PyPI", "EndOfLife"}
+    {
+        "Wikipedia",
+        "DuckDuckGo",
+        "GoogleNews",
+        "Frankfurter",
+        "OpenMeteo",
+        "PyPI",
+        "EndOfLife",
+    }
 )
 
 
@@ -91,6 +100,38 @@ def _research_query_variants(query: str) -> List[str]:
             variants.append("current weather")
     if "fastapi" in ql and ("release" in ql or "wersj" in ql or "najnow" in ql or "stabil"):
         variants.extend(["FastAPI latest release PyPI", "fastapi pypi version"])
+
+    news_markers = (
+        "news",
+        "wiadomo",
+        "aktualno",
+        "najnowsz",
+        "ostatnich",
+        "dzisiaj",
+        "today",
+        "latest",
+    )
+    ai_markers = (
+        " ai ",
+        "sztuczn",
+        "artificial intelligence",
+        "openai",
+        "anthropic",
+        "gemini",
+        "chatgpt",
+        "llm",
+    )
+    padded = f" {ql} "
+    if any(marker in ql for marker in news_markers):
+        if any(marker in padded for marker in ai_markers):
+            variants.extend(
+                [
+                    "artificial intelligence latest news",
+                    "AI industry latest news",
+                    "OpenAI Anthropic Google AI latest news",
+                ]
+            )
+
     seen: set[str] = set()
     out: List[str] = []
     for v in variants:
@@ -292,25 +333,46 @@ class ResearchEngine:
         }
 
     def _extract_facts_from_text(
-        self, text: str, source_url: str
+        self,
+        text: str,
+        source_url: str,
+        *,
+        allow_fallback: bool = False,
+        fallback_type: str = "source_statement",
     ) -> List[Dict[str, Any]]:
-        """Ekstrakcja faktów z tekstu."""
-        facts = []
+        """Extract structured facts, with an optional conservative source fallback."""
+        facts: List[Dict[str, Any]] = []
+        fallback_candidates: List[str] = []
 
         try:
-            # Split text into sentences
-            sentences = re.split(r"[.!?]+", text)
+            normalized_text = re.sub(r"&nbsp;?", " ", str(text or ""))
+            normalized_text = re.sub(r"\s+", " ", normalized_text).strip()
 
-            for sentence in sentences[:20]:  # Limit to first 20 sentences
-                sentence = sentence.strip()
+            # Keep the publication date intact instead of splitting after weekday abbreviations.
+            sentences = re.split(
+                r"(?<=[.!?])\s+(?=[A-ZÀ-Ż0-9])",
+                normalized_text,
+            )
+
+            if len(sentences) == 1:
+                sentences = re.split(r"[.!?]+", normalized_text)
+
+            seen_sentences: set[str] = set()
+
+            for raw_sentence in sentences[:20]:
+                sentence = re.sub(r"\s+", " ", raw_sentence).strip(" -\t\r\n")
                 if len(sentence) < 20:
                     continue
 
-                # Try pattern matching
+                sentence_key = sentence.casefold()
+                if sentence_key in seen_sentences:
+                    continue
+                seen_sentences.add(sentence_key)
+
+                matched = False
                 for pattern_type, patterns in self.extraction_patterns.items():
                     for pattern in patterns:
-                        matches = re.findall(pattern, sentence, re.IGNORECASE)
-                        if matches:
+                        if re.search(pattern, sentence, re.IGNORECASE):
                             facts.append(
                                 {
                                     "type": pattern_type,
@@ -320,12 +382,50 @@ class ResearchEngine:
                                     "confidence": 0.6,
                                 }
                             )
+                            matched = True
                             break
+                    if matched:
+                        break
+
+                if not matched:
+                    fallback_candidates.append(sentence)
+
+            if allow_fallback and not facts:
+                metadata_prefixes = (
+                    "publisher:",
+                    "published:",
+                    "source:",
+                    "author:",
+                )
+
+                for sentence in fallback_candidates:
+                    lowered = sentence.casefold()
+
+                    if lowered.startswith(metadata_prefixes):
+                        continue
+                    if len(sentence) < 35:
+                        continue
+                    if not re.search(r"[A-Za-zÀ-Żà-ż]", sentence):
+                        continue
+
+                    facts.append(
+                        {
+                            "type": fallback_type,
+                            "extracted": sentence,
+                            "source_url": source_url,
+                            "extraction_ts": now_ts(),
+                            "confidence": 0.4,
+                        }
+                    )
+
+                    # RSS entries usually contain one useful headline/summary statement.
+                    if len(facts) >= 2:
+                        break
 
         except Exception as e:
-            logger.debug(f"Error extracting facts: {e}")
+            logger.debug("Error extracting facts: %s", e)
 
-        return facts[:10]  # Limit to 10 facts
+        return facts[:10]
 
     def _calculate_relevance(self, query: str, text: str) -> float:
         """Oblicz relevance score tekstu do query."""
@@ -395,8 +495,18 @@ class ResearchEngine:
             for result in search_results[: self.max_results]:
                 try:
                     # Extract facts from result
+                    source_name = str(result.get("source") or "unknown")
+                    is_news_result = source_name in {
+                        "google_news",
+                        "bing_news",
+                        "news_rss",
+                    }
+
                     facts = self._extract_facts_from_text(
-                        result["content"], result["url"]
+                        str(result.get("content") or ""),
+                        str(result.get("url") or ""),
+                        allow_fallback=is_news_result,
+                        fallback_type="news_statement",
                     )
 
                     # Store facts in memory (quality gate + fingerprint dedup)
@@ -448,6 +558,8 @@ class ResearchEngine:
                             "relevance": relevance,
                             "facts_extracted": stored,
                             "source": result.get("source", "unknown"),
+                            "published_at": result.get("published_at"),
+                            "publisher": result.get("publisher"),
                         }
                     )
 
@@ -550,6 +662,9 @@ class ResearchEngine:
             tasks.append(asyncio.to_thread(self._fetch_duckduckgo, query))
             names.append("DuckDuckGo")
 
+            tasks.append(asyncio.to_thread(self._fetch_google_news, query))
+            names.append("GoogleNews")
+
             if _fx_pair_from_query(query):
                 tasks.append(asyncio.to_thread(self._fetch_frankfurter_fx, query))
                 names.append("Frankfurter")
@@ -603,6 +718,7 @@ class ResearchEngine:
             "open_meteo": 0,
             "pypi": 0,
             "endoflife": 0,
+            "google_news": 1,
             "brave": 1,
             "wikipedia": 2,
             "duckduckgo": 3,
@@ -882,6 +998,114 @@ class ResearchEngine:
                 )
         except httpx.HTTPError as exc:
             logger.debug("endoflife.date Python fetch failed: %s", exc)
+        return out
+
+    def _fetch_google_news(self, query: str) -> List[Dict[str, Any]]:
+        """Search current news through Google News RSS without an API key."""
+        out: List[Dict[str, Any]] = []
+        seen_urls: set[str] = set()
+
+        try:
+            with httpx.Client(
+                **_http_client_kwargs(HTTP_TIMEOUT_S),
+                follow_redirects=True,
+            ) as client:
+                for variant in _research_query_variants(query):
+                    params = {
+                        "q": variant,
+                        "hl": "en-US",
+                        "gl": "US",
+                        "ceid": "US:en",
+                    }
+                    resp = _http_get_with_backoff(
+                        client,
+                        "https://news.google.com/rss/search",
+                        params=params,
+                    )
+
+                    if resp.status_code >= 400:
+                        logger.debug(
+                            "Google News RSS HTTP %s query=%r",
+                            resp.status_code,
+                            variant,
+                        )
+                        continue
+
+                    try:
+                        root = ET.fromstring(resp.content)
+                    except ET.ParseError as exc:
+                        logger.debug(
+                            "Google News RSS XML parse failed query=%r: %s",
+                            variant,
+                            exc,
+                        )
+                        continue
+
+                    for item in root.findall(".//item"):
+                        title = str(item.findtext("title") or "").strip()
+                        url = str(item.findtext("link") or "").strip()
+                        description = str(
+                            item.findtext("description") or ""
+                        ).strip()
+                        published = str(item.findtext("pubDate") or "").strip()
+                        source_node = item.find("source")
+                        publisher = (
+                            str(source_node.text or "").strip()
+                            if source_node is not None
+                            else ""
+                        )
+
+                        description = re.sub(
+                            r"<[^>]+>",
+                            " ",
+                            description,
+                        )
+                        description = re.sub(
+                            r"\s+",
+                            " ",
+                            description,
+                        ).strip()
+
+                        if not title or not url or url in seen_urls:
+                            continue
+
+                        content_parts = [title]
+                        if description and description.lower() != title.lower():
+                            content_parts.append(description)
+                        if publisher:
+                            content_parts.append(f"Publisher: {publisher}.")
+                        if published:
+                            content_parts.append(f"Published: {published}.")
+
+                        content = " ".join(content_parts).strip()
+                        if len(content) <= 30:
+                            continue
+
+                        seen_urls.add(url)
+                        out.append(
+                            {
+                                "title": title[:300],
+                                "url": url,
+                                "content": content[:HTTP_MAX_BYTES],
+                                "source": "google_news",
+                                "published_at": published,
+                                "publisher": publisher,
+                            }
+                        )
+
+                        if len(out) >= 8:
+                            return out
+
+                    if out:
+                        break
+
+        except httpx.HTTPError as exc:
+            logger.debug(
+                "Google News RSS fetch failed query=%r: %s",
+                query[:200],
+                exc,
+            )
+
         return out
 
     def _fetch_duckduckgo_html(self, query: str) -> List[Dict[str, Any]]:

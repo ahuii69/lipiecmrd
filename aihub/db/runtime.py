@@ -964,6 +964,8 @@ def init_db() -> None:
             title TEXT NOT NULL,
             created_at REAL NOT NULL,
             updated_at REAL NOT NULL,
+            archived INTEGER NOT NULL DEFAULT 0,
+            archived_at REAL,
             PRIMARY KEY (user_id, id)
         );
         """
@@ -971,6 +973,25 @@ def init_db() -> None:
         cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_updated "
             "ON chat_sessions(user_id, updated_at DESC);"
+        )
+        _chat_sessions_mig: dict[str, Any] = {}
+        _sqlite_add_column_if_missing(
+            cur,
+            "chat_sessions",
+            "archived",
+            "INTEGER NOT NULL DEFAULT 0",
+            _chat_sessions_mig,
+        )
+        _sqlite_add_column_if_missing(
+            cur,
+            "chat_sessions",
+            "archived_at",
+            "REAL",
+            _chat_sessions_mig,
+        )
+        cur.execute(
+            "CREATE INDEX IF NOT EXISTS idx_chat_sessions_user_archived "
+            "ON chat_sessions(user_id, archived, updated_at DESC);"
         )
 
         cur.execute(
@@ -2424,8 +2445,8 @@ def ensure_chat_session_row(user_id: str, session_id: str) -> None:
         return
     exec_one(
         """
-        INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at)
-        VALUES(?,?,?,?,?)
+        INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at, archived, archived_at)
+        VALUES(?,?,?,?,?,0,NULL)
         """,
         (uid, sid, "Nowa rozmowa", ts, ts),
     )

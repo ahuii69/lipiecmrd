@@ -39,6 +39,7 @@ describe("isCockpitProxyAllowed", () => {
         expect(isCockpitProxyAllowed("POST", "/chat/capabilities/execute")).toBe(
             true,
         );
+        expect(isCockpitProxyAllowed("GET", "/chat/file/file-xyz")).toBe(true);
         expect(isCockpitProxyAllowed("GET", "/system/ping")).toBe(true);
         expect(isCockpitProxyAllowed("GET", "/cockpit/schema-health")).toBe(
             true,

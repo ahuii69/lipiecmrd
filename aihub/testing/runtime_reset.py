@@ -146,7 +146,7 @@ def reset_runtime_for_tests(*, fail_on_leftover: bool = False) -> dict[str, Any]
         import aihub.turn.concurrency as tconc
 
         cr._RUNTIME = None
-        tops._RUNTIME = None
+        # get_turn_ops() delegates to get_chat_runtime(); no separate ops._RUNTIME.
         tops._TRACE_CACHE.clear()
         tidem._SCHEMA_READY = False
         tconc._LOCK_TABLE_READY = False

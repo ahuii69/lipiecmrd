@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Wykrywanie prośb o grafikę i budowa gotowych promptów (bez ogólnych odmów)."""
+"""Wykrywanie prośb o grafikę + tool ``image.generate`` (prawdziwy render)."""
 
 from __future__ import annotations
 
@@ -60,7 +60,6 @@ def compose_image_prompt_package(subject_hint: str) -> dict[str, Any]:
     if len(subj) < 2:
         subj = "whimsical abstract surreal scene with playful unexpected shapes"
 
-    # Warstwa „bezpieczna”: zawsze ramka artystyczna / surreal / stylizacja.
     en_core = (
         "Stylized digital illustration, whimsical surreal art, vibrant harmonious colors, "
         "clean composition, high detail, fantasy art style, no text, no watermark, no logo: "
@@ -80,7 +79,7 @@ def compose_image_prompt_package(subject_hint: str) -> dict[str, Any]:
 
 
 def build_image_generation_reply(user_message: str) -> str:
-    """Tekst odpowiedzi użytkownikowi: zawsze konkretny prompt + opis."""
+    """Legacy text package (tests / fallback when render unavailable)."""
     pkg = compose_image_prompt_package(extract_image_subject(user_message))
     en = pkg["prompt_en"]
     pl = pkg["description_pl"]
@@ -103,18 +102,66 @@ class ImageGenerateIn(BaseModel):
 
 
 async def tool_image_generate_handler(
-    _ctx: Any, inp: ImageGenerateIn
+    ctx: Any, inp: ImageGenerateIn
 ) -> dict[str, Any]:
+    """Render real PNG via DeepInfra FLUX; fall back to prompt package if not configured."""
     hint = (inp.subject_hint or inp.subject or "").strip()
     if not hint and (inp.user_message or "").strip():
         hint = extract_image_subject(inp.user_message)
     pkg = compose_image_prompt_package(hint)
+
+    from aihub.chat_image_render import image_gen_configured, public_chat_file_path, render_image_png
+
+    if not image_gen_configured():
+        return {
+            "ok": False,
+            "result": {
+                "error": "image_gen_not_configured",
+                "prompt_en": pkg["prompt_en"],
+                "description_pl": pkg["description_pl"],
+                "negative_prompt": pkg["negative_prompt"],
+                "subject_used": pkg["subject_used"],
+                "rendered": False,
+            },
+        }
+
+    user_id = str(getattr(ctx, "user_id", None) or "default")
+    session_id = str(getattr(ctx, "session_id", None) or "default")
+    rendered = await render_image_png(
+        prompt=pkg["prompt_en"],
+        user_id=user_id,
+        session_id=session_id,
+        negative_prompt=pkg["negative_prompt"],
+    )
+    if not rendered.get("ok"):
+        return {
+            "ok": False,
+            "result": {
+                "error": str(rendered.get("error") or "image_gen_failed"),
+                "message": str(rendered.get("message") or "")[:400],
+                "prompt_en": pkg["prompt_en"],
+                "description_pl": pkg["description_pl"],
+                "negative_prompt": pkg["negative_prompt"],
+                "subject_used": pkg["subject_used"],
+                "rendered": False,
+            },
+        }
+
+    file_id = str(rendered.get("file_id") or "")
     return {
         "ok": True,
         "result": {
+            "file_id": file_id,
+            "filename": rendered.get("filename"),
+            "content_type": rendered.get("content_type"),
+            "size": rendered.get("size"),
+            "model": rendered.get("model"),
+            "url_path": public_chat_file_path(file_id),
+            "public_url": f"/api/aihub{public_chat_file_path(file_id)}",
             "prompt_en": pkg["prompt_en"],
             "description_pl": pkg["description_pl"],
             "negative_prompt": pkg["negative_prompt"],
             "subject_used": pkg["subject_used"],
+            "rendered": True,
         },
     }

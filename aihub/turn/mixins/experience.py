@@ -1121,6 +1121,9 @@ class ExperienceMixin:
         except Exception:
             text = text
 
+        # Rewrite ONLY as model-only fallback (after capability escalation + tools).
+        # Never rewrite a tool-verified turn — that would reintroduce the old
+        # "sprawdziłem → mogę sprawdzić" anti-pattern instead of using tools.
         if grounding_mode in {"model_only", "unknown_not_verified"}:
             if is_cap_q:
                 cap_names = [c.name for c in ctx.capabilities]

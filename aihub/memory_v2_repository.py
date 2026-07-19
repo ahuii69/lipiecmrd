@@ -176,6 +176,27 @@ def get_memory_item(item_id: str, user_id: str) -> MemoryV2Item | None:
     return _row_to_memory_item(row)
 
 
+def get_memory_item_by_source_ref(
+    user_id: str, source_ref: str
+) -> MemoryV2Item | None:
+    """Idempotent L2→V2 bridge lookup: one V2 row per V1 ``memory_nodes.id``."""
+    ref = str(source_ref or "").strip()
+    if not ref:
+        return None
+    row = fetch_one(
+        """
+        SELECT * FROM memory_v2_items
+        WHERE user_id=? AND source_ref=? AND is_archived=0
+        ORDER BY updated_ts DESC
+        LIMIT 1
+        """,
+        (user_id, ref),
+    )
+    if not row:
+        return None
+    return _row_to_memory_item(row)
+
+
 def search_memory_items(
     user_id: str,
     query: str = "",

@@ -4,6 +4,7 @@ import { useEffect, useState } from "react";
 
 import { Badge } from "@/components/ui/badge";
 import { ScrollArea } from "@/components/ui/scroll-area";
+import { useChatUiStore } from "@/features/chat/chat-ui-store";
 import { apiClient } from "@/lib/api/client";
 import { lastUserVisiblePreview } from "@/lib/chat/session-title";
 import { useCockpitStore } from "@/lib/store/cockpit-store";
@@ -17,6 +18,10 @@ export function ChatSessions({ userId }: { userId: string }) {
     const updateSessionTitle = useCockpitStore((s) => s.updateSessionTitle);
     const deleteSession = useCockpitStore((s) => s.deleteSession);
     const mergeServerSessions = useCockpitStore((s) => s.mergeServerSessions);
+    const archivedSessionIds = useChatUiStore((s) => s.archivedSessionIds);
+    const replaceArchivedSessionIds = useChatUiStore(
+        (s) => s.replaceArchivedSessionIds,
+    );
 
     const [renamingId, setRenamingId] = useState<string | null>(null);
     const [renameDraft, setRenameDraft] = useState("");
@@ -31,6 +36,11 @@ export function ChatSessions({ userId }: { userId: string }) {
                 );
                 if (!cancelled) {
                     mergeServerSessions(r.sessions, userId);
+                    replaceArchivedSessionIds(
+                        r.sessions
+                            .filter((s) => s.archived === true)
+                            .map((s) => s.id),
+                    );
                 }
             } catch {
                 void 0;
@@ -39,7 +49,7 @@ export function ChatSessions({ userId }: { userId: string }) {
         return () => {
             cancelled = true;
         };
-    }, [userId, apiKeyOverride, mergeServerSessions]);
+    }, [userId, apiKeyOverride, mergeServerSessions, replaceArchivedSessionIds]);
 
     const commitRename = async (sessionId: string, fallbackTitle: string) => {
         const t = renameDraft.trim() || fallbackTitle;
@@ -71,7 +81,10 @@ export function ChatSessions({ userId }: { userId: string }) {
             void 0;
         }
         deleteSession(sessionId);
+        useChatUiStore.getState().unarchiveSession(sessionId);
     };
+
+    const archivedSet = new Set(archivedSessionIds);
 
     return (
         <ScrollArea className="h-full rounded-md border border-border/60 p-1">
@@ -79,74 +92,73 @@ export function ChatSessions({ userId }: { userId: string }) {
                 {sessions.map((session) => (
                     <div
                         key={session.id}
-                        role="presentation"
-                        onClick={() => setActiveSession(session.id)}
-                        className={`w-full cursor-pointer rounded-md border px-2 py-2 text-left transition ${
+                        className={`flex cursor-pointer flex-col gap-1 rounded-md px-2 py-1.5 text-xs ${
                             session.id === activeSessionId
-                                ? "border-primary bg-primary/10"
-                                : "border-transparent hover:border-border hover:bg-muted/40"
+                                ? "bg-primary/15"
+                                : "hover:bg-muted/60"
                         }`}
+                        onClick={() => setActiveSession(session.id)}
                     >
-                        <div className="mb-1 flex items-center justify-between gap-2">
-                            {renamingId === session.id ? (
-                                <input
-                                    autoFocus
-                                    className="h-7 min-w-0 flex-1 rounded border border-input bg-background px-1 text-xs"
-                                    value={renameDraft}
-                                    onChange={(e) =>
-                                        setRenameDraft(e.target.value)
-                                    }
-                                    onClick={(e) => e.stopPropagation()}
-                                    onKeyDown={(e) => {
-                                        if (e.key === "Enter") {
-                                            e.preventDefault();
-                                            void commitRename(
-                                                session.id,
-                                                session.title,
-                                            );
-                                        }
-                                    }}
-                                />
-                            ) : (
-                                <p
-                                    role="presentation"
-                                    className="min-w-0 flex-1 cursor-text truncate text-xs font-semibold"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        setRenamingId(session.id);
-                                        setRenameDraft(session.title);
-                                    }}
-                                >
-                                    {session.title}
-                                </p>
-                            )}
+                        <div className="flex items-center justify-between gap-2">
+                            <span className="truncate font-medium">
+                                {session.title}
+                            </span>
                             <div className="flex shrink-0 items-center gap-1">
-                                <Badge
-                                    variant="outline"
-                                    className="text-[10px]"
-                                >
-                                    {session.mode}
+                                {archivedSet.has(session.id) ? (
+                                    <Badge variant="outline">archiwum</Badge>
+                                ) : null}
+                                <Badge variant="secondary">
+                                    {shortId(session.id)}
                                 </Badge>
-                                <button
-                                    type="button"
-                                    className="text-sm leading-none opacity-70 hover:opacity-100"
-                                    aria-label="Delete session"
-                                    onClick={(e) => {
-                                        e.stopPropagation();
-                                        void onTrash(session.id);
-                                    }}
-                                >
-                                    🗑
-                                </button>
                             </div>
                         </div>
-                        <p className="line-clamp-2 text-[10px] text-muted-foreground">
+                        <p className="truncate text-[10px] text-muted-foreground">
                             {lastUserVisiblePreview(session.messages) ||
-                                shortId(session.id)}
+                                formatTs(session.updatedAt)}
                         </p>
-                        <p className="text-[10px] text-muted-foreground">
-                            {formatTs(session.updatedAt)}
-                        </p>
+                        <div className="flex gap-2">
+                            <button
+                                type="button"
+                                className="text-[10px] text-muted-foreground underline"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    setRenamingId(session.id);
+                                    setRenameDraft(session.title);
+                                }}
+                            >
+                                Rename
+                            </button>
+                            <button
+                                type="button"
+                                className="text-[10px] text-destructive underline"
+                                onClick={(e) => {
+                                    e.stopPropagation();
+                                    void onTrash(session.id);
+                                }}
+                            >
+                                Delete
+                            </button>
+                        </div>
+                        {renamingId === session.id ? (
+                            <input
+                                className="rounded border border-border bg-background px-1 py-0.5 text-xs"
+                                value={renameDraft}
+                                onChange={(e) => setRenameDraft(e.target.value)}
+                                onClick={(e) => e.stopPropagation()}
+                                onKeyDown={(e) => {
+                                    if (e.key === "Enter") {
+                                        void commitRename(
+                                            session.id,
+                                            session.title,
+                                        );
+                                    }
+                                }}
+                                onBlur={() =>
+                                    void commitRename(session.id, session.title)
+                                }
+                                autoFocus
+                            />
+                        ) : null}
                     </div>
                 ))}
             </div>

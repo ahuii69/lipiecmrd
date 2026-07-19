@@ -126,11 +126,17 @@ class ChatTurnApplicationService:
 
         started = time.monotonic()
         try:
+            from aihub.config import AIHUB_REQUEST_TIMEOUT_S
+
+            lock_timeout = min(
+                float(env.turn_deadline_s),
+                max(45.0, float(AIHUB_REQUEST_TIMEOUT_S)),
+            )
             async with async_session_turn_lock(
                 user_id=ctx.user_id,
                 session_id=ctx.session_id,
                 turn_id=ctx.turn_id,
-                timeout_s=min(45.0, env.turn_deadline_s),
+                timeout_s=lock_timeout,
                 lease_s=env.turn_deadline_s + 30.0,
             ):
                 # Bind context onto ops for single-turn_id write-backs

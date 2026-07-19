@@ -18,6 +18,8 @@ PUBLIC_PATHS = {
     "/ops/health",
     "/ops/ready",
     "/ops/capabilities",
+    "/ops/cost/today",
+    "/ops/cost/global-today",
     "/auth/login",
     "/auth/register",
     "/auth/registration-status",

@@ -33,6 +33,11 @@ def failure_class_for_error(exc: BaseException) -> str:
         if "transport" in code or "connection" in code:
             return "transport"
         return code or "provider_error"
+    # TurnRuntimeError / ProviderExecutionError carry .info.code
+    info = getattr(exc, "info", None)
+    info_code = str(getattr(info, "code", "") or "").strip()
+    if info_code:
+        return info_code
     msg = str(exc).lower()
     if "timeout" in msg or "timed out" in msg:
         return "timeout"
@@ -55,6 +60,7 @@ def is_failover_eligible(exc: BaseException) -> bool:
             "timeout",
             "transport",
             "missing_api_key",
+            "provider_non_text_content",
         }:
             return True
         if not exc.retryable and status in {400, 404, 422}:
@@ -62,6 +68,15 @@ def is_failover_eligible(exc: BaseException) -> bool:
         if "empty" in code or code == "empty_response":
             return True
         return bool(exc.retryable) or status == 0
+    info = getattr(exc, "info", None)
+    if info is not None:
+        code = str(getattr(info, "code", "") or "")
+        if code == "provider_non_text_content":
+            return True
+        if bool(getattr(info, "retryable", False)) and str(
+            getattr(info, "category", "") or ""
+        ) == "provider":
+            return True
     name = type(exc).__name__.lower()
     if "timeout" in name or isinstance(exc, TimeoutError):
         return True

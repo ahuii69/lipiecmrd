@@ -1,14 +1,15 @@
 "use client";
 
 import { Check, Copy, RotateCcw, ThumbsDown, ThumbsUp } from "lucide-react";
-import { useMemo, useState } from "react";
+import { memo, useMemo, useState } from "react";
 
 import { ChatError } from "@/features/chat/ChatError";
 import { ChatMarkdown } from "@/features/chat/ChatMarkdown";
+import { stabilizeStreamingMarkdown } from "@/lib/chat/stabilize-streaming-markdown";
 import type { ChatUIMessage } from "@/lib/store/cockpit-store";
 import { formatTs } from "@/lib/utils";
 
-export function ChatMessage({
+export const ChatMessage = memo(function ChatMessage({
     message,
     onRetry,
 }: {
@@ -29,6 +30,11 @@ export function ChatMessage({
                 /web|source|źród|research|http/i.test(c) || c.startsWith("http"),
         );
     }, [message.contextChips]);
+
+    const streamingMarkdown = useMemo(() => {
+        if (!message.streaming || !body) return "";
+        return stabilizeStreamingMarkdown(message.content || "");
+    }, [message.streaming, message.content, body]);
 
     const copy = async () => {
         if (!body) return;
@@ -92,8 +98,8 @@ export function ChatMessage({
                         <span className="text-sm">Piszę…</span>
                     </div>
                 ) : message.streaming ? (
-                    <div className="whitespace-pre-wrap break-words">
-                        {message.content}
+                    <div className="relative">
+                        <ChatMarkdown content={streamingMarkdown} />
                         <span className="chat-stream-cursor" aria-hidden />
                     </div>
                 ) : body ? (
@@ -149,7 +155,7 @@ export function ChatMessage({
             ) : null}
         </article>
     );
-}
+});
 
 function ActionBtn({
     children,

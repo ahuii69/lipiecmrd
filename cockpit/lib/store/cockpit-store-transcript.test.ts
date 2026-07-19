@@ -162,6 +162,35 @@ describe("cockpit-store — server-backed transcript", () => {
         expect(localStorage.getItem("aihub-cockpit-user-scope-v1")).toBeNull();
     });
 
+    it("createSession zawsze tworzy nowe ID (nie reuse pustych po rehydrate)", () => {
+        const principalId = "11111111-2222-3333-4444-555555555555";
+        useCockpitStore.getState().bindAuthPrincipal(principalId);
+        // Symuluj rehydrate: puste messages + placeholder title na starej sesji serwerowej
+        useCockpitStore.setState((st) => ({
+            sessions: [
+                {
+                    ...st.sessions[0],
+                    id: "s_old_server",
+                    title: "Nowa rozmowa",
+                    messages: [],
+                    historyStatus: "idle",
+                    userId: principalId,
+                },
+            ],
+            activeSessionId: "s_old_server",
+        }));
+        const before = useCockpitStore.getState().activeSessionId;
+        const created = useCockpitStore.getState().createSession();
+        expect(created).not.toBe(before);
+        expect(created).not.toBe("s_old_server");
+        expect(useCockpitStore.getState().activeSessionId).toBe(created);
+        const active = useCockpitStore
+            .getState()
+            .sessions.find((s) => s.id === created)!;
+        expect(active.messages).toEqual([]);
+        expect(active.userId).toBe(principalId);
+    });
+
     it("createSession dziedziczy authUserId, nie localStorage", () => {
         const principalId = "11111111-2222-3333-4444-555555555555";
         useCockpitStore.getState().bindAuthPrincipal(principalId);
@@ -177,11 +206,28 @@ describe("cockpit-store — server-backed transcript", () => {
                     },
                 ],
                 title: "Zajęta",
+                historyStatus: "ready" as const,
             })),
         }));
         useCockpitStore.getState().createSession();
         const sessions = useCockpitStore.getState().sessions;
         expect(sessions.every((s) => s.userId === principalId)).toBe(true);
+    });
+
+    it("replaceSessionMessagesFromServer ustawia historyStatus ready", () => {
+        useCockpitStore.getState().setSessionHistoryStatus(sessionId, "loading");
+        useCockpitStore.getState().replaceSessionMessagesFromServer(sessionId, [
+            {
+                id: "z",
+                role: "user",
+                content: "z",
+                created_at: "2020-01-01T00:00:00Z",
+            },
+        ]);
+        const s = useCockpitStore
+            .getState()
+            .sessions.find((x) => x.id === sessionId)!;
+        expect(s.historyStatus).toBe("ready");
     });
 
     it("nie przyjmuje ani nie utrwala klucza API w przeglądarce", async () => {

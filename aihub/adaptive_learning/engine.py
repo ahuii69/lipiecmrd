@@ -168,6 +168,17 @@ def evaluate_turn_outcome(
         quality = min(quality, 0.35)
         codes.append("OUTCOME_NOT_OK")
 
+    # Prefer continuous self-eval when present on the trace.
+    cse = tr.get("continuous_self_eval") if isinstance(tr.get("continuous_self_eval"), dict) else {}
+    mem_u = float(cse.get("memory_usefulness") or tr.get("memory_usefulness") or 0.55)
+    _planner_default = 0.55 if bool(dc.get("planner_recommended") or tr.get("planner_executed")) else 0.5
+    planner_u = float(cse.get("planner_usefulness") if cse.get("planner_usefulness") is not None else _planner_default)
+    tool_u = float(cse.get("tool_usefulness") if cse.get("tool_usefulness") is not None else tool_score)
+    token_eff = float(cse.get("token_efficiency") or 0.5)
+    if cse:
+        quality = _clamp(0.7 * quality + 0.3 * float(cse.get("overall_quality") or quality))
+        codes.append("OUTCOME_CSE_MERGED")
+
     reward = _clamp(
         quality
         + 0.15 * acceptance_sig
@@ -176,9 +187,12 @@ def evaluate_turn_outcome(
         - 0.35 * correction_sig
         - 0.25 * rejection_sig
         - (0.15 if tr.get("used_fallback") else 0.0)
+        + 0.05 * (token_eff - 0.5)
     , -1.0, 1.0)
 
     conf = _clamp(0.35 + (0.2 if tools_total or web_used else 0.1) + (0.15 if critic_f is not None else 0.0))
+    if cse.get("confidence_calibration") is not None:
+        conf = _clamp(0.5 * conf + 0.5 * float(cse["confidence_calibration"]))
 
     return TurnOutcomeEvaluation(
         turn_id=turn_id,
@@ -218,14 +232,14 @@ def evaluate_turn_outcome(
         style_match_score=style_match,
         intent_match_score=intent_match,
         verbosity_match_score=verbosity_match,
-        memory_usefulness_score=0.55,
+        memory_usefulness_score=mem_u,
         psyche_alignment_score=0.55,
-        planner_quality_score=0.55 if bool(dc.get("planner_recommended") or tr.get("planner_executed")) else 0.5,
-        tool_success_score=tool_score,
+        planner_quality_score=planner_u,
+        tool_success_score=tool_u,
         tool_execution_score=tool_score,
         research_quality_score=research_q,
         latency_score=latency_score,
-        cost_score=0.5,
+        cost_score=token_eff,
         overall_reward=reward,
         confidence=conf,
         reason_codes=codes,
@@ -240,8 +254,12 @@ def evaluate_turn_outcome(
             "request_id": tr.get("request_id") or dc.get("request_id"),
             "correlation_id": tr.get("correlation_id") or dc.get("correlation_id"),
             "critic_revision_happened": bool(tr.get("response_revision_happened")),
-            "memory_usefulness_score": 0.55,
+            "memory_usefulness_score": mem_u,
             "psyche_alignment_score": 0.55,
+            "continuous_self_eval": cse or None,
+            "hallucination_risk": cse.get("hallucination_risk"),
+            "token_efficiency": token_eff,
+            "answer_completeness": cse.get("answer_completeness"),
         },
     )
 
@@ -753,6 +771,21 @@ def update_self_model_from_outcome(outcome: TurnOutcomeEvaluation) -> RuntimeSel
             model.weak_domains = (model.weak_domains + [outcome.primary_intent])[-12:]
     if outcome.overall_reward > 0.35 and outcome.primary_intent not in model.strong_domains:
         model.strong_domains = (model.strong_domains + [outcome.primary_intent])[-12:]
+    # Rolling hallucination risk by intent domain from CSE metadata.
+    cse = (outcome.metadata or {}).get("continuous_self_eval") if isinstance(outcome.metadata, dict) else None
+    if isinstance(cse, dict) and cse.get("hallucination_risk") is not None:
+        domain = outcome.primary_intent or "unknown"
+        prev_h = float(model.hallucination_risk_by_domain.get(domain, 0.3))
+        model.hallucination_risk_by_domain[domain] = _clamp(
+            prev_h * 0.7 + float(cse["hallucination_risk"]) * 0.3
+        )
+    if isinstance(cse, dict) and cse.get("token_efficiency") is not None:
+        path = outcome.selected_strategy or "contextual"
+        slot = dict(model.cost_latency_by_path.get(path) or {})
+        prev_te = float(slot.get("token_efficiency", 0.5))
+        slot["token_efficiency"] = _clamp(prev_te * 0.7 + float(cse["token_efficiency"]) * 0.3)
+        slot["samples"] = int(slot.get("samples") or 0) + 1
+        model.cost_latency_by_path[path] = slot
     model.version = int(model.version or 1) + 1
     store.save_self_model(model)
     return model
@@ -842,32 +875,80 @@ def maybe_update_long_horizon(
 ) -> tuple[str, bool]:
     dc = decision_core or {}
     msg = (message or "").strip()
+    msg_l = msg.lower()
     task = store.get_active_long_horizon_task(user_id=user_id, session_id=session_id)
+
+    # Explicit track / status intents must bind cross-session tasks by marker.
+    track_intent = bool(
+        re.search(
+            r"(?iu)\b(śledź|sledz|długoterminow|dlugoterminow|track\s+this|long[\s-]?horizon)\b",
+            msg_l,
+        )
+    )
+    status_intent = bool(
+        re.search(
+            r"(?iu)\b(stan\s+zadania|stan\s+planu|następnym\s+krokiem|nastepnym\s+krokiem|next\s+step|progress)\b",
+            msg_l,
+        )
+    )
+    marker_hit = re.search(r"(?i)(Profile26-[A-Za-z0-9_-]+|Profile26)", msg)
+    if task is None and (track_intent or status_intent or marker_hit):
+        marker = marker_hit.group(1) if marker_hit else ""
+        if marker:
+            task = store.find_long_horizon_task_by_marker(user_id=user_id, marker=marker)
+        if task is None:
+            task = store.get_active_long_horizon_task(
+                user_id=user_id, session_id="", allow_cross_session=True
+            )
+        if task is not None and session_id and task.session_id != session_id:
+            # Rebind active task to the current session for continuity.
+            task.session_id = session_id
+            task.updated_at = time.time()
+            store.save_long_horizon_task(task)
+            store.append_task_event(
+                task_id=task.task_id,
+                turn_id=turn_id,
+                event_type="task_session_rebound",
+                payload={"session_id": session_id},
+            )
+
     multi = bool(outcome.planner_used or dc.get("planner_recommended"))
     planish = bool(
         re.search(r"(?iu)\b(plan|etap|krok|najpierw|potem|wdroż)\b", msg)
         and len(msg.split()) >= 5
     )
-    if task is None and (multi or planish):
+    if task is None and (multi or planish or track_intent):
+        title = msg[:120] or "multi-step task"
+        if marker_hit:
+            title = f"{marker_hit.group(1)}: {msg[:100]}"
+        # Prefer structured pending steps for migration-style plans.
+        pending = [msg[:160]] if msg else []
+        if re.search(r"(?iu)migracj|rollback|weryfik", msg_l):
+            pending = [
+                "Przygotowanie / backup",
+                "Konfiguracja nowego środowiska",
+                "Migracja danych",
+                "Weryfikacja + rollback plan",
+            ]
         task = LongHorizonTask(
             task_id=str(uuid.uuid4()),
             user_id=user_id,
             session_id=session_id,
-            title=msg[:120] or "multi-step task",
+            title=title,
             objective=msg[:400],
-            pending_steps=[msg[:160]] if msg else [],
-            current_stage="planning",
+            pending_steps=pending,
+            current_stage="planning" if not track_intent else "tracked",
             status="active",
-            confidence=0.55,
-            last_action="created",
-            next_best_action="execute_first_step",
+            confidence=0.7 if track_intent else 0.55,
+            last_action="created" if not track_intent else "tracked_by_user",
+            next_best_action=pending[0] if pending else "execute_first_step",
         )
         store.save_long_horizon_task(task)
         store.append_task_event(
             task_id=task.task_id,
             turn_id=turn_id,
             event_type="task_created",
-            payload={"title": task.title},
+            payload={"title": task.title, "track_intent": track_intent},
         )
         return task.task_id, True
 
@@ -875,6 +956,24 @@ def maybe_update_long_horizon(
         return "", False
 
     updated = False
+    if track_intent:
+        if marker_hit and marker_hit.group(1).lower() not in (task.title or "").lower():
+            task.title = f"{marker_hit.group(1)}: {(task.title or msg)[:100]}"
+            updated = True
+        task.last_action = "user_track_request"
+        if not task.next_best_action and task.pending_steps:
+            task.next_best_action = str(task.pending_steps[0])[:180]
+            updated = True
+        updated = True
+        store.append_task_event(
+            task_id=task.task_id,
+            turn_id=turn_id,
+            event_type="task_tracked",
+            payload={"message": msg[:160]},
+        )
+    if status_intent:
+        task.last_action = "status_query"
+        updated = True
     if re.search(r"(?iu)\b(odrzucam|nie chcę|bez\s+\w+)\b", msg):
         if msg not in task.rejected_decisions:
             task.rejected_decisions = (task.rejected_decisions + [msg[:160]])[-20:]
@@ -895,6 +994,8 @@ def maybe_update_long_horizon(
             task.completed_steps = (task.completed_steps + [step])[-30:]
             task.pending_steps = [p for p in task.pending_steps if p != step]
             task.current_stage = "executing"
+            if task.pending_steps:
+                task.next_best_action = str(task.pending_steps[0])[:180]
             updated = True
     if re.search(r"(?iu)\b(anuluj\s+plan|porzuć|rezygnuję z planu)\b", msg):
         task.status = "abandoned"
@@ -903,7 +1004,7 @@ def maybe_update_long_horizon(
             task_id=task.task_id, turn_id=turn_id, event_type="task_abandoned", payload={}
         )
     if updated:
-        task.last_action = f"turn:{turn_id[:8]}"
+        task.last_action = task.last_action or f"turn:{turn_id[:8]}"
         store.save_long_horizon_task(task)
     return task.task_id, updated
 
@@ -1089,7 +1190,25 @@ def apply_learning_influences_to_decision(
         decision_core["long_horizon_rejected"] = rejected
         decision_core["long_horizon_accepted"] = list(task.accepted_decisions[-8:])
         decision_core["long_horizon_status"] = task.status
+        decision_core["long_horizon_title"] = task.title
+        decision_core["long_horizon_objective"] = task.objective
+        decision_core["long_horizon_stage"] = task.current_stage
+        decision_core["long_horizon_next_step"] = task.next_best_action
+        decision_core["long_horizon_pending"] = list(task.pending_steps[:5])
+        decision_core["long_horizon_completed"] = list(task.completed_steps[-5:])
+        decision_core["long_horizon_brief"] = store.format_long_horizon_brief(task)
         msg_l = (message or "").lower()
+        # Status / next-step questions about an active LHT must stay memory-aware.
+        if re.search(
+            r"(?iu)\b(stan\s+zadania|stan\s+planu|następnym\s+krokiem|nastepnym\s+krokiem|next\s+step)\b",
+            msg_l,
+        ) or ("profile26" in msg_l and "zadani" in msg_l):
+            if str(decision_core.get("selected_strategy") or "") in ("instant", "direct", "casual"):
+                decision_core["selected_strategy"] = "agentic"
+                influenced = True
+                codes.append("LEARN_LHT_STATUS_ESCALATE_AGENTIC")
+            decision_core["planner_recommended"] = True
+            decision_core["requires_memory"] = True
         if rejected:
             decision_core["rejected_decision_guard_applied"] = True
             decision_core["blocked_rejected_options"] = list(dict.fromkeys(rejected))[:10]
@@ -1165,6 +1284,20 @@ def apply_learning_influences_to_decision(
     decision_core["confidence_calibration_source"] = cal.calibration_source
     decision_core["confidence_calibration_samples"] = cal.calibration_sample_count
     codes.append("LEARN_CONFIDENCE_CALIBRATED")
+
+    # Continuous self-eval prior → real next-turn behavioral influence.
+    try:
+        from aihub.turn.cse_feedback import apply_cse_prior_to_decision, load_cse_prior
+
+        prior = load_cse_prior(user_id)
+        if prior:
+            apply_cse_prior_to_decision(decision_core, prior, message=message)
+            if decision_core.get("cse_prior_influenced"):
+                influenced = True
+            codes = list(decision_core.get("reason_codes") or codes)
+    except Exception as cse_exc:
+        log.debug("cse prior apply skipped: %s", cse_exc, exc_info=True)
+        codes.append("CSE_PRIOR_APPLY_SKIPPED")
 
     decision_core["self_model_influenced_strategy"] = influenced
     decision_core["reason_codes"] = codes
@@ -1254,6 +1387,20 @@ def process_turn_learning(
             update_research_metrics_from_trace(user_id=user_id, trace=trace, outcome=outcome)
             update_self_model_from_outcome(outcome)
             result.self_model_updated = True
+            # Persist CSE rolling prior so next turn can change behavior.
+            try:
+                from aihub.turn.cse_feedback import persist_cse_prior
+
+                cse = {}
+                if isinstance(trace, dict):
+                    cse = dict(trace.get("continuous_self_eval") or {})
+                if not cse and isinstance(outcome.metadata, dict):
+                    cse = dict(outcome.metadata.get("continuous_self_eval") or {})
+                if cse:
+                    persist_cse_prior(user_id, cse)
+                    result.reason_codes.append("CSE_PRIOR_PERSISTED")
+            except Exception as cse_persist_exc:
+                log.debug("cse prior persist skipped: %s", cse_persist_exc, exc_info=True)
             _, um_changed = update_user_model_v2_from_signals(
                 user_id=user_id,
                 turn_id=turn_id,

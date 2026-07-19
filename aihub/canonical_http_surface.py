@@ -163,6 +163,13 @@ CANONICAL_HTTP_ROUTES: Tuple[Tuple[str, str, str, str, str], ...] = (
     ),
     (
         "GET",
+        "/chat/file/{file_id}",
+        "aihub/chat_api.py",
+        "TAK",
+        "tests/test_chat_image_generation.py",
+    ),
+    (
+        "GET",
         "/chat/sessions",
         "aihub/chat_sessions_api.py",
         "TAK",
@@ -336,6 +343,20 @@ CANONICAL_HTTP_ROUTES: Tuple[Tuple[str, str, str, str, str], ...] = (
     ),
     (
         "GET",
+        "/ops/cost/today",
+        "aihub/main.py",
+        "TAK",
+        "tests/test_cohesion_surface_30.py",
+    ),
+    (
+        "GET",
+        "/ops/cost/global-today",
+        "aihub/main.py",
+        "TAK",
+        "tests/test_cohesion_surface_30.py",
+    ),
+    (
+        "GET",
         "/ops/ready",
         "aihub/main.py",
         "TAK",
@@ -469,6 +490,20 @@ CANONICAL_HTTP_ROUTES: Tuple[Tuple[str, str, str, str, str], ...] = (
     (
         "POST",
         "/chat/session/auto-title",
+        "aihub/chat_sessions_api.py",
+        "TAK",
+        "tests/test_chat_sessions_api.py",
+    ),
+    (
+        "POST",
+        "/chat/session/archive",
+        "aihub/chat_sessions_api.py",
+        "TAK",
+        "tests/test_chat_sessions_api.py",
+    ),
+    (
+        "POST",
+        "/chat/session/unarchive",
         "aihub/chat_sessions_api.py",
         "TAK",
         "tests/test_chat_sessions_api.py",

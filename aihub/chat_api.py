@@ -3,7 +3,8 @@
 
 """Frontend-facing chat API endpoints.
 
-Jedyna ścieżka decyzyjna tur czatu HTTP: ``get_chat_runtime().run_turn`` → ``ChatRuntime._run_turn_core``.
+Jedyna ścieżka decyzyjna tur czatu HTTP:
+``get_chat_runtime().run_turn`` → ``ChatTurnApplicationService.execute`` → ``TurnOps.run_turn_core``.
 Nie dodawaj równoległego routingu czatu poza tym modułem.
 """
 
@@ -18,13 +19,14 @@ from io import BytesIO
 from typing import Any, Dict, Union
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Request, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel, Field
+from pathlib import Path
 
 from aihub.chat_context_compose import derive_context_chips_from_trace
-from aihub.chat_contracts import ChatTurnInput, ChatTurnResult, ToolCallRequest
+from aihub.chat_contracts import ChatTurnInput, ChatTurnResult, ToolCallRequest, ToolPolicyOverrides
 from aihub.ops_trace import attach_runtime_trace_summary
-from aihub.chat_file_service import save_multipart_upload
+from aihub.chat_file_service import get_upload_for_user, save_multipart_upload
 from aihub.chat_runtime import get_chat_runtime
 from aihub.chat_stream_session import CHAT_STREAM_SESSION, STREAM_END, ChatStreamSession
 from aihub.chat_stt_service import transcribe_audio_bytes
@@ -36,12 +38,8 @@ router = APIRouter(prefix="/chat", tags=["chat"])
 logger = logging.getLogger(__name__)
 
 
-class ToolPolicyOverridesInput(BaseModel):
-    """Explicit, validated policy switches accepted by the operator API."""
-
-    allow_sensitive_mutations: bool = False
-
-    model_config = {"extra": "forbid"}
+# Backward-compatible alias for capability execute payload validation.
+ToolPolicyOverridesInput = ToolPolicyOverrides
 
 
 class CapabilityExecuteInput(BaseModel):
@@ -59,6 +57,36 @@ class CapabilityExecuteInput(BaseModel):
     model_config = {"extra": "forbid"}
 
 
+def _principal_is_admin(request: Request) -> bool:
+    principal = getattr(request.state, "principal", None)
+    return bool(principal is not None and getattr(principal, "role", "") == "admin")
+
+
+def _apply_chat_turn_privilege_gates(
+    request: Request,
+    payload: ChatTurnInput,
+) -> ChatTurnInput:
+    """Bind user_id to principal; strip operator-only switches for non-admin callers."""
+    updates: dict[str, Any] = {}
+    principal = getattr(request.state, "principal", None)
+    if principal is not None and getattr(principal, "user_id", None):
+        updates["user_id"] = str(principal.user_id).strip()
+
+    if not _principal_is_admin(request):
+        if payload.include_debug:
+            updates["include_debug"] = False
+        overrides = dict(payload.tool_policy_overrides or {})
+        if overrides.get("allow_sensitive_mutations"):
+            updates["tool_policy_overrides"] = {
+                **overrides,
+                "allow_sensitive_mutations": False,
+            }
+
+    if not updates:
+        return payload
+    return payload.model_copy(update=updates)
+
+
 def _sse_data_line(obj: dict[str, Any]) -> bytes:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n".encode("utf-8")
 
@@ -66,6 +94,24 @@ def _sse_data_line(obj: dict[str, Any]) -> bytes:
 def _finalize_chat_turn_result(res: ChatTurnResult) -> ChatTurnResult:
     if isinstance(res.trace, dict):
         attach_runtime_trace_summary(res.trace)
+    try:
+        from aihub.tools.mutation_guard import collect_pending_confirmations
+
+        pending = list(res.pending_confirmations or [])
+        if not pending:
+            pending = collect_pending_confirmations(
+                tool_calls=res.tool_calls,
+                tool_results=res.tool_results,
+                errors=list(res.errors or []),
+            )
+        if pending:
+            tr = dict(res.trace or {})
+            tr["pending_confirmations"] = pending
+            return res.model_copy(
+                update={"pending_confirmations": pending, "trace": tr}
+            )
+    except Exception:
+        logger.debug("pending_confirmations attach skipped", exc_info=True)
     return res
 
 
@@ -206,6 +252,14 @@ async def _sse_chat_turn(
     )
     if chips:
         done_payload["context_chips"] = chips
+    # Always surface confirmation gate for ChatShell (even without full turn dump).
+    pcs = list(getattr(r, "pending_confirmations", None) or [])
+    if not pcs and isinstance(getattr(r, "trace", None), dict):
+        raw = r.trace.get("pending_confirmations")
+        if isinstance(raw, list):
+            pcs = [x for x in raw if isinstance(x, dict)]
+    if pcs:
+        done_payload["pending_confirmations"] = pcs
     if include_turn_result or payload.include_debug:
         done_payload["result"] = r.model_dump(mode="json")
     if r.attachments_summary:
@@ -253,6 +307,34 @@ async def chat_upload(
     return out
 
 
+@router.get("/file/{file_id}")
+async def chat_file_get(
+    request: Request,
+    file_id: str,
+) -> FileResponse:
+    """Serve a previously uploaded / generated chat file (owner-scoped)."""
+    principal = getattr(request.state, "principal", None)
+    user_id = (
+        str(getattr(principal, "user_id", "") or "").strip()
+        if principal is not None
+        else ""
+    )
+    if not user_id:
+        # Non-auth local/dev: allow query user_id for tooling; production principal binds.
+        user_id = (request.query_params.get("user_id") or "default").strip() or "default"
+    row = get_upload_for_user(file_id=(file_id or "").strip(), user_id=user_id)
+    if not row:
+        raise HTTPException(status_code=404, detail={"ok": False, "error": "file_not_found"})
+    path = Path(str(row.get("stored_path") or ""))
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail={"ok": False, "error": "file_missing_on_disk"})
+    return FileResponse(
+        path,
+        media_type=str(row.get("content_type") or "application/octet-stream"),
+        filename=str(row.get("original_filename") or path.name),
+    )
+
+
 @router.post("/turn", response_model=None)
 async def chat_turn(
     request: Request,
@@ -266,12 +348,7 @@ async def chat_turn(
     ),
 ) -> Union[ChatTurnResult, StreamingResponse]:
     runtime = get_chat_runtime()
-    # Bound turn identity to authenticated principal (never silent default fallback).
-    principal = getattr(request.state, "principal", None)
-    if principal is not None and getattr(principal, "user_id", None):
-        payload = payload.model_copy(
-            update={"user_id": str(principal.user_id).strip()}
-        )
+    payload = _apply_chat_turn_privilege_gates(request, payload)
     if stream:
         return StreamingResponse(
             _sse_chat_turn(
@@ -295,6 +372,9 @@ async def chat_turn(
         )
         if chips:
             out = out.model_copy(update={"context_chips": chips})
+        # Defense-in-depth: never return debug payload to non-admin even if turn set it.
+        if out.debug is not None and not _principal_is_admin(request):
+            out = out.model_copy(update={"debug": None})
         return out
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=str(exc)) from exc
@@ -302,9 +382,12 @@ async def chat_turn(
 
 @router.get("/capabilities")
 def chat_capabilities(
+    request: Request,
     mode: ToolMode = Query(default="chat"),
     include_debug: bool = Query(default=False),
 ) -> Dict[str, Any]:
+    if include_debug and not _principal_is_admin(request):
+        include_debug = False
     registry = get_tool_registry()
     capabilities = registry.list_capabilities(
         mode=mode,
@@ -321,13 +404,29 @@ def chat_capabilities(
 
 
 @router.post("/capabilities/execute")
-async def chat_capabilities_execute(payload: CapabilityExecuteInput) -> Dict[str, Any]:
+async def chat_capabilities_execute(
+    request: Request,
+    payload: CapabilityExecuteInput,
+) -> Dict[str, Any]:
     """Execute one registered capability through existing ToolRouter policies/schemas.
 
     This endpoint is intended for operator cockpit workflows (planner preview,
     reasoning preview, goals control, runtime introspection) without relying on
     model-mediated tool-calling.
     """
+    # Sensitive mutation override is admin-only even on the capability console.
+    if (
+        payload.tool_policy_overrides.allow_sensitive_mutations
+        and not _principal_is_admin(request)
+    ):
+        payload = payload.model_copy(
+            update={
+                "tool_policy_overrides": ToolPolicyOverridesInput(
+                    allow_sensitive_mutations=False
+                ),
+            }
+        )
+
     registry = get_tool_registry()
     tool_router = ToolRouter(registry)
 

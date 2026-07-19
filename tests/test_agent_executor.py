@@ -98,7 +98,7 @@ def test_executor_action(monkeypatch):
 
     assert result["ok"] is True
     assert result["action"] == "tool"
-    assert result["tool"] == "web_fetch"
+    assert result["tool"] == "web.fetch_url"
     fetch_mock.assert_awaited_once()
 
 

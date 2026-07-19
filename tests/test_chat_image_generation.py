@@ -1,4 +1,4 @@
-"""Prośby o grafikę: deterministyczna ścieżka + brak ogólnych odmów."""
+"""Prośby o grafikę: intencja + brak deterministycznego prompt-only shortcut."""
 
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ from aihub.chat_image_generation import (
     is_image_generation_intent,
 )
 from aihub.chat_runtime import ChatRuntime
+from aihub.turn.forced_capability_tools import build_image_markdown_reply
 
 
 def test_image_intent_detected_polish() -> None:
@@ -30,28 +31,31 @@ def test_image_intent_weird_request_no_refusal() -> None:
     assert "nie moge" not in low.replace("ę", "e")
     assert "niewłaściwe" not in low
     assert "niewlasciwe" not in low
-    # Konkret: prompt do generatorów
     assert "prompt" in low or "dall" in low or "stable" in low or "midjourney" in low
     assert "```" in text
 
 
-def test_deterministic_turn_returns_image_package() -> None:
+def test_deterministic_turn_no_longer_short_circuits_image() -> None:
+    """Image gen is a forced tool capability — deterministic path must fall through."""
     turn = ChatTurnInput(
         user_id="test_img_user",
         session_id="s1",
         message="narysuj coś dziwnego i absurdalnego",
     )
     res = try_deterministic_turn(turn, started_monotonic=time.monotonic())
-    assert res is not None
-    assert res.ok
-    low = res.response_text.lower()
-    assert "nie mogę" not in low
-    assert "prompt" in low or "dall" in low
+    assert res is None
+
+
+def test_image_markdown_reply_embeds_file() -> None:
+    text = build_image_markdown_reply(
+        {"file_id": "cf_abc123", "description_pl": "kot", "model": "flux"}
+    )
+    assert "/api/aihub/chat/file/cf_abc123" in text
+    assert "![" in text
 
 
 def test_describe_attached_image_is_not_image_generation() -> None:
-    """With an attachment, 'opisz ten obrazek' must fall through to the vision path,
-    not the deterministic DALL·E prompt generator."""
+    """With an attachment, 'opisz ten obrazek' must fall through to the vision path."""
     turn = ChatTurnInput(
         user_id="test_img_user",
         session_id="s1",

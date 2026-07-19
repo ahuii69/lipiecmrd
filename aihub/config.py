@@ -116,6 +116,12 @@ def _validate_production_secrets() -> None:
     - At least one HTTP hub auth secret (see ``aihub.auth_patch.collect_hub_auth_secrets``):
       without it, ``aihub.main._auth_middleware`` skips authentication entirely for every
       non-public path.
+
+    Test harness contract: ``tests/conftest.py`` forces ``ENV=test`` before any ``aihub``
+    import and again before every ``importlib.reload(aihub.config)`` in ``isolated_db``.
+    Without that, a developer ``.env`` with ``ENV=production`` plus cleared hub keys on
+    reload raises here and aborts the suite. Production-secret contracts are still asserted
+    explicitly in ``tests/test_config_truth.py`` via direct calls to this function.
     """
     env_mode = os.getenv("ENV", "development").lower().strip()
     if env_mode != "production":
@@ -277,16 +283,66 @@ CHAT_STT_OPENAI_MODEL = os.getenv("CHAT_STT_OPENAI_MODEL", "whisper-1")
 CHAT_STT_TIMEOUT_S = float(os.getenv("CHAT_STT_TIMEOUT_S", "120"))
 
 # Vision — opisy załączników graficznych (``aihub.chat_attachment_vision``)
-CHAT_VISION_ENABLED = _env_bool("CHAT_VISION_ENABLED", "0")
-CHAT_VISION_BACKEND = os.getenv("CHAT_VISION_BACKEND", "ollama")
+# Prefer remote openai_compatible when LLM credentials exist; ollama only as local fallback.
+_CHAT_VISION_BACKEND_RAW = os.getenv("CHAT_VISION_BACKEND", "").strip()
+CHAT_VISION_API_KEY = (
+    os.getenv("CHAT_VISION_API_KEY", "").strip() or LLM_API_KEY
+)
+if _CHAT_VISION_BACKEND_RAW:
+    CHAT_VISION_BACKEND = _CHAT_VISION_BACKEND_RAW
+elif CHAT_VISION_API_KEY:
+    CHAT_VISION_BACKEND = "openai_compatible"
+else:
+    CHAT_VISION_BACKEND = "ollama"
 CHAT_VISION_OLLAMA_URL = os.getenv(
     "CHAT_VISION_OLLAMA_URL", "http://127.0.0.1:11434"
 )
-CHAT_VISION_MODEL = os.getenv("CHAT_VISION_MODEL", "")
+_CHAT_VISION_MODEL_RAW = os.getenv("CHAT_VISION_MODEL", "").strip()
 CHAT_VISION_FALLBACK_MODEL = os.getenv("CHAT_VISION_FALLBACK_MODEL", "")
-CHAT_VISION_API_URL = os.getenv("CHAT_VISION_API_URL", "")
-CHAT_VISION_API_KEY = os.getenv("CHAT_VISION_API_KEY", "")
+_CHAT_VISION_API_URL_RAW = os.getenv("CHAT_VISION_API_URL", "").strip()
+if _CHAT_VISION_API_URL_RAW:
+    CHAT_VISION_API_URL = _CHAT_VISION_API_URL_RAW
+elif CHAT_VISION_BACKEND in ("openai_compatible", "openai", "remote"):
+    CHAT_VISION_API_URL = LLM_BASE_URL
+else:
+    CHAT_VISION_API_URL = ""
+if _CHAT_VISION_MODEL_RAW:
+    CHAT_VISION_MODEL = _CHAT_VISION_MODEL_RAW
+elif CHAT_VISION_BACKEND in ("openai_compatible", "openai", "remote") and CHAT_VISION_API_KEY:
+    # Sensible DeepInfra / OpenAI-compatible VL default when unset.
+    CHAT_VISION_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct"
+else:
+    CHAT_VISION_MODEL = ""
+_CHAT_VISION_ENABLED_RAW = os.getenv("CHAT_VISION_ENABLED")
+if _CHAT_VISION_ENABLED_RAW is None or str(_CHAT_VISION_ENABLED_RAW).strip() == "":
+    CHAT_VISION_ENABLED = bool(
+        CHAT_VISION_BACKEND in ("openai_compatible", "openai", "remote")
+        and CHAT_VISION_API_KEY
+        and CHAT_VISION_API_URL
+        and CHAT_VISION_MODEL
+    )
+else:
+    CHAT_VISION_ENABLED = _env_bool("CHAT_VISION_ENABLED", "0")
 CHAT_VISION_TIMEOUT_S = float(os.getenv("CHAT_VISION_TIMEOUT_S", "120"))
+
+# Image generation — DeepInfra OpenAI-compatible images API (FLUX by default)
+CHAT_IMAGE_GEN_ENABLED = _env_bool("CHAT_IMAGE_GEN_ENABLED", "1")
+CHAT_IMAGE_GEN_MODEL = os.getenv(
+    "CHAT_IMAGE_GEN_MODEL", "black-forest-labs/FLUX-1-schnell"
+)
+CHAT_IMAGE_GEN_SIZE = os.getenv("CHAT_IMAGE_GEN_SIZE", "1024x1024")
+# Canonical request budget (seconds). BFF AIHUB_TIMEOUT_MS must be >= this * 1000.
+# Image gen and long chat turns share this ceiling so frontend never 504s a finished backend.
+AIHUB_REQUEST_TIMEOUT_S = float(os.getenv("AIHUB_REQUEST_TIMEOUT_S", "120"))
+CHAT_IMAGE_GEN_TIMEOUT_S = float(
+    os.getenv(
+        "CHAT_IMAGE_GEN_TIMEOUT_S",
+        str(max(30.0, min(90.0, AIHUB_REQUEST_TIMEOUT_S - 15.0))),
+    )
+)
+CHAT_IMAGE_GEN_BASE_URL = os.getenv(
+    "CHAT_IMAGE_GEN_BASE_URL", "https://api.deepinfra.com/v1/openai"
+).rstrip("/")
 
 # FS sandbox root
 FS_ROOT = Path(os.getenv("FS_ROOT", str(DATA_DIR / "fs"))).resolve()

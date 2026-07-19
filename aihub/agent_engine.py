@@ -135,30 +135,51 @@ def extract_facts_from_text(text: str) -> List[Tuple[str, List[str], Dict[str, A
 
 
 def plan_from_text(user_id: str, text: str) -> List[Dict[str, Any]]:
-    """
-    Plan zadań z tekstu.
+    """Plan zadań z tekstu — ta sama klasyfikacja intencji co chat capability_escalation.
 
-    Obsługuje:
-    - web.fetch (URLs)
-    - fs.write (zapisz: ... :: ...)
-    - system.snapshot
+    Nie używa gołego ``if "sprawdź"`` — lokalne checki (pisownia) nie tworzą web.fetch.
+    Mutacje (fs.write / snapshot) wymagają później MutationPolicy + confirmed.
     """
     try:
-        tl = text.lower()
+        from aihub.turn.capability_escalation import detect_capability_intents
+
+        intents = detect_capability_intents(text or "")
         tasks: List[Dict[str, Any]] = []
+        url_m = _URL_RE.search(text or "")
+        url = url_m.group(1) if url_m else None
 
-        # web fetch
-        if "sprawdź" in tl or "ściągnij" in tl or "fetch" in tl:
-            m = _URL_RE.search(text)
-            if m:
-                url = m.group(1)
-                if _is_valid_url(url):
+        # External verify / search / freshness → research or fetch URL
+        # Local editorial "sprawdź pisownię" → no web task (intents.verify=False).
+        if intents.get("verify") or intents.get("freshness") or intents.get("ingest"):
+            if url and _is_valid_url(url):
+                if intents.get("ingest"):
                     tasks.append(
-                        {"type": "web.fetch", "priority": 10, "payload": {"url": url}}
+                        {
+                            "type": "web.fetch",
+                            "priority": 10,
+                            "payload": {"url": url},
+                        }
                     )
+                else:
+                    tasks.append(
+                        {
+                            "type": "web.fetch",
+                            "priority": 10,
+                            "payload": {"url": url},
+                        }
+                    )
+            else:
+                tasks.append(
+                    {
+                        "type": "research.query",
+                        "priority": 15,
+                        "payload": {"query": (text or "").strip()},
+                    }
+                )
 
-        # fs write: "zapisz: <ścieżka> :: <treść>"
-        if tl.startswith("zapisz:") and "::" in text:
+        # Explicit structured fs write syntax (legacy): "zapisz: path :: content"
+        tl = (text or "").lower()
+        if tl.startswith("zapisz:") and "::" in (text or ""):
             try:
                 left, content = text.split("::", 1)
                 path = left.split(":", 1)[1].strip()
@@ -171,33 +192,30 @@ def plan_from_text(user_id: str, text: str) -> List[Dict[str, Any]]:
                                 "path": path,
                                 "content": content.strip(),
                                 "overwrite": True,
+                                # MutationPolicy: never auto-confirm from parser.
+                                "confirmed": False,
                             },
                         }
                     )
             except (ValueError, IndexError) as e:
                 logger.debug(f"Failed to parse fs.write task: {e}")
 
-        # snapshot
-        if "snapshot" in tl or "backup" in tl or "kopia" in tl:
+        if intents.get("sensitive_mutation") and (
+            "snapshot" in tl or "backup" in tl or "kopia" in tl
+        ):
             tasks.append(
                 {
                     "type": "system.snapshot",
                     "priority": 20,
-                    "payload": {"reason": "agent:auto"},
+                    "payload": {"reason": "agent:auto", "confirmed": False},
                 }
             )
-
-        # research
-        if any(
-            k in tl
-            for k in ["wyszukaj", "research", "znajdź info", "zbadaj", "sprawdź temat"]
-        ):
-            query = text.strip()
+        elif "snapshot" in tl or "backup" in tl or "kopia" in tl:
             tasks.append(
                 {
-                    "type": "research.query",
-                    "priority": 15,
-                    "payload": {"query": query},
+                    "type": "system.snapshot",
+                    "priority": 20,
+                    "payload": {"reason": "agent:auto", "confirmed": False},
                 }
             )
 
@@ -226,32 +244,35 @@ def _is_valid_path(path: str) -> bool:
 
 async def execute_task(user_id: str, task: Dict[str, Any]) -> None:
     """
-    Wykonaj pojedyncze zadanie.
+    Wykonaj pojedyncze zadanie przez Tool Registry (ta sama powierzchnia co chat).
 
-    Obsługuje:
-    - web.fetch
-    - fs.write
-    - system.snapshot
+    Obsługuje m.in.:
+    - web.fetch / web.fetch_url / web.ingest_url
+    - fs.write / fs.write_file / fs.read_file
+    - system.snapshot / snapshot.create
+    - memory.search / memory.add_fact / image.generate
+    - research.query
     """
+    typ = task.get("type")
     try:
-        typ = task.get("type")
         payload = task.get("payload") or {}
+        if not isinstance(payload, dict):
+            payload = {}
 
         logger.debug(f"Executing task type={typ} for user {user_id}")
 
-        if typ == "web.fetch":
-            await _execute_web_fetch(user_id, payload)
-
-        elif typ == "fs.write":
-            await _execute_fs_write(user_id, payload)
-
-        elif typ == "system.snapshot":
-            await _execute_snapshot(user_id, payload)
-
-        elif typ == "research.query":
+        # research.query keeps dedicated rate-limited path (not only registry).
+        if str(typ or "") in ("research.query", "research"):
             await _execute_research(user_id, payload)
+            return
 
-        else:
+        from aihub.tools.executive_dispatch import (
+            dispatch_executive_tool,
+            resolve_executive_tool_name,
+        )
+
+        tool_name = resolve_executive_tool_name(str(typ or ""))
+        if not tool_name:
             logger.warning(f"Unknown task type: {typ}")
             get_memory_core().ingest_fact(
                 user_id,
@@ -259,6 +280,57 @@ async def execute_task(user_id: str, task: Dict[str, Any]) -> None:
                 tags=["agent", "task", "unknown"],
                 meta={"payload": payload},
             )
+            return
+
+        args = dict(payload)
+        # Snapshot / fs.write require explicit confirm via MutationPolicy.
+        confirmed = bool(args.pop("_confirmed", False) or args.pop("confirmed", False))
+        if tool_name == "snapshot.create" and "reason" not in args:
+            args["reason"] = str(args.get("reason") or "agent_task")
+
+        out = await dispatch_executive_tool(
+            user_id=user_id,
+            tool_name=tool_name,
+            arguments=args,
+            session_id=str(task.get("session_id") or "agent_engine"),
+            mode="agent",
+            confirmed=confirmed,
+        )
+        if not out.get("ok"):
+            logger.warning(
+                "Executive tool failed type=%s tool=%s err=%s",
+                typ,
+                tool_name,
+                out.get("error"),
+            )
+            append_event(
+                user_id,
+                "agent.task.tool_failed",
+                {"type": typ, "tool": tool_name, "error": out.get("error")},
+            )
+            return
+
+        # Best-effort memory note for successful web/fs (legacy behavior).
+        result = out.get("result") or {}
+        if tool_name == "web.fetch_url" and isinstance(result, dict):
+            text = str(result.get("text") or result.get("preview") or "")[:800]
+            url = str(args.get("url") or result.get("url") or "")
+            if url and text:
+                get_memory_core().ingest_fact(
+                    user_id,
+                    f"Web fetch {url}: {text}",
+                    tags=["web", "fetch"],
+                    meta={"source": "agent_web_fetch", "status": result.get("status")},
+                )
+        elif tool_name == "fs.write_file" and isinstance(result, dict) and result.get("ok", True):
+            path = str(args.get("path") or "")
+            if path:
+                get_memory_core().ingest_fact(
+                    user_id,
+                    f"Zapisano plik: {path}",
+                    tags=["fs", "write"],
+                    meta={"bytes": result.get("bytes"), "source": "agent_fs_write"},
+                )
 
     except Exception as e:
         logger.error(f"Error executing task: {e}", exc_info=True)
@@ -298,6 +370,24 @@ async def _execute_web_fetch(user_id: str, payload: Dict[str, Any]) -> None:
 
 async def _execute_fs_write(user_id: str, payload: Dict[str, Any]) -> None:
     """Execute file write task."""
+    from aihub.tools.mutation_guard import block_unconfirmed_mutation
+
+    blocked = block_unconfirmed_mutation(
+        "fs.write", payload if isinstance(payload, dict) else {}
+    )
+    if blocked:
+        logger.warning(
+            "fs.write blocked without confirmation user=%s path=%s",
+            user_id,
+            (payload or {}).get("path"),
+        )
+        append_event(
+            user_id,
+            "fs.write.blocked",
+            {"reason": blocked.get("error"), "path": (payload or {}).get("path")},
+        )
+        return
+
     path = payload.get("path", "note.txt")
     content = payload.get("content", "")
     overwrite = bool(payload.get("overwrite", True))
@@ -327,6 +417,22 @@ async def _execute_fs_write(user_id: str, payload: Dict[str, Any]) -> None:
 
 async def _execute_snapshot(user_id: str, payload: Dict[str, Any]) -> None:
     """Execute snapshot creation task."""
+    from aihub.tools.mutation_guard import block_unconfirmed_mutation
+
+    blocked = block_unconfirmed_mutation(
+        "snapshot.create", payload if isinstance(payload, dict) else {}
+    )
+    if blocked:
+        logger.warning(
+            "snapshot blocked without confirmation user=%s", user_id
+        )
+        append_event(
+            user_id,
+            "snapshot.blocked",
+            {"reason": blocked.get("error")},
+        )
+        return
+
     reason = payload.get("reason", "agent:auto")
 
     try:

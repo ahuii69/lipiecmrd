@@ -70,6 +70,12 @@ export interface ChatTurnResponse {
     debug?: Record<string, unknown> | null;
     attachments_summary?: string | null;
     context_chips?: string[];
+    pending_confirmations?: Array<{
+        tool_name: string;
+        arguments?: Record<string, unknown>;
+        tool_call_id?: string | null;
+        message?: string;
+    }>;
 }
 
 export interface ChatUploadResponse {

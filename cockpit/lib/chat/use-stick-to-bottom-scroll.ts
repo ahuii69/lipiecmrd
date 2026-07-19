@@ -17,13 +17,14 @@ import {
  * Autoscroll jak w typowym chacie: podąża tylko gdy użytkownik jest „przy dole”;
  * po przewinięciu wyżej nie zrywa widoku (stickToBottomRef = false z onScroll).
  *
- * ResizeObserver: wzrost wysokości treści (stream, zawijanie) bez zmiany length —
- * nadal przewijamy, jeśli user był przy dole.
+ * Przy zmianie sesji / historyNonce — zawsze wracamy na dół.
  */
 export function useStickToBottomScroll(opts: {
     scrollRef: RefObject<HTMLElement | null>;
     contentRef: RefObject<HTMLElement | null>;
     stickToBottomRef: MutableRefObject<boolean>;
+    sessionId?: string;
+    historyNonce?: number;
     messagesLength: number;
     lastMessageId: string;
     streamSig: string;
@@ -34,6 +35,8 @@ export function useStickToBottomScroll(opts: {
         scrollRef,
         contentRef,
         stickToBottomRef,
+        sessionId,
+        historyNonce,
         messagesLength,
         lastMessageId,
         streamSig,
@@ -47,15 +50,25 @@ export function useStickToBottomScroll(opts: {
         stickToBottomRef.current = isScrollContainerNearBottom(el);
     }, [scrollRef, stickToBottomRef]);
 
-    const scrollIfStuck = useCallback(() => {
-        const el = scrollRef.current;
-        if (!el || !stickToBottomRef.current) return;
-        const behavior: ScrollBehavior =
-            loading || streamingBubble ? "auto" : "smooth";
-        requestAnimationFrame(() => {
-            scrollContainerToBottom(el, behavior);
-        });
-    }, [scrollRef, stickToBottomRef, loading, streamingBubble]);
+    const scrollIfStuck = useCallback(
+        (force = false) => {
+            const el = scrollRef.current;
+            if (!el) return;
+            if (!force && !stickToBottomRef.current) return;
+            const behavior: ScrollBehavior =
+                force || loading || streamingBubble ? "auto" : "smooth";
+            requestAnimationFrame(() => {
+                scrollContainerToBottom(el, behavior);
+            });
+        },
+        [scrollRef, stickToBottomRef, loading, streamingBubble],
+    );
+
+    // Nowa sesja / świeża historia → zawsze dół.
+    useLayoutEffect(() => {
+        stickToBottomRef.current = true;
+        scrollIfStuck(true);
+    }, [sessionId, historyNonce, stickToBottomRef, scrollIfStuck]);
 
     useLayoutEffect(() => {
         scrollIfStuck();

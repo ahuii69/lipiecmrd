@@ -862,7 +862,7 @@ class ToolRegistry:
                 read_only=False,
                 requires_confirmation=False,
                 timeout_seconds=35.0,
-                visibility=["agent", "debug"],
+                visibility=["chat", "agent", "debug"],
                 handler=_web_ingest,
             )
         )
@@ -872,18 +872,18 @@ class ToolRegistry:
             ToolDefinition(
                 name="image.generate",
                 description=(
-                    "Build a ready-to-paste English prompt for DALL·E, Stable Diffusion, or Midjourney "
-                    "from the user's idea. Always returns prompt_en, description_pl, negative_prompt — "
-                    "use for any draw/image request; never refuse generically."
+                    "Generate a real image (DeepInfra FLUX) from the user's idea. "
+                    "Returns file_id + public_url for markdown embedding, plus prompt_en / description_pl. "
+                    "Use for any draw/image request; never refuse generically."
                 ),
                 capability_group="image",
                 input_model=ImageGenerateIn,
                 output_model=ToolEnvelopeOut,
                 enabled=True,
-                read_only=True,
+                read_only=False,
                 requires_confirmation=False,
-                timeout_seconds=5.0,
-                visibility=["chat", "agent", "readonly", "debug"],
+                timeout_seconds=100.0,
+                visibility=["chat", "agent", "debug"],
                 handler=tool_image_generate_handler,
             )
         )

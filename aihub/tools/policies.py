@@ -67,7 +67,11 @@ def can_call_tool(
     if not view.allowed:
         return view
 
-    if tool.requires_confirmation and not confirmed:
-        return ToolPolicyDecision(False, "tool requires confirmation")
+    from aihub.tools.mutation_guard import evaluate_mutation, tool_requires_mutation_confirmation
+
+    if tool.requires_confirmation or tool_requires_mutation_confirmation(tool.name):
+        decision = evaluate_mutation(tool.name, confirmed=confirmed)
+        if not decision.allowed:
+            return ToolPolicyDecision(False, decision.reason)
 
     return ToolPolicyDecision(True, "allowed")

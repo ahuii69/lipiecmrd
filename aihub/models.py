@@ -94,6 +94,7 @@ class FSWriteIn(BaseModel):
     path: str = Field(min_length=1, max_length=5_000)
     content: str = Field(default="", max_length=5_000_000)
     overwrite: bool = True
+    confirmed: bool = False
 
 
 class FSReadIn(BaseModel):
@@ -125,6 +126,7 @@ class WebIngestIn(BaseModel):
 
 class SnapshotCreateIn(BaseModel):
     reason: str = Field(default="manual", min_length=1, max_length=200)
+    confirmed: bool = False
 
 
 class SnapshotRestoreIn(BaseModel):

@@ -7,10 +7,18 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 ToolMode = Literal["chat", "agent", "readonly", "debug"]
 MessageRole = Literal["system", "user", "assistant", "tool"]
+
+
+class ToolPolicyOverrides(BaseModel):
+    """Validated tool policy switches (shared by /chat/turn and capability execute)."""
+
+    allow_sensitive_mutations: bool = False
+
+    model_config = {"extra": "forbid"}
 
 
 class ProviderUsage(BaseModel):
@@ -70,6 +78,16 @@ class ChatTurnInput(BaseModel):
         max_length=5,
         description="IDs z POST /chat/upload (max 5 na turę).",
     )
+
+    @field_validator("tool_policy_overrides", mode="before")
+    @classmethod
+    def _coerce_tool_policy_overrides(cls, value: Any) -> Dict[str, Any]:
+        """Reject unknown switches; keep a plain dict for downstream policy engine."""
+        if value is None:
+            return {}
+        if isinstance(value, ToolPolicyOverrides):
+            return value.model_dump()
+        return ToolPolicyOverrides.model_validate(value or {}).model_dump()
     input_via_stt: bool = Field(
         default=False,
         description="True gdy treść usera weszła z dyktowania (STT) — chip stt-input.",
@@ -238,4 +256,8 @@ class ChatTurnResult(BaseModel):
     context_chips: List[str] = Field(
         default_factory=list,
         description="Krótkie etykiety źródeł odpowiedzi (UI / audyt).",
+    )
+    pending_confirmations: List[Dict[str, Any]] = Field(
+        default_factory=list,
+        description="Mutacje zablokowane przez MutationPolicy — ChatShell może potwierdzić.",
     )

@@ -102,6 +102,23 @@ def upsert_user_declared_procedure(user_id: str, text: str) -> MemoryV2Procedure
     low = raw.lower()
     if not any(m in low for m in _USER_PROC_MARKERS):
         return None
+    # Questions / recall prompts must not create new procedure rows.
+    if raw.endswith("?") or re.match(
+        r"(?iu)^(jak|czego|czym|podaj|opisz|przypomnij|co\s+z)\b", raw
+    ):
+        if not any(
+            m in low
+            for m in (
+                "zapamiętaj",
+                "zapamietaj",
+                "zmień procedur",
+                "zmien procedur",
+                "odpowiadaj zawsze",
+                "gdy proszę",
+                "gdy prosze",
+            )
+        ):
+            return None
 
     now = time.time()
     supersede = any(

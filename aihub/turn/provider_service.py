@@ -50,6 +50,15 @@ def classify_provider_error(exc: BaseException) -> tuple[str, bool, type[Provide
             return "provider_timeout", True, ProviderTimeoutError
         return code, retryable, ProviderExecutionError
 
+    # Preserve typed provider execution failures (e.g. non-text structured content).
+    if isinstance(exc, ProviderExecutionError):
+        code = str(exc.info.code or "provider_error")
+        if code == "provider_timeout":
+            return code, True, ProviderTimeoutError
+        if code == "provider_rate_limit":
+            return code, True, ProviderRateLimitError
+        return code, bool(exc.retryable), ProviderExecutionError
+
     name = type(exc).__name__.lower()
     msg = str(exc).lower()
     if isinstance(exc, (asyncio.TimeoutError, TimeoutError)) or "timeout" in msg or "timed out" in msg:
@@ -91,11 +100,19 @@ def _parse_retry_after(exc: BaseException) -> float | None:
 
 
 def normalize_model_response(raw: Any, *, provider_name: str, default_model: str) -> ModelResponse:
+    """Normalize provider output. Content is extracted, never ``str(dict)``."""
+    from aihub.response_runtime_guard import extract_assistant_text
+
     if isinstance(raw, ModelResponse):
+        # Provider adapters already return str content; keep as-is (no post-filter).
         return raw
     if isinstance(raw, dict):
         message = raw.get("message") if isinstance(raw.get("message"), dict) else {}
-        content = str(raw.get("content") or message.get("content") or "")
+        content_raw = raw.get("content")
+        if content_raw in (None, ""):
+            content_raw = message.get("content")
+        # Root-cause fix: extract text leaves; ChatTurnContext-shaped dicts have none → "".
+        content = extract_assistant_text(content_raw)
         raw_tool_calls = raw.get("tool_calls") or message.get("tool_calls") or []
         tool_calls: list[ToolCallRequest] = []
         for idx, call in enumerate(raw_tool_calls):
@@ -118,6 +135,20 @@ def normalize_model_response(raw: Any, *, provider_name: str, default_model: str
                         arguments=dict(args) if isinstance(args, dict) else {},
                     )
                 )
+        # Structured payload with no text leaves and no tools is unusable for chat —
+        # raise retryable so failover can switch providers (honest empty ≠ silent dump).
+        if (
+            not content
+            and not tool_calls
+            and isinstance(content_raw, (dict, list))
+            and content_raw not in ([], {})
+        ):
+            raise ProviderExecutionError(
+                "Provider zwrócił treść bez wyodrębnialnego tekstu asystenta.",
+                retryable=True,
+                code="provider_non_text_content",
+                internal_detail=type(content_raw).__name__,
+            )
         usage_obj = raw.get("usage")
         usage = usage_obj if isinstance(usage_obj, ProviderUsage) else ProviderUsage()
         return ModelResponse(
@@ -150,7 +181,7 @@ def normalize_model_response(raw: Any, *, provider_name: str, default_model: str
         return ModelResponse(
             provider=str(getattr(raw, "provider", provider_name)),
             model=str(getattr(raw, "model", default_model)),
-            content=str(getattr(raw, "content", "") or ""),
+            content=extract_assistant_text(getattr(raw, "content", "")),
             finish_reason=str(getattr(raw, "finish_reason", "stop") or "stop"),
             tool_calls=tool_calls,
             usage=usage,

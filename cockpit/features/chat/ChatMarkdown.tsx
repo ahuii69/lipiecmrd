@@ -13,11 +13,25 @@ import remarkMath from "remark-math";
 
 const sanitizeSchema = {
     ...defaultSchema,
+    tagNames: [...(defaultSchema.tagNames ?? []), "img"],
     attributes: {
         ...defaultSchema.attributes,
         code: [...(defaultSchema.attributes?.code ?? []), ["className"]],
         span: [...(defaultSchema.attributes?.span ?? []), ["className"], ["style"]],
         div: [...(defaultSchema.attributes?.div ?? []), ["className"], ["style"]],
+        img: [
+            ...(defaultSchema.attributes?.img ?? []),
+            ["src"],
+            ["alt"],
+            ["title"],
+            ["width"],
+            ["height"],
+            ["className"],
+        ],
+    },
+    protocols: {
+        ...defaultSchema.protocols,
+        src: [...(defaultSchema.protocols?.src ?? ["http", "https"]), "http", "https"],
     },
 };
 
@@ -116,6 +130,24 @@ const components: Components = {
             <a href={href} className="chat-md-link" {...props}>
                 {children}
             </a>
+        );
+    },
+    img({ src, alt, ...props }) {
+        const raw = typeof src === "string" ? src : "";
+        // Only allow same-origin chat file URLs (generated / uploaded images).
+        const ok =
+            raw.startsWith("/api/aihub/chat/file/") ||
+            raw.startsWith("/chat/file/");
+        if (!ok) return null;
+        return (
+            // eslint-disable-next-line @next/next/no-img-element
+            <img
+                src={raw}
+                alt={alt || "obraz"}
+                className="chat-md-img my-3 max-h-[28rem] max-w-full rounded-md border border-[var(--chat-border)]"
+                loading="lazy"
+                {...props}
+            />
         );
     },
 };

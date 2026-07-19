@@ -17,7 +17,6 @@ from aihub.chat_contracts import (
 from aihub.chat_decision_trace import (
     ROUTE_DETERMINISTIC_FACT_READ,
     ROUTE_DETERMINISTIC_HISTORY,
-    ROUTE_DETERMINISTIC_IMAGE_GENERATION,
     ROUTE_DETERMINISTIC_VAULT_DELETE,
     ROUTE_DETERMINISTIC_VAULT_LIST,
     ROUTE_DETERMINISTIC_VAULT_READ,
@@ -27,10 +26,6 @@ from aihub.chat_decision_trace import (
     trace_handoff_gate_outcome,
 )
 from aihub.chat_history_trace import build_history_trace
-from aihub.chat_image_generation import (
-    build_image_generation_reply,
-    is_image_generation_intent,
-)
 from aihub.chat_product_policy import MEMORY_FACT_RECALL_HINT
 from aihub.memory_context_pack import is_junk_memory_content
 from aihub.vault.firewall import blocks_memory_fact_recall_for_credentials
@@ -597,19 +592,6 @@ def try_deterministic_turn(
             turn,
             selected_route=ROUTE_DETERMINISTIC_HISTORY,
             route_reason="session_transcript_meta_query",
-        )
-
-    # An attached image means the user is talking ABOUT that image (describe/analyze),
-    # not asking us to synthesize a new one. Words like "obrazek"/"obrazu" would otherwise
-    # trip the image-generation intent and return a DALL·E prompt instead of using vision.
-    if is_image_generation_intent(msg) and not (turn.attached_file_ids or []):
-        return _result(
-            build_image_generation_reply(msg),
-            "deterministic_image_generation",
-            duration_ms,
-            turn,
-            selected_route=ROUTE_DETERMINISTIC_IMAGE_GENERATION,
-            route_reason="image_generation_intent",
         )
 
     return None

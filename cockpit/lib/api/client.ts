@@ -183,6 +183,8 @@ export const apiClient = {
                 title: string;
                 created_at: number;
                 updated_at: number;
+                archived?: boolean;
+                archived_at?: number;
             }>;
         }>("GET", `/chat/sessions?user_id=${encodeURIComponent(userId)}`, {
             apiKeyOverride,
@@ -230,6 +232,29 @@ export const apiClient = {
         apiKeyOverride?: string,
     ) {
         return hubJson("DELETE", "/chat/session", { body, apiKeyOverride });
+    },
+
+    archiveSession(
+        body: { user_id: string; session_id: string },
+        apiKeyOverride?: string,
+    ) {
+        return hubJson<{
+            ok: boolean;
+            session_id: string;
+            archived: boolean;
+            archived_at?: number;
+        }>("POST", "/chat/session/archive", { body, apiKeyOverride });
+    },
+
+    unarchiveSession(
+        body: { user_id: string; session_id: string },
+        apiKeyOverride?: string,
+    ) {
+        return hubJson<{
+            ok: boolean;
+            session_id: string;
+            archived: boolean;
+        }>("POST", "/chat/session/unarchive", { body, apiKeyOverride });
     },
 
     runAgent(

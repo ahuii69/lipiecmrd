@@ -5,7 +5,25 @@ import { validateSessionFromRequest } from "@/lib/api/bff-session-auth";
 import { SESSION_COOKIE_NAME } from "@/lib/auth/session-constants";
 import { newRequestId, signPrincipalForBackend } from "@/lib/api/signed-principal";
 
-const DEFAULT_TIMEOUT_MS = Number(process.env.AIHUB_TIMEOUT_MS || "45000");
+const DEFAULT_TIMEOUT_MS = Number(process.env.AIHUB_TIMEOUT_MS || "120000");
+
+/** Longer routes (chat turn / image gen) must not be shorter than backend work. */
+function timeoutMsForPath(logicalPath: string): number {
+    const base = DEFAULT_TIMEOUT_MS;
+    if (
+        logicalPath === "/chat/turn" ||
+        logicalPath.startsWith("/chat/turn?") ||
+        logicalPath.startsWith("/chat/file/")
+    ) {
+        const turnMs = Number(process.env.AIHUB_CHAT_TURN_TIMEOUT_MS || "");
+        if (Number.isFinite(turnMs) && turnMs > 0) {
+            return Math.max(base, turnMs);
+        }
+        // Align with aihub.config AIHUB_REQUEST_TIMEOUT_S default (120s).
+        return Math.max(base, 120_000);
+    }
+    return base;
+}
 const HOP_BY_HOP_HEADERS = new Set([
     "connection",
     "keep-alive",
@@ -202,7 +220,8 @@ async function forward(req: NextRequest, path: string[]) {
     }
 
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), DEFAULT_TIMEOUT_MS);
+    const timeoutMs = timeoutMsForPath(logicalPath);
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
         const response = await fetch(url, {

@@ -67,12 +67,20 @@ def _mirror_l2_fact_to_memory_v2(
     importance: float,
     confidence: float,
 ) -> None:
+    """Best-effort L2 → Memory V2 bridge (idempotent via ``source_ref=node_id``)."""
     try:
         from aihub.memory_core import get_memory_core
+        from aihub.memory_v2_repository import get_memory_item_by_source_ref
+
+        existing = get_memory_item_by_source_ref(user_id, node_id)
+        if existing is not None:
+            # Duplicate / re-ingest path: reinforce so V2 stays visible and fresh.
+            get_memory_core().v2_service.reinforce_memory(existing.id, user_id)
+            return
 
         mt = _l2_tags_to_memory_v2_type(tags)
         title = fact if len(fact) <= 120 else (fact[:117] + "…")
-        get_memory_core().v2_create_item(
+        created = get_memory_core().v2_create_item(
             user_id=user_id,
             memory_type=mt,  # type: ignore[arg-type]
             scope="user",
@@ -83,8 +91,17 @@ def _mirror_l2_fact_to_memory_v2(
             importance_score=float(importance),
             confidence_score=float(confidence),
         )
+        if created is None:
+            logger.warning(
+                "memory.l2.v2_mirror_empty user=%s node=%s", user_id, node_id
+            )
     except Exception:
-        logger.debug("memory.l2.v2_mirror_failed", exc_info=True)
+        logger.warning(
+            "memory.l2.v2_mirror_failed user=%s node=%s",
+            user_id,
+            node_id,
+            exc_info=True,
+        )
 
 
 def add_stm(user_id: str, role: str, content: str, meta: Dict[str, Any]) -> str:
@@ -267,12 +284,14 @@ def add_fact(user_id: str, fact: str, tags: List[str], meta: Dict[str, Any]) -> 
 
         verdict = check_consistency(user_id, fact)
         if verdict and verdict.classification == "duplicate":
-            # Skip duplicate — return existing node id
+            # Skip duplicate L2 write — still ensure V2 mirror for the matched node.
+            matched = verdict.matched_node_id or node_id
             logger.debug(
                 "Consistency: duplicate fact skipped (matched=%s)",
-                verdict.matched_node_id,
+                matched,
             )
-            return verdict.matched_node_id or node_id
+            _mirror_l2_fact_to_memory_v2(user_id, fact, tags, matched, imp, conf)
+            return matched
         if verdict and verdict.classification == "revision":
             # Revision: store new version, apply KG edges
             conf = max(conf, verdict.confidence)

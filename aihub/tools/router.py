@@ -75,8 +75,13 @@ def _normalize_tool_name(name: str) -> str:
         # fs
         "read_file": "fs.read_file",
         "write_file": "fs.write_file",
+        "fs_write": "fs.write_file",
+        "read_file": "fs.read_file",
+        "fs_read": "fs.read_file",
         # snapshot
         "create_snapshot": "snapshot.create",
+        "snapshot": "snapshot.create",
+        "system_snapshot": "snapshot.create",
         # web / research: canonical dotted names; bare names are common LLM mistakes
         "fetch_url": "web.fetch_url",
         "web_fetch": "web.fetch_url",

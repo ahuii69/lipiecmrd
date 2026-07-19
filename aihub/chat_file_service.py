@@ -221,6 +221,40 @@ def fetch_recent_session_attachment_ids(
     return ids
 
 
+def get_upload_for_user(
+    *,
+    file_id: str,
+    user_id: str,
+) -> dict[str, Any] | None:
+    """Load one upload by id scoped to user (for GET /chat/file/{id})."""
+    fid = (file_id or "").strip()
+    uid = (user_id or "").strip() or "default"
+    if not fid:
+        return None
+    with _DB_LOCK, _conn() as con:
+        row = con.execute(
+            """
+            SELECT file_id, user_id, session_id, original_filename, stored_path,
+                   content_type, size_bytes, extract_status
+            FROM chat_uploaded_files
+            WHERE file_id = ? AND user_id = ?
+            """,
+            (fid, uid),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "file_id": row["file_id"],
+        "user_id": row["user_id"],
+        "session_id": row["session_id"],
+        "original_filename": row["original_filename"],
+        "stored_path": row["stored_path"] or "",
+        "content_type": row["content_type"] or "application/octet-stream",
+        "size_bytes": int(row["size_bytes"] or 0),
+        "extract_status": row["extract_status"],
+    }
+
+
 def fetch_files_for_ids(
     *,
     user_id: str,

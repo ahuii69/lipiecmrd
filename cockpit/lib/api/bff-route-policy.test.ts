@@ -29,6 +29,13 @@ describe("bff route policy", () => {
         expect(classifyBffRoute("GET", "/cockpit/schema-health")).toBe("admin");
     });
 
+    it("classifies chat capability execute and file as user-scoped", () => {
+        expect(classifyBffRoute("POST", "/chat/capabilities/execute")).toBe(
+            "user",
+        );
+        expect(classifyBffRoute("GET", "/chat/file/abc123")).toBe("user");
+    });
+
     it("allows bootstrap register and registration-status anonymously", () => {
         expect(classifyBffRoute("POST", "/auth/register")).toBe("public");
         expect(classifyBffRoute("GET", "/auth/registration-status")).toBe("public");

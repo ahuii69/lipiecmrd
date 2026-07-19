@@ -68,6 +68,10 @@ class PipelineMixin:
             g['__result__'] = g['det']
             return
         g['ctx'] = self._build_context(g['turn'], correction_turn_trace=g['correction_turn_trace'])
+        g['mem_ctx'] = g['ctx'].memory_context if isinstance(g['ctx'].memory_context, dict) else {}
+        # Canonical light-path flags from PromptContext (written + read — not dead markers).
+        g['casual_light_lightweight'] = bool(g['mem_ctx'].get('casual_light_lightweight'))
+        g['meta_ask_lightweight'] = bool(g['mem_ctx'].get('meta_ask_lightweight'))
         g['mem_fact'] = try_memory_fact_read_turn(g['turn'], g['ctx'].memory_context, started_monotonic=g['started'])
         if g['mem_fact'] is not None:
             try:
@@ -101,10 +105,20 @@ class PipelineMixin:
                 and not meta_ask_refers_to_prior_conversation(g['turn'].message or '')
             )
             g['casual_smalltalk'] = is_casual_smalltalk(g['turn'].message or '')
+            # Prefer flags already computed in memory_context (single source of truth).
+            if g.get('casual_light_lightweight'):
+                g['casual_smalltalk'] = True
+            if g.get('meta_ask_lightweight'):
+                g['assistant_meta_ask'] = True
         except Exception:
             g['assistant_meta_ask'] = False
             g['assistant_meta_ask_pure'] = False
             g['casual_smalltalk'] = False
+            # Still honor context flags if classifiers failed after _build_context.
+            if g.get('casual_light_lightweight'):
+                g['casual_smalltalk'] = True
+            if g.get('meta_ask_lightweight'):
+                g['assistant_meta_ask'] = True
         if g.get('assistant_meta_ask'):
             # Cap completion budget for identity/meta asks.
             cur = self._turn_max_completion_tokens
@@ -165,6 +179,11 @@ class PipelineMixin:
             except Exception as bridge_error:
                 g['bridge_error'] = bridge_error
                 logger.warning(f'Failed to load V2 bridges: {bridge_error}')
+                g.setdefault('subsystem_degradations', []).append({
+                    'subsystem': 'v2_bridges',
+                    'error': str(bridge_error)[:500],
+                    'degraded': True,
+                })
             try:
                 if g['memory_v2_runtime_ctx'] is not None or g['psyche_v2_behavior_ctx'] is not None:
                     from aihub.psyche_v2_repository import ensure_psyche_profile
@@ -174,8 +193,19 @@ class PipelineMixin:
             except Exception as consistency_error:
                 g['consistency_error'] = consistency_error
                 logger.debug('Self-consistency pass skipped: %s', consistency_error, exc_info=True)
+                g.setdefault('subsystem_degradations', []).append({
+                    'subsystem': 'self_consistency',
+                    'error': str(consistency_error)[:500],
+                    'degraded': True,
+                })
         g['mem_truth'] = memory_truth_for_prompt(g['ctx'].memory_context)
-        g['_light_memory_skip'] = bool(g.get('assistant_meta_ask') or g.get('casual_smalltalk'))
+        g['_light_memory_skip'] = bool(
+            g.get('assistant_meta_ask')
+            or g.get('casual_smalltalk')
+            or g.get('casual_light_lightweight')
+            or g.get('meta_ask_lightweight')
+            or bool(g['mem_ctx'].get('memory_lookup_skipped'))
+        )
         g['memory_lookup_flag'] = bool(g['mem_truth']['memory_retrieval_has_rows']) and not g['_light_memory_skip']
         g['memory_substantive_flag'] = bool(g['mem_truth']['memory_substantive_in_prompt']) and not g['_light_memory_skip']
         if g.get('_light_memory_skip'):
@@ -273,7 +303,13 @@ class PipelineMixin:
         g['decision_core'] = self._pre_exec_decision_core(turn=g['turn'], ctx=g['ctx'], psyche_snapshot=g['psyche_snapshot'], memory_v2_runtime_ctx=g['memory_v2_runtime_ctx'], psyche_v2_behavior_ctx=g['psyche_v2_behavior_ctx'])
         # Prompt budget profile — before tools/prompt assembly.
         try:
-            from aihub.turn.prompt_budget import select_prompt_budget
+            from aihub.turn.prompt_budget import refine_prompt_budget_dynamic, select_prompt_budget
+            from aihub.turn.turn_signals import compute_turn_signals
+            from aihub.turn.adaptive_runtime import (
+                plan_adaptive_runtime,
+                truncate_memory_pack_in_context,
+            )
+
             g['prompt_budget'] = select_prompt_budget(
                 user_text=g['turn'].message or '',
                 selected_strategy=str(g['decision_core'].get('selected_strategy') or 'instant'),
@@ -281,13 +317,72 @@ class PipelineMixin:
                 history=list(g['turn'].history or []),
                 mode=str(getattr(g['turn'], 'mode', None) or 'chat'),
             )
-            g['decision_core']['budget_profile'] = g['prompt_budget'].profile
-            g['decision_core']['turn_value_class'] = g['prompt_budget'].turn_value_class
-            g['decision_core']['writeback_policy'] = g['prompt_budget'].writeback_policy
+            # Dynamic per-turn layer plan (ROI / confidence / latency).
+            _sys = getattr(g.get('ctx'), 'system_context', None) if g.get('ctx') else None
+            _pack = _sys.get('memory_context_pack') if isinstance(_sys, dict) else {}
+            _pack_n = len((_pack or {}).get('selected_ids') or []) if isinstance(_pack, dict) else 0
+            _mem_hits = 0
+            if isinstance(getattr(g.get('ctx'), 'memory_context', None), dict):
+                _mem_hits = int((g['ctx'].memory_context or {}).get('total') or 0)
+            g['turn_signals'] = compute_turn_signals(
+                user_text=g['turn'].message or '',
+                selected_strategy=str(g['decision_core'].get('selected_strategy') or 'instant'),
+                web_decision=str(g['decision_core'].get('web_decision') or 'off'),
+                strategy_confidence=float(g['decision_core'].get('strategy_confidence') or 0.5),
+                intent_confidence=float(g['decision_core'].get('intent_confidence') or 0.5),
+                ambiguity=float(g['decision_core'].get('cognitive_ambiguity') or 0.0),
+                memory_hits=_mem_hits,
+                memory_pack_items=_pack_n,
+                history_len=len(g['turn'].history or []),
+                budget_profile=g['prompt_budget'].profile,
+                reason_codes=list(g['decision_core'].get('reason_codes') or []),
+            )
+            # CSE prior adjusts signals before dynamic budget / adaptive plan.
+            try:
+                from aihub.turn.cse_feedback import apply_cse_prior_to_signals, load_cse_prior
+
+                _cse_prior = g['decision_core'].get('cse_prior') or load_cse_prior(g['turn'].user_id)
+                if _cse_prior:
+                    g['turn_signals'] = apply_cse_prior_to_signals(g['turn_signals'], _cse_prior)
+            except Exception:
+                logger.debug('cse prior→signals skipped', exc_info=True)
+            g['prompt_budget'] = refine_prompt_budget_dynamic(g['prompt_budget'], g['turn_signals'])
+            # Honor CSE behavioral overrides on budget/adaptive.
+            if g['decision_core'].get('cse_lean_budget'):
+                g['prompt_budget'].max_prompt_tokens = max(400, int(g['prompt_budget'].max_prompt_tokens * 0.8))
+                g['prompt_budget'].max_completion_tokens = max(64, int(g['prompt_budget'].max_completion_tokens * 0.75))
+                g['prompt_budget'].reason_codes = list(g['prompt_budget'].reason_codes or []) + ['CSE_LEAN_APPLIED']
+            if g['decision_core'].get('cse_boost_memory_pack'):
+                g['prompt_budget'].memory_pack_max_items = max(int(g['prompt_budget'].memory_pack_max_items or 0), 6)
+                g['prompt_budget'].memory_pack_max_chars = max(int(g['prompt_budget'].memory_pack_max_chars or 0), 1800)
+            if g['decision_core'].get('cse_force_critic'):
+                g['prompt_budget'].skip_critic = False
+                g['prompt_budget'].allow_critic_llm = True
+            if g['decision_core'].get('cse_force_reflection'):
+                g['prompt_budget'].skip_reflection = False
+            g['adaptive_runtime'] = plan_adaptive_runtime(
+                g['turn_signals'], g['prompt_budget'], decision_core=g['decision_core']
+            )
+            if g['decision_core'].get('cse_force_critic'):
+                g['adaptive_runtime'].skip_critic = False
+            if g['decision_core'].get('cse_force_reflection'):
+                g['adaptive_runtime'].skip_reflection = False
+            if g['decision_core'].get('cse_boost_memory_pack'):
+                g['adaptive_runtime'].memory_pack_max_items = max(g['adaptive_runtime'].memory_pack_max_items, 6)
+                g['adaptive_runtime'].memory_pack_max_chars = max(g['adaptive_runtime'].memory_pack_max_chars, 1800)
             if isinstance(g['ctx'].system_context, dict):
+                truncate_memory_pack_in_context(g['ctx'].system_context, g['adaptive_runtime'])
+                g['ctx'].system_context['turn_signals'] = g['turn_signals'].to_dict()
+                g['ctx'].system_context['adaptive_runtime'] = g['adaptive_runtime'].to_dict()
                 g['ctx'].system_context['prompt_budget_decision'] = g['prompt_budget']
                 g['ctx'].system_context['budget_profile'] = g['prompt_budget'].profile
                 g['ctx'].system_context['user_turn_text'] = g['turn'].message or ''
+            g['decision_core']['budget_profile'] = g['prompt_budget'].profile
+            g['decision_core']['turn_value_class'] = g['prompt_budget'].turn_value_class
+            g['decision_core']['writeback_policy'] = g['prompt_budget'].writeback_policy
+            g['decision_core']['turn_signals'] = g['turn_signals'].to_dict()
+            g['decision_core']['adaptive_runtime'] = g['adaptive_runtime'].to_dict()
+            g['decision_core']['budget_dynamic_refined'] = bool(g['prompt_budget'].dynamic_refined)
             # Cap completion tokens from budget profile.
             try:
                 cur = int(self._turn_max_completion_tokens) if self._turn_max_completion_tokens is not None else g['prompt_budget'].max_completion_tokens
@@ -295,15 +390,38 @@ class PipelineMixin:
                 cur = g['prompt_budget'].max_completion_tokens
             self._turn_max_completion_tokens = max(64, min(cur, int(g['prompt_budget'].max_completion_tokens)))
             if not g['prompt_budget'].allow_tools:
-                g['decision_core']['escalation_use_tools'] = False
-                g['tools'] = []
+                if g['decision_core'].get('capability_tools_required'):
+                    g['prompt_budget'].allow_tools = True
+                    g['decision_core']['budget_tools_forced_by_capability'] = True
+                else:
+                    g['decision_core']['escalation_use_tools'] = False
+                    g['tools'] = []
+            elif g.get('adaptive_runtime') and g['adaptive_runtime'].max_tool_iterations == 0:
+                # Soft adaptive hint only — do not strip an already-selected tool set
+                # unless budget profile forbids tools.
+                g['decision_core']['adaptive_tool_iters'] = 0
+            if g.get('adaptive_runtime') and g['adaptive_runtime'].skip_simulation:
+                g['decision_core']['adaptive_skip_simulation'] = True
         except Exception as budget_exc:
             g['prompt_budget'] = None
             g['budget_exc'] = budget_exc
             logger.debug('prompt budget select skipped: %s', budget_exc, exc_info=True)
-        g['tools'] = self._apply_strategy_to_tools(g['tools'], g['decision_core']['selected_strategy'], tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []))
-        if not g['decision_core'].get('escalation_use_tools') or (g.get('prompt_budget') and not g['prompt_budget'].allow_tools):
+        g['tools'] = self._apply_strategy_to_tools(
+            g['tools'],
+            g['decision_core']['selected_strategy'],
+            tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []),
+            forced_tool_prefixes=list(g['decision_core'].get('forced_tool_prefixes') or []),
+        )
+        if not g['decision_core'].get('escalation_use_tools') or (g.get('prompt_budget') and not g['prompt_budget'].allow_tools and not g['decision_core'].get('capability_tools_required')):
             g['tools'] = []
+        if g['decision_core'].get('capability_tools_required') and g['decision_core'].get('escalation_use_tools') and not g['tools']:
+            # Rebuild full set then re-apply with forced prefixes — never strand a capability turn.
+            g['tools'] = self._apply_strategy_to_tools(
+                self._build_provider_tools(g['ctx']),
+                g['decision_core']['selected_strategy'],
+                tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []),
+                forced_tool_prefixes=list(g['decision_core'].get('forced_tool_prefixes') or []),
+            )
         g['blocker_verdict'] = self._evaluate_blocker_verdict(g['decision_core'])
         if g['blocker_verdict'].hard:
             g['duration_ms'] = (time.monotonic() - g['started']) * 1000.0
@@ -332,7 +450,19 @@ class PipelineMixin:
                 g['decision_core']['reason_codes'].append(f"BLOCKER_{g['blocker_verdict'].resolution.upper()}_{g['old_strategy'].upper()}_TO_{g['new_strategy'].upper()}")
                 logger.info('Blocker %s: strategy %s→%s for user=%s (type=%s)', g['blocker_verdict'].resolution, g['old_strategy'], g['new_strategy'], g['turn'].user_id, g['blocker_verdict'].blocker_type)
                 self._finalize_escalation(g['decision_core'])
-                g['tools'] = self._apply_strategy_to_tools(self._build_provider_tools(g['ctx']), g['decision_core']['selected_strategy'], tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []))
+                try:
+                    from aihub.turn.capability_escalation import apply_capability_escalation
+                    apply_capability_escalation(g['decision_core'], g['turn'].message or '')
+                    if g['decision_core'].get('capability_tools_required'):
+                        g['decision_core']['escalation_use_tools'] = True
+                except Exception:
+                    logger.debug('capability re-escalation after blocker skipped', exc_info=True)
+                g['tools'] = self._apply_strategy_to_tools(
+                    self._build_provider_tools(g['ctx']),
+                    g['decision_core']['selected_strategy'],
+                    tool_order_hint=list(g['decision_core'].get('tool_order_hint') or []),
+                    forced_tool_prefixes=list(g['decision_core'].get('forced_tool_prefixes') or []),
+                )
                 if not g['decision_core'].get('escalation_use_tools'):
                     g['tools'] = []
 
@@ -345,6 +475,55 @@ class PipelineMixin:
         else:
             g['decision_core']['chat_handoff_executed'] = False
             g['decision_core']['chat_handoff_skip_reason'] = g['handoff_reason']
+            # Plan-only: still run the real PlannerEngine into the chat prompt so the
+            # user gets a structured plan with dependencies — without executive stub.
+            _adapt = g.get('adaptive_runtime')
+            _force_plan = g['handoff_reason'] == 'plan_only_chat_path' or (
+                str(g['decision_core'].get('selected_strategy') or '') == 'agentic'
+                and 'plan' in (g['turn'].message or '').lower()
+            )
+            if _force_plan and not (getattr(_adapt, 'skip_planner', False) and g['handoff_reason'] != 'plan_only_chat_path'):
+                try:
+                    from aihub.planner_engine import build_task_graph
+
+                    plan = build_task_graph(
+                        message=g['turn'].message or '',
+                        memory_context=g['ctx'].memory_context if g.get('ctx') else None,
+                        goal_context={'selected_goal': g['decision_core'].get('selected_goal')},
+                        user_id=g['turn'].user_id,
+                    )
+                    _max_nodes = int(getattr(_adapt, 'planner_max_nodes', 12) or 12) if _adapt else 12
+                    nodes = []
+                    for node in list(plan.graph.nodes.values())[: max(1, _max_nodes)]:
+                        nodes.append(
+                            {
+                                'id': getattr(node, 'id', None) or getattr(node, 'task_id', ''),
+                                'type': getattr(node, 'task_type', ''),
+                                'priority': getattr(node, 'priority', 0),
+                                'depends_on': list(getattr(node, 'depends_on', []) or []),
+                                'payload': str(getattr(node, 'payload', '') or '')[:160],
+                            }
+                        )
+                    g['decision_core']['planner_used'] = True
+                    g['decision_core']['planner_chat_plan'] = {
+                        'tasks_total': len(nodes),
+                        'tasks': nodes,
+                        'summary': plan.summary,
+                    }
+                    if isinstance(g['ctx'].system_context, dict):
+                        lines = ['PLANER (chat path — niczego nie wykonuj, tylko zaplanuj):']
+                        for i, n in enumerate(nodes, 1):
+                            deps = ','.join(str(d) for d in (n.get('depends_on') or [])[:4]) or '-'
+                            lines.append(
+                                f"{i}. [{n.get('type')}] prio={n.get('priority')} deps={deps} :: {n.get('payload')}"
+                            )
+                        g['ctx'].system_context['planner_brief'] = '\n'.join(lines)[:1800]
+                        hints = str(g['decision_core'].get('strategy_hints') or '')
+                        g['decision_core']['strategy_hints'] = (
+                            hints + '\n' + g['ctx'].system_context['planner_brief']
+                        ).strip()
+                except Exception:
+                    logger.debug('plan_only planner brief failed', exc_info=True)
         if g['should_handoff']:
             if stream_session_active():
                 await emit_status('tools', label_pl='Wykonuję kroki…')
@@ -352,6 +531,101 @@ class PipelineMixin:
             return
 
     async def _stage_web_setup(self, g):
+        # Capability closing: force image / memory.add_fact / web.ingest before LLM.
+        try:
+            from aihub.turn.forced_capability_tools import run_forced_capability_tools
+
+            g['forced_cap'] = await run_forced_capability_tools(
+                self=self,
+                turn=g['turn'],
+                ctx=g['ctx'],
+                decision_core=g['decision_core'],
+                tool_calls=g['tool_calls'],
+                tool_results=g['tool_results'],
+                errors=g['errors'],
+            )
+            g['decision_core']['forced_capability_tools_ran'] = list(g['forced_cap'].get('ran') or [])
+            if g['forced_cap'].get('short_circuit_text'):
+                g['duration_ms'] = (time.monotonic() - g['started']) * 1000.0
+                g['grounding'] = g['forced_cap'].get('short_circuit_reason') or 'forced_capability'
+                g['tool_name_sc'] = str((g['forced_cap'].get('ran') or [{}])[0].get('tool') or 'forced_tool')
+                g['trace'] = {
+                    'provider_calls': 0,
+                    'tool_iterations': 0,
+                    'tool_calls_requested': len(g['tool_calls']),
+                    'tool_calls_executed': len(g['tool_results']),
+                    'tool_calls_successful': len([r for r in g['tool_results'] if r.ok]),
+                    'tool_failures': len([r for r in g['tool_results'] if not r.ok]),
+                    'used_tools': len(g['tool_results']) > 0,
+                    'used_fallback': False,
+                    'response_grounding_mode': g['grounding'],
+                    'duration_ms': g['duration_ms'],
+                    'provider': 'capability_forced_tool',
+                    'model': g['tool_name_sc'],
+                    'selected_strategy': g['decision_core'].get('selected_strategy'),
+                    **self._decision_core_trace_escalation(g['decision_core']),
+                    'reason_codes': list(g['decision_core'].get('reason_codes') or []),
+                    'forced_capability_tools_ran': list(g['forced_cap'].get('ran') or []),
+                    'capability_short_circuit': True,
+                    'experience_write_back_attempted': False,
+                    'experience_write_back_succeeded': False,
+                }
+                merge_canonical_decision_trace(
+                    g['trace'],
+                    selected_route='forced_capability_tool',
+                    route_reason=g['grounding'],
+                    decision_intent='act',
+                    deterministic_hit=False,
+                    vault_used=False,
+                    memory_retrieval_used=bool(g.get('memory_lookup_flag')),
+                    web_required=str(g['decision_core'].get('web_decision') or 'off') == 'required',
+                    planner_used=False,
+                    blocker_hard=False,
+                )
+                try:
+                    self._write_back_experience(
+                        turn=g['turn'],
+                        response_text=g['forced_cap']['short_circuit_text'],
+                        grounding_mode=g['grounding'],
+                        tool_calls=g['tool_calls'],
+                        tool_results=g['tool_results'],
+                        trace=g['trace'],
+                        errors=g['errors'],
+                        psyche_snapshot=g.get('psyche_snapshot') or {},
+                        decision_core=g['decision_core'],
+                    )
+                except Exception:
+                    logger.debug('forced capability experience writeback skipped', exc_info=True)
+                _cr_hook('append_event', append_event)(
+                    g['turn'].user_id,
+                    'chat.turn',
+                    {
+                        'ok': True,
+                        'provider': 'capability_forced_tool',
+                        'model': g['tool_name_sc'],
+                        'trace': g['trace'],
+                        'tool_calls': [c.model_dump() for c in g['tool_calls']],
+                        'tool_results': [r.model_dump() for r in g['tool_results']],
+                    },
+                )
+                _TRACE_CACHE[g['turn'].user_id].append(g['trace'])
+                g['__result__'] = ChatTurnResult(
+                    ok=True,
+                    response_text=g['forced_cap']['short_circuit_text'],
+                    model=g['tool_name_sc'],
+                    provider='capability_forced_tool',
+                    tool_calls=g['tool_calls'],
+                    tool_results=g['tool_results'],
+                    selected_mode=g['ctx'].mode,
+                    usage=ProviderUsage(prompt_tokens=0, completion_tokens=0, total_tokens=0),
+                    trace=g['trace'],
+                    errors=list(g['errors']),
+                )
+                return
+        except Exception:
+            logger.warning('forced capability tools failed', exc_info=True)
+            g['forced_cap'] = {'ran': [], 'short_circuit_text': None}
+
         g['web_prefetch'] = await self._run_controlled_web_prefetch(turn=g['turn'], ctx=g['ctx'], web_decision=g['decision_core'].get('web_decision', 'off'))
         if g['web_prefetch'].get('triggered'):
             g['call_obj'] = g['web_prefetch'].get('tool_call')
@@ -637,7 +911,7 @@ class PipelineMixin:
                     g['trace']['experience_write_back_succeeded'] = False
                 self._run_runtime_experience_feedback(g['turn'].user_id, g['trace'])
                 _cr_hook('append_event', append_event)(g['turn'].user_id, 'chat.turn', {'ok': False, 'provider': g['_fb_provider'], 'model': g['_fb_model'], 'errors': g['errors'], 'trace': g['trace']})
-                g['result'] = ChatTurnResult(ok=False, response_text=g['fallback_text'], model=g['_fb_model'], provider=g['_fb_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug={'context': g['ctx'].model_dump()} if g['turn'].include_debug else None, attachments_summary=g['attachments_summary'])
+                g['result'] = ChatTurnResult(ok=False, response_text=g['fallback_text'], model=g['_fb_model'], provider=g['_fb_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug=self._debug_context_payload(g['turn'], g['ctx']), attachments_summary=g['attachments_summary'])
                 _TRACE_CACHE[g['turn'].user_id].append(g['result'].trace)
                 g['__result__'] = g['result']
                 return
@@ -687,7 +961,16 @@ class PipelineMixin:
     async def _stage_shape_deliberation(self, g):
         g['deliberation_metadata']: dict[str, Any] = {}
         g['_light_turn'] = bool(g.get('prompt_budget') and g['prompt_budget'].profile in ('meta_light', 'casual_light'))
-        g['_skip_heavy_shape'] = bool(g.get('prompt_budget') and (not g['prompt_budget'].allow_response_variants) and (not g['prompt_budget'].allow_critic_llm))
+        g['_adapt'] = g.get('adaptive_runtime')
+        g['_skip_heavy_shape'] = bool(
+            (g.get('prompt_budget') and (not g['prompt_budget'].allow_response_variants) and (not g['prompt_budget'].allow_critic_llm))
+            or (g.get('_adapt') and g['_adapt'].skip_response_variants and g['_adapt'].skip_critic and g['_light_turn'])
+        )
+        # Adaptive: skip variants even on heavier profiles when plan says so.
+        if g.get('_adapt') and g['_adapt'].skip_response_variants and not g.get('_light_turn'):
+            g['_force_skip_variants'] = True
+        else:
+            g['_force_skip_variants'] = False
         if stream_session_active():
             await emit_status('finalizing', label_pl='Kończę odpowiedź…')
         if g.get('_skip_heavy_shape'):
@@ -718,11 +1001,19 @@ class PipelineMixin:
             g['post_reflection'] = {'reflection_ran': False, 'reflection_summary': '', 'strategy_fit': 'na', 'handoff_hindsight': 'na', 'blocker_hindsight': 'na', 'confidence_hindsight': 0.0, 'risk_hindsight': 0.0, 'deliberation_hindsight': {}}
             return
         try:
-            g['original_msgs'] = [{'role': g['m'].role, 'content': g['m'].content, 'name': g['m'].name, 'tool_call_id': g['m'].tool_call_id} for g['m'] in g['messages']]
-            g['deliberated_text'], g['deliberation_metadata'] = await _cr_hook('ResponseVariantsEngine', ResponseVariantsEngine).run_deliberation(decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], original_response=g['response_text'], original_messages=g['original_msgs'], provider_call_fn=self._provider_call, deliberation_history=g['decision_core'].get('deliberation_history'))
-            if g['deliberation_metadata'].get('response_variants_triggered'):
-                g['response_text'] = g['deliberated_text']
-                logger.info('Deliberation replaced response_text: winner=%s confidence=%.2f', g['deliberation_metadata'].get('response_variants_winner_type', '?'), g['deliberation_metadata'].get('response_variants_confidence', 0.0))
+            if g.get('_force_skip_variants') or (g.get('prompt_budget') and not g['prompt_budget'].allow_response_variants):
+                g['deliberation_metadata'] = {
+                    'response_variants_triggered': False,
+                    'response_variants_count': 0,
+                    'response_variants_reason_codes': ['SKIPPED_ADAPTIVE_RUNTIME'],
+                    'response_variants_error': False,
+                }
+            else:
+                g['original_msgs'] = [{'role': g['m'].role, 'content': g['m'].content, 'name': g['m'].name, 'tool_call_id': g['m'].tool_call_id} for g['m'] in g['messages']]
+                g['deliberated_text'], g['deliberation_metadata'] = await _cr_hook('ResponseVariantsEngine', ResponseVariantsEngine).run_deliberation(decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], original_response=g['response_text'], original_messages=g['original_msgs'], provider_call_fn=self._provider_call, deliberation_history=g['decision_core'].get('deliberation_history'))
+                if g['deliberation_metadata'].get('response_variants_triggered'):
+                    g['response_text'] = g['deliberated_text']
+                    logger.info('Deliberation replaced response_text: winner=%s confidence=%.2f', g['deliberation_metadata'].get('response_variants_winner_type', '?'), g['deliberation_metadata'].get('response_variants_confidence', 0.0))
         except Exception:
             logger.warning('Deliberation engine failed — using original response', exc_info=True)
             g['deliberation_metadata'] = {'response_variants_triggered': False, 'response_variants_count': 0, 'response_variants_reason_codes': [], 'response_variants_error': True}
@@ -732,10 +1023,26 @@ class PipelineMixin:
             if g['_dk'] in g['deliberation_metadata']:
                 g['decision_core'][g['_dk']] = g['deliberation_metadata'][g['_dk']]
         g['decision_core']['deliberation_outcome_quality'] = self._compute_deliberation_outcome_quality(g['deliberation_metadata'])
-        g['post_reflection'] = self._post_exec_reflection(user_id=g['turn'].user_id, message=g['turn'].message, response_text=g['response_text'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], handoff_happened=False)
+        if g.get('_adapt') and g['_adapt'].skip_reflection:
+            g['post_reflection'] = {
+                'reflection_ran': False,
+                'reflection_summary': '',
+                'strategy_fit': 'na',
+                'handoff_hindsight': 'na',
+                'blocker_hindsight': 'na',
+                'confidence_hindsight': 0.0,
+                'risk_hindsight': 0.0,
+                'deliberation_hindsight': {},
+                'adaptive_skipped': True,
+            }
+        else:
+            g['post_reflection'] = self._post_exec_reflection(user_id=g['turn'].user_id, message=g['turn'].message, response_text=g['response_text'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], handoff_happened=False)
         # Response critic V2 — at most one revision, no re-run of side-effect tools
         g['response_revision_happened'] = False
-        if not getattr(g['turn'], 'skip_response_critic', False):
+        _skip_critic = bool(getattr(g['turn'], 'skip_response_critic', False)) or bool(
+            g.get('_adapt') and g['_adapt'].skip_critic
+        ) or bool(g.get('prompt_budget') and getattr(g['prompt_budget'], 'skip_critic', False))
+        if not _skip_critic:
             try:
                 from aihub.turn.pragmatics import PragmaticAnalysis
                 from aihub.turn.cognitive_integration import critique_response_v2, CognitiveInfluencePack
@@ -799,7 +1106,7 @@ class PipelineMixin:
             if g['_dk'] in g['deliberation_metadata']:
                 g['decision_core'][g['_dk']] = g['deliberation_metadata'][g['_dk']]
         g['decision_core']['deliberation_outcome_quality'] = self._compute_deliberation_outcome_quality(g['deliberation_metadata'])
-        g['post_reflection'] = self._post_exec_reflection(user_id=g['turn'].user_id, message=g['turn'].message, response_text=g['response_text'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], decision_core=g['decision_core'], blocker_verdict=g['blocker_verdict'], handoff_happened=False)
+        # Keep adaptive reflection skip — do not re-run post_exec_reflection here.
 
     async def _stage_build_success_trace(self, g):
         g['duration_ms'] = (time.monotonic() - g['started']) * 1000.0
@@ -817,8 +1124,21 @@ class PipelineMixin:
         if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded:
             g['final_behavior_profile'] = {'mode': g['psyche_v2_style_mode'], 'directness': g['psyche_v2_behavior_ctx'].directness_bias, 'verbosity': g['psyche_v2_behavior_ctx'].verbosity_bias, 'caution': g['psyche_v2_behavior_ctx'].caution_bias, 'pressure': g['psyche_v2_behavior_ctx'].pressure, 'trust': g['psyche_v2_behavior_ctx'].trust, 'friction': g['psyche_v2_behavior_ctx'].friction, 'warmth': g['psyche_v2_behavior_ctx'].warmth, 'autonomy': g['psyche_v2_behavior_ctx'].autonomy_bias, 'structuredness': g['psyche_v2_behavior_ctx'].structuredness_bias, 'tool_bias': g['psyche_v2_behavior_ctx'].tool_bias, 'web_bias': g['psyche_v2_behavior_ctx'].web_bias, 'reassurance': g['psyche_v2_behavior_ctx'].reassurance_bias}
         g['trace'] = {'provider_calls': g['provider_call_count'], 'tool_iterations': (0 if (g.get('prompt_budget') is not None and not g['prompt_budget'].allow_tools) else min(int(g.get('iteration') or 0), max(1, int(CHAT_MAX_TOOL_ITERATIONS)))), 'tool_calls_requested': len(g['tool_calls']), 'tool_calls_executed': len(g['tool_results']), 'tool_calls_successful': len([g['r'] for g['r'] in g['tool_results'] if g['r'].ok]), 'tool_failures': len([g['r'] for g['r'] in g['tool_results'] if not g['r'].ok]), 'used_tools': len(g['tool_results']) > 0, 'used_fallback': False, **self._correction_trace_fields(g['ctx']), 'anti_hallucination_clamp_applied': bool(g['anti_hallucination_trace'].get('applied')), 'anti_hallucination_clamp_reason': g['anti_hallucination_trace'].get('reason'), 'response_grounding_mode': g['grounding_mode'], 'chat_thread_first_turn': g['first_turn_in_thread'], 'chat_history_message_count': len(g['turn'].history or []), **build_history_trace(g['turn']), 'duration_ms': g['duration_ms'], 'provider': g['final_provider'], 'model': g['final_model'], 'usage_reporting_mode': g['usage_summary'].reporting_mode, 'usage_total_tokens': g['usage_summary'].total_tokens, 'selected_strategy': g['decision_core']['selected_strategy'], **self._decision_core_trace_escalation(g['decision_core']), 'reason_codes': g['decision_core']['reason_codes'], 'strategy_confidence': g['decision_core']['strategy_confidence'], 'degraded': g['decision_core']['strategy_degraded'], 'memory_lookup_happened': g['memory_lookup_flag'], 'memory_results_count': memory_results_count_for_trace(g['ctx'].memory_context), 'psyche_snapshot_happened': False, 'research_was_required': g['research_required'], 'agentic_executed': False, 'tool_calls_count': len(g['tool_calls']), 'experience_write_back_attempted': False, 'experience_write_back_succeeded': False, 'controlled_web_decision': g['decision_core'].get('web_decision', 'off'), 'controlled_web_decision_reason': g['decision_core'].get('web_decision_reason', 'not_evaluated'), 'controlled_web_triggered': bool(g['controlled_web'].get('triggered')), 'controlled_web_reason': g['controlled_web'].get('reason'), 'controlled_web_tool': g['controlled_web'].get('tool_name'), 'controlled_web_ok': g['controlled_web'].get('ok'), 'controlled_web_has_results': g['controlled_web'].get('has_results'), 'controlled_web_provider_info': g['controlled_web'].get('provider_info'), 'controlled_web_query': g['controlled_web'].get('query'), 'controlled_web_source_count': g['controlled_web'].get('source_count', 0), 'controlled_web_freshness_needed': g['controlled_web'].get('freshness_needed', False), **self._web_stage_trace_fields(g['decision_core'], g['controlled_web'], explicit_fail_applied=False), 'consistency_check_ran': g['decision_core']['consistency_check_ran'], 'consistency_classification': g['decision_core']['consistency_classification'], 'contradictions_found': g['decision_core']['contradictions_found'], 'policy_hints_loaded': g['decision_core']['policy_hints_loaded'], 'policy_profile_name': g['decision_core']['policy_profile_name'], 'simulation_ran': g['decision_core']['simulation_ran'], 'simulation_best_action': g['decision_core']['simulation_best_action'], 'simulation_variants_count': g['decision_core']['simulation_variants_count'], 'simulation_risk_summary': g['decision_core']['simulation_risk_summary'], 'experience_lookup_happened': g['decision_core'].get('experience_lookup_happened', False), 'experience_matches_count': g['decision_core'].get('experience_matches_count', 0), 'experience_influenced_strategy': g['decision_core'].get('experience_influenced_strategy', False), 'experience_confidence_adjustment': g['decision_core'].get('experience_confidence_adjustment'), 'experience_handoff_bias': g['decision_core'].get('experience_handoff_bias'), 'experience_blocker_reason': g['decision_core'].get('experience_blocker_reason'), 'experience_signal_summary': g['decision_core'].get('experience_signal_summary'), 'reflection_ran': g['post_reflection']['reflection_ran'], 'reflection_summary': g['post_reflection']['reflection_summary'], 'selected_goal': g['decision_core'].get('selected_goal'), 'policy_feedback_loaded': bool(g['decision_core'].get('policy_feedback_loaded')), 'policy_feedback_applied': bool(g['decision_core'].get('policy_feedback_applied')), 'policy_feedback_summary': g['decision_core'].get('policy_feedback_summary', ''), 'policy_confidence_delta': g['decision_core'].get('policy_confidence_delta', 0.0), 'policy_handoff_bias': g['decision_core'].get('policy_handoff_bias', 0.0), 'policy_blocker_sensitivity': g['decision_core'].get('policy_blocker_sensitivity', 0.0), 'policy_simulation_risk_cal': g['decision_core'].get('policy_simulation_risk_cal', 0.0), 'policy_strategy_adjustments': g['decision_core'].get('policy_strategy_adjustments', {}), 'reflection_strategy_fit': g['post_reflection'].get('strategy_fit', 'neutral'), 'reflection_handoff_hindsight': g['post_reflection'].get('handoff_hindsight', 'na'), 'reflection_blocker_hindsight': g['post_reflection'].get('blocker_hindsight', 'na'), 'memory_v2_loaded': g['memory_v2_snapshot'].get('loaded', False), 'memory_v2_match_count': g['memory_v2_snapshot'].get('match_count', 0), 'memory_v2_reinforced_count': g['memory_v2_snapshot'].get('reinforced_count', 0), 'memory_v2_suppressed_count': g['memory_v2_snapshot'].get('suppressed_count', 0), 'memory_v2_contradictions_count': g['memory_v2_snapshot'].get('contradictions_count', 0), 'memory_v2_actionable_contradictions_count': g['memory_v2_snapshot'].get('actionable_contradictions_count', 0), 'memory_v2_transient_contradiction_count': g['memory_v2_snapshot'].get('transient_contradiction_count', 0), 'memory_v2_stability_tier_counts': dict(g['memory_v2_runtime_ctx'].stability_tier_counts) if g['memory_v2_runtime_ctx'] and g['memory_v2_runtime_ctx'].loaded else {}, 'memory_v2_procedure_confidence_raw': g['memory_v2_runtime_ctx'].confidence_modifier_raw if g['memory_v2_runtime_ctx'] and g['memory_v2_runtime_ctx'].loaded else 0.0, 'self_consistency_decision': g['psyche_v2_behavior_ctx'].consistency_decision if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded else 'allow', 'self_consistency_reasons': list(g['psyche_v2_behavior_ctx'].consistency_reasons) if g['psyche_v2_behavior_ctx'] and g['psyche_v2_behavior_ctx'].loaded else [], 'memory_v2_procedures_count': g['memory_v2_snapshot'].get('procedures_count', 0), 'memory_v2_top_reason_codes': g['memory_v2_snapshot'].get('top_reason_codes', []), 'memory_v2_retrieval_explanation': g['memory_v2_snapshot'].get('retrieval_strategy', ''), 'psyche_v2_loaded': g['psyche_v2_snapshot'].get('loaded', False), 'psyche_v2_mode': g['psyche_v2_snapshot'].get('mode', 'neutral'), 'psyche_v2_relation_trust': g['psyche_v2_snapshot'].get('relation_trust', 0.5), 'psyche_v2_relation_friction': g['psyche_v2_snapshot'].get('relation_friction', 0.0), 'psyche_v2_habit_biases': g['psyche_v2_snapshot'].get('habit_biases', []), 'psyche_v2_behavior_style': g['psyche_v2_snapshot'].get('behavior_policy', {}).get('directness', 0.5), 'identity_bridge_loaded': g['identity_bridge_snapshot'] is not None, 'memory_influenced_strategy': g['decision_core'].get('memory_influenced_strategy_chat', False), 'psyche_influenced_strategy': g['decision_core'].get('psyche_influenced_strategy_chat', False), 'memory_v2_context_injected': g['memory_v2_context_injected'], 'memory_v2_context_item_count': g['memory_v2_context_item_count'], 'memory_v2_procedure_bias_applied': g['memory_v2_procedure_bias_applied'], 'memory_v2_contradiction_guard_applied': g['memory_v2_contradiction_guard_applied'], 'psyche_v2_behavior_applied': g['psyche_v2_behavior_applied'], 'psyche_v2_style_mode': g['psyche_v2_style_mode'], 'psyche_v2_pressure_applied': g['psyche_v2_pressure_applied'], 'psyche_v2_relation_tone_applied': g['psyche_v2_relation_tone_applied'], 'final_behavior_profile': g['final_behavior_profile'], 'reflection_confidence_hindsight': g['post_reflection'].get('confidence_hindsight', 0.0), 'reflection_risk_hindsight': g['post_reflection'].get('risk_hindsight', 0.0), 'reflection_deliberation_hindsight': g['post_reflection'].get('deliberation_hindsight', {}), 'attached_files': g['attachment_meta'], 'attachments_summary': g['attachments_summary'], 'blocker_verdict': g['blocker_verdict'].model_dump(), 'response_variants_triggered': g['deliberation_metadata'].get('response_variants_triggered', False), 'response_variants_count': g['deliberation_metadata'].get('response_variants_count', 0), 'response_variants_reason_codes': g['deliberation_metadata'].get('response_variants_reason_codes', []), 'response_variants_winner': g['deliberation_metadata'].get('response_variants_winner'), 'response_variants_winner_type': g['deliberation_metadata'].get('response_variants_winner_type'), 'response_variants_synthesis_used': g['deliberation_metadata'].get('response_variants_synthesis_used', []), 'response_variants_dropped': g['deliberation_metadata'].get('response_variants_dropped', []), 'response_variants_confidence': g['deliberation_metadata'].get('response_variants_confidence'), 'response_variants_risk': g['deliberation_metadata'].get('response_variants_risk'), 'response_variants_summary': g['deliberation_metadata'].get('response_variants_summary'), 'response_variants_duration_ms': g['deliberation_metadata'].get('response_variants_duration_ms'), 'response_variants_scores': g['deliberation_metadata'].get('response_variants_scores', []), 'response_variants_error': g['deliberation_metadata'].get('response_variants_error', False)}
+        g['trace']['casual_light_lightweight'] = bool(g.get('casual_light_lightweight'))
+        g['trace']['meta_ask_lightweight'] = bool(g.get('meta_ask_lightweight'))
+        if g.get('subsystem_degradations'):
+            g['trace']['subsystem_degradations'] = list(g['subsystem_degradations'])
+            g['trace']['subsystem_degraded'] = True
+            # Honest observability in trace only — do not flip turn ok via errors[].
         if isinstance(g.get('_provider_trace'), dict):
             g['trace'].update(g['_provider_trace'])
+        # Plan-only chat path: surface real PlannerEngine usage in the turn trace.
+        if g['decision_core'].get('planner_used') or g['decision_core'].get('planner_chat_plan'):
+            g['trace']['planner_used'] = True
+            g['trace']['planner_executed'] = True
+            plan = g['decision_core'].get('planner_chat_plan') or {}
+            g['trace']['planner_tasks_count'] = int(plan.get('tasks_total') or 0)
+            g['trace']['planner_chat_path'] = True
         # Honest usage + budget + provider attempt semantics
         try:
             g['trace']['prompt_tokens'] = int(getattr(g['usage_summary'], 'prompt_tokens', 0) or 0)
@@ -833,6 +1153,75 @@ class PipelineMixin:
             g['trace']['budget_profile'] = g['prompt_budget'].profile
             g['trace']['turn_value_class'] = g['prompt_budget'].turn_value_class
             g['trace']['writeback_policy'] = g['prompt_budget'].writeback_policy
+            if getattr(g['prompt_budget'], 'dynamic_refined', False):
+                g['trace']['budget_dynamic_refined'] = True
+                g['trace']['budget_layers_included'] = list(g['prompt_budget'].layers_included or [])
+                g['trace']['budget_layers_skipped'] = list(g['prompt_budget'].layers_skipped or [])
+                g['trace']['latency_budget_ms'] = g['prompt_budget'].latency_budget_ms
+        if g.get('turn_signals') is not None:
+            g['trace']['turn_signals'] = g['turn_signals'].to_dict()
+        if g.get('adaptive_runtime') is not None:
+            g['trace']['adaptive_runtime'] = g['adaptive_runtime'].to_dict()
+            g['trace']['post_reflection_skipped'] = bool(g['adaptive_runtime'].skip_reflection)
+            g['trace']['critic_skipped_adaptive'] = bool(g['adaptive_runtime'].skip_critic)
+        # Continuous self-evaluation (cheap, every successful turn)
+        try:
+            from aihub.turn.continuous_self_eval import evaluate_continuous_self
+
+            g['continuous_self_eval'] = evaluate_continuous_self(
+                message=g['turn'].message or '',
+                response_text=g.get('response_text') or '',
+                trace=g['trace'],
+                decision_core=g['decision_core'],
+                ok=True,
+            )
+            g['trace']['continuous_self_eval'] = g['continuous_self_eval'].to_dict()
+            g['trace']['hallucination_risk'] = g['continuous_self_eval'].hallucination_risk
+            g['trace']['retrieval_usefulness'] = g['continuous_self_eval'].retrieval_usefulness
+            g['trace']['memory_usefulness'] = g['continuous_self_eval'].memory_usefulness
+            g['trace']['planner_usefulness'] = g['continuous_self_eval'].planner_usefulness
+            g['trace']['reflection_usefulness'] = g['continuous_self_eval'].reflection_usefulness
+            g['trace']['tool_usefulness'] = g['continuous_self_eval'].tool_usefulness
+            g['trace']['token_efficiency'] = g['continuous_self_eval'].token_efficiency
+            g['trace']['confidence_calibration'] = g['continuous_self_eval'].confidence_calibration
+            g['trace']['answer_completeness'] = g['continuous_self_eval'].answer_completeness
+            g['trace']['self_eval_overall_quality'] = g['continuous_self_eval'].overall_quality
+        except Exception as cse_exc:
+            logger.debug('continuous self eval skipped: %s', cse_exc, exc_info=True)
+        # Cost ledger — real USD estimate persisted for cockpit + alerts.
+        try:
+            from aihub.cost_ledger import record_turn_cost, user_day_summary
+
+            g['_cost'] = record_turn_cost(
+                user_id=g['turn'].user_id,
+                session_id=g['turn'].session_id or '',
+                turn_id=str(g.get('turn_id_for_wb') or ''),
+                provider=str(g['trace'].get('provider') or g.get('final_provider') or ''),
+                model=str(g['trace'].get('model') or g.get('final_model') or ''),
+                prompt_tokens=int(g['trace'].get('prompt_tokens') or getattr(g.get('usage_summary'), 'prompt_tokens', 0) or 0),
+                completion_tokens=int(g['trace'].get('completion_tokens') or getattr(g.get('usage_summary'), 'completion_tokens', 0) or 0),
+                total_tokens=int(g['trace'].get('total_tokens') or g['trace'].get('usage_total_tokens') or 0),
+                meta={
+                    'budget_profile': g['trace'].get('budget_profile'),
+                    'selected_strategy': g['trace'].get('selected_strategy'),
+                },
+            )
+            g['trace']['cost_usd'] = g['_cost']['cost_usd']
+            g['trace']['cost_ledger_id'] = g['_cost']['id']
+            g['_day_cost'] = user_day_summary(g['turn'].user_id)
+            g['trace']['cost_day_usd'] = g['_day_cost']['cost_usd']
+            g['trace']['cost_day_alert'] = bool(g['_day_cost'].get('alert'))
+        except Exception as cost_exc:
+            logger.debug('cost ledger skipped: %s', cost_exc, exc_info=True)
+        # Chat path coherence with executive fields (frontend expects these).
+        if g['decision_core'].get('planner_used') or g['decision_core'].get('planner_chat_plan'):
+            g['trace']['planner_executed'] = True
+            g['trace']['effective_runtime_path'] = g['trace'].get('effective_runtime_path') or 'chat_planner'
+        g['trace']['agent_loop_integrated'] = True
+        g['trace']['simulation_integrated'] = bool(g['decision_core'].get('simulation_ran'))
+        g['trace']['variants_module_active'] = bool(
+            (g.get('deliberation_metadata') or {}).get('response_variants_triggered')
+        ) or bool(g.get('prompt_budget') and getattr(g['prompt_budget'], 'allow_response_variants', False))
         # Clarify provider call accounting (keep provider_calls for compat = generation attempts in chat loop)
         _attempts = g['trace'].get('provider_attempts') or []
         if isinstance(_attempts, list) and _attempts:
@@ -960,7 +1349,7 @@ class PipelineMixin:
                 except Exception:
                     logger.debug('feedback user-model update skipped', exc_info=True)
             _cr_hook('append_event', append_event)(g['turn'].user_id, 'chat.turn', {'ok': len(g['errors']) == 0, 'provider': g['final_provider'], 'model': g['final_model'], 'trace': g['trace'], 'tool_calls': [], 'tool_results': []})
-            g['result'] = ChatTurnResult(ok=len(g['errors']) == 0, response_text=g['response_text'], model=g['final_model'], provider=g['final_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug={'context': g['ctx'].model_dump()} if g['turn'].include_debug else None, attachments_summary=g.get('attachments_summary'))
+            g['result'] = ChatTurnResult(ok=len(g['errors']) == 0, response_text=g['response_text'], model=g['final_model'], provider=g['final_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug=self._debug_context_payload(g['turn'], g['ctx']), attachments_summary=g.get('attachments_summary'))
             _TRACE_CACHE[g['turn'].user_id].append(g['result'].trace)
             g['__result__'] = g['result']
             return
@@ -1210,7 +1599,7 @@ class PipelineMixin:
             g['trace']['experience_write_back_succeeded'] = False
         self._run_runtime_experience_feedback(g['turn'].user_id, g['trace'])
         _cr_hook('append_event', append_event)(g['turn'].user_id, 'chat.turn', {'ok': len(g['errors']) == 0, 'provider': g['final_provider'], 'model': g['final_model'], 'trace': g['trace'], 'tool_calls': [g['tc'].model_dump() for g['tc'] in g['tool_calls']], 'tool_results': [g['tr'].model_dump() for g['tr'] in g['tool_results']]})
-        g['result'] = ChatTurnResult(ok=len(g['errors']) == 0, response_text=g['response_text'], model=g['final_model'], provider=g['final_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug={'context': g['ctx'].model_dump()} if g['turn'].include_debug else None, attachments_summary=g['attachments_summary'])
+        g['result'] = ChatTurnResult(ok=len(g['errors']) == 0, response_text=g['response_text'], model=g['final_model'], provider=g['final_provider'], tool_calls=g['tool_calls'], tool_results=g['tool_results'], selected_mode=g['ctx'].mode, usage=self._sum_usage(g['provider_usages']), trace=g['trace'], errors=g['errors'], debug=self._debug_context_payload(g['turn'], g['ctx']), attachments_summary=g['attachments_summary'])
         _TRACE_CACHE[g['turn'].user_id].append(g['result'].trace)
         g['__result__'] = g['result']
         return

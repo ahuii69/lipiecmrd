@@ -101,14 +101,39 @@ def test_ingest_fact_mirrors_into_memory_v2(isolated_db):
     uid = "fact_v2_mirror_user"
     fact = "mój ulubiony framework to FastAPI"
     get_psyche_core().ensure_user(uid)
-    get_memory_core().ingest_fact(uid, fact, tags=["user", "preference"], meta={})
+    node_id = get_memory_core().ingest_fact(
+        uid, fact, tags=["user", "preference"], meta={}
+    )
 
     row = fetch_one(
-        "SELECT content, memory_type FROM memory_v2_items WHERE user_id=? AND content=?",
+        "SELECT content, memory_type, source_ref FROM memory_v2_items WHERE user_id=? AND content=?",
         (uid, fact),
     )
     assert row is not None
     assert row["memory_type"] == "preference"
+    assert row["source_ref"] == node_id
+
+
+def test_duplicate_fact_still_mirrors_memory_v2(isolated_db):
+    """Duplicate L2 skip must still ensure a V2 row for the matched node."""
+    from aihub.db import fetch_all
+    from aihub.memory_core import get_memory_core
+    from aihub.psyche_core import get_psyche_core
+
+    uid = "fact_v2_dup_mirror"
+    fact = "użytkownik pije tylko zieloną herbatę o poranku"
+    get_psyche_core().ensure_user(uid)
+    core = get_memory_core()
+    first = core.ingest_fact(uid, fact, tags=["preference"], meta={})
+    second = core.ingest_fact(uid, fact, tags=["preference"], meta={})
+    assert first == second
+
+    rows = fetch_all(
+        "SELECT id, source_ref, content FROM memory_v2_items WHERE user_id=? AND source_ref=?",
+        (uid, first),
+    )
+    assert len(rows) >= 1
+    assert rows[0]["content"] == fact
 
 
 def test_retrieve_unified_extends_v1_with_v2_fields(isolated_db, monkeypatch):

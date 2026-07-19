@@ -486,6 +486,34 @@ def test_build_memory_brief_includes_stm_when_graph_buckets_empty():
     )
     assert "STM (ostatnia sesja" in brief
     assert "STM_UNIQUE_MARKER_X9" in brief
+    assert "Graph (knowledge) top:" in brief
+
+
+def test_build_memory_brief_includes_graph_hit_content():
+    from aihub.chat_runtime import ChatRuntime
+
+    rt = ChatRuntime()
+    brief = rt._build_memory_brief(
+        {
+            "total": 1,
+            "stm": [],
+            "episodic": [],
+            "semantic": [],
+            "dense_hits": [],
+            "graph_hits": [
+                {
+                    "node_id": "n1",
+                    "type": "entity",
+                    "content": "GRAPH_NODE_CONTENT_MARKER_42",
+                    "confidence": 0.9,
+                }
+            ],
+        }
+    )
+    assert "graph=1" in brief
+    assert "Graph (knowledge) top:" in brief
+    assert "GRAPH_NODE_CONTENT_MARKER_42" in brief
+    assert "[entity]" in brief
 
 
 def test_build_system_prompt_first_turn_vs_continuation():

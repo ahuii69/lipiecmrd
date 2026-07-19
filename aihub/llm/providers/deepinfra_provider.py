@@ -161,20 +161,9 @@ class DeepInfraProvider(BaseProvider):
 
     @classmethod
     def _extract_text_content(cls, raw: Any) -> str:
-        if raw is None:
-            return ""
-        if isinstance(raw, str):
-            return raw.strip()
-        if isinstance(raw, list):
-            parts = [cls._extract_text_content(item) for item in raw]
-            return "\n".join(part for part in parts if part).strip()
-        if isinstance(raw, dict):
-            for key in ("text", "content", "value", "output_text"):
-                value = raw.get(key)
-                text = cls._extract_text_content(value)
-                if text:
-                    return text
-        return ""
+        from aihub.response_runtime_guard import extract_assistant_text
+
+        return extract_assistant_text(raw)
 
     @classmethod
     def _prefer_final_answer(cls, text: str) -> str:
@@ -495,11 +484,20 @@ class DeepInfraProvider(BaseProvider):
             try:
                 if stream:
                     try:
-                        return await self._stream_chat_completions(
+                        parsed = await self._stream_chat_completions(
                             payload=payload,
                             model_name=model_name,
                             timeout_seconds=timeout_seconds,
                         )
+                        if not (parsed.content or "").strip() and not parsed.tool_calls:
+                            raise ProviderError(
+                                provider=self.provider_name,
+                                code="empty_response",
+                                message="provider returned empty content",
+                                retryable=False,
+                                details={"stream": True},
+                            )
+                        return parsed
                     except _ToolCallsInStreamError:
                         payload["stream"] = False
                         stream = False

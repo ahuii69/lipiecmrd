@@ -21,8 +21,10 @@ const PUBLIC_EXACT = new Set<string>([
 
 const ADMIN_TEMPLATES: Array<{ method: string; path: string }> = [
     { method: "GET", path: "/cockpit/schema-health" },
-    { method: "POST", path: "/chat/capabilities/execute" },
 ];
+
+// POST /chat/capabilities/execute is USER-scoped: ChatDrawer + chat tools.
+// Sensitive mutation override remains admin-only in aihub/chat_api.py.
 
 const USER_PREFIXES = [
     "/memory",

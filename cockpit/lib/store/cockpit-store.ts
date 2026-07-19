@@ -55,6 +55,8 @@ function trimMessages(messages: ChatUIMessage[]): ChatUIMessage[] {
     return messages.slice(-MAX_MESSAGES_PER_SESSION);
 }
 
+export type SessionHistoryStatus = "idle" | "loading" | "ready" | "error";
+
 export interface SessionState extends SessionSummary {
     messages: ChatUIMessage[];
     lastFailedUserMessage: string | null;
@@ -62,6 +64,9 @@ export interface SessionState extends SessionSummary {
     titleLockedByUser?: boolean;
     /** Inkrement po załadowaniu transkryptu z backendu (scroll / remount listy). */
     historyNonce?: number;
+    /** Stan synchronizacji historii z backendu (nie mylić z pustym UI po rehydrate). */
+    historyStatus?: SessionHistoryStatus;
+    historyError?: string | null;
 }
 
 interface CockpitState {
@@ -76,8 +81,19 @@ interface CockpitState {
     authUserId: string | null;
 
     setSection: (section: CockpitSection) => void;
-    createSession: () => void;
+    createSession: () => string;
     setActiveSession: (sessionId: string) => void;
+    /** Deep-link / URL: upewnij się, że sesja istnieje lokalnie (pusta, do hydracji historii). */
+    ensureSessionStub: (sessionId: string, userId?: string) => void;
+    setSessionHistoryStatus: (
+        sessionId: string,
+        status: SessionHistoryStatus,
+        error?: string | null,
+    ) => void;
+    /** True gdy w sesji jest bańka asystenta ze streaming=true. */
+    sessionHasStreamingMessage: (sessionId: string) => boolean;
+    /** Clears streaming flags on all messages (after abort / session switch). */
+    clearAllStreamingFlags: () => void;
     setSessionMode: (sessionId: string, mode: ChatMode) => void;
     appendMessage: (sessionId: string, msg: ChatUIMessage) => void;
     appendMessageContent: (sessionId: string, messageId: string, chunk: string) => void;
@@ -94,6 +110,8 @@ interface CockpitState {
             title: string;
             created_at: number;
             updated_at: number;
+            archived?: boolean;
+            archived_at?: number;
         }[],
         defaultUserId: string,
     ) => void;
@@ -181,6 +199,17 @@ function isPlaceholderUserId(userId: string | null | undefined): boolean {
     return false;
 }
 
+function newSessionId(): string {
+    if (typeof crypto !== "undefined" && "randomUUID" in crypto) {
+        return `s_${crypto.randomUUID()}`;
+    }
+    const suffix =
+        typeof performance !== "undefined"
+            ? performance.now().toString(16).replace(".", "")
+            : `${Date.now().toString(16)}x`;
+    return `s_${Date.now().toString(16)}_${suffix}`;
+}
+
 function createInitialSession(idx = 1, userId = "default"): SessionState {
     if (idx === 1) {
         return {
@@ -192,11 +221,14 @@ function createInitialSession(idx = 1, userId = "default"): SessionState {
             updatedAt: 0,
             messages: [],
             lastFailedUserMessage: null,
+            historyStatus: "idle",
+            historyError: null,
+            historyNonce: 0,
         };
     }
     const ts = Date.now();
     return {
-        id: `s_${ts}_${Math.random().toString(16).slice(2, 8)}`,
+        id: newSessionId(),
         title: "Nowa rozmowa",
         userId,
         mode: "chat",
@@ -204,7 +236,21 @@ function createInitialSession(idx = 1, userId = "default"): SessionState {
         updatedAt: ts,
         messages: [],
         lastFailedUserMessage: null,
+        historyStatus: "idle",
+        historyError: null,
+        historyNonce: 0,
     };
+}
+
+/** Lokalny blank draft: pusta, gotowa historia, placeholder title — bezpiecznie do usunięcia. */
+function isPrunableBlankDraft(s: SessionState): boolean {
+    return (
+        s.messages.length === 0 &&
+        isPlaceholderSessionTitle(s.title) &&
+        !s.titleLockedByUser &&
+        (s.historyStatus === "ready" || s.historyStatus === "idle") &&
+        s.id !== INITIAL_SESSION_ID
+    );
 }
 
 function normalizeSession(session: SessionState): SessionState {
@@ -217,12 +263,21 @@ function normalizeSession(session: SessionState): SessionState {
             }),
         ),
     );
+    const status = session.historyStatus;
     return {
         ...session,
         messages,
         lastFailedUserMessage: session.lastFailedUserMessage ?? null,
         titleLockedByUser: Boolean(session.titleLockedByUser),
         historyNonce: Number(session.historyNonce ?? 0),
+        historyStatus:
+            status === "loading" ||
+            status === "ready" ||
+            status === "error" ||
+            status === "idle"
+                ? status
+                : "idle",
+        historyError: session.historyError ?? null,
         updatedAt: Number(session.updatedAt ?? Date.now()),
         createdAt: Number(session.createdAt ?? Date.now()),
         mode: session.mode,
@@ -245,21 +300,9 @@ export const useCockpitStore = create<CockpitState>()(
 
                 setSection: (section) => set({ currentSection: section }),
 
-                createSession: () =>
+                createSession: () => {
+                    let createdId = "";
                     set((state) => {
-                        const emptyPlaceholder = state.sessions.find(
-                            (s) =>
-                                s.messages.length === 0 &&
-                                isPlaceholderSessionTitle(s.title) &&
-                                !s.titleLockedByUser,
-                        );
-                        if (emptyPlaceholder) {
-                            return {
-                                activeSessionId: emptyPlaceholder.id,
-                                currentSection: "chat",
-                                selectedMessageId: undefined,
-                            };
-                        }
                         const uid =
                             state.authUserId ||
                             state.sessions.find((s) => s.id === state.activeSessionId)
@@ -267,13 +310,23 @@ export const useCockpitStore = create<CockpitState>()(
                             state.sessions[0]?.userId ||
                             "default";
                         const next = createInitialSession(state.sessions.length + 1, uid);
+                        createdId = next.id;
+                        // Usuń inne lokalne blank drafts (już zsynchronizowane, puste) —
+                        // nigdy nie reuse’uj ich ID (to był root cause wycieku historii).
+                        const kept = state.sessions.filter(
+                            (s) =>
+                                s.id === state.activeSessionId ||
+                                !isPrunableBlankDraft(s),
+                        );
                         return {
-                            sessions: [next, ...state.sessions],
+                            sessions: [next, ...kept],
                             activeSessionId: next.id,
-                            currentSection: "chat",
+                            currentSection: "chat" as CockpitSection,
                             selectedMessageId: undefined,
                         };
-                    }),
+                    });
+                    return createdId;
+                },
 
                 setActiveSession: (sessionId) =>
                     set((state) => {
@@ -286,6 +339,72 @@ export const useCockpitStore = create<CockpitState>()(
                             selectedMessageId: undefined,
                         };
                     }),
+
+                ensureSessionStub: (sessionId, userId) =>
+                    set((state) => {
+                        if (state.sessions.some((s) => s.id === sessionId)) {
+                            return { activeSessionId: sessionId };
+                        }
+                        const uid =
+                            (userId || "").trim() ||
+                            state.authUserId ||
+                            state.sessions[0]?.userId ||
+                            "default";
+                        const stub: SessionState = {
+                            id: sessionId,
+                            title: "Nowa rozmowa",
+                            userId: uid,
+                            mode: "chat",
+                            createdAt: Date.now(),
+                            updatedAt: Date.now(),
+                            messages: [],
+                            lastFailedUserMessage: null,
+                            historyStatus: "idle",
+                            historyError: null,
+                            historyNonce: 0,
+                        };
+                        return {
+                            sessions: [stub, ...state.sessions],
+                            activeSessionId: sessionId,
+                            selectedMessageId: undefined,
+                        };
+                    }),
+
+                setSessionHistoryStatus: (sessionId, status, error = null) =>
+                    set((state) => ({
+                        sessions: state.sessions.map((s) =>
+                            s.id === sessionId
+                                ? {
+                                      ...s,
+                                      historyStatus: status,
+                                      historyError:
+                                          status === "error"
+                                              ? error ?? s.historyError ?? null
+                                              : null,
+                                  }
+                                : s,
+                        ),
+                    })),
+
+                sessionHasStreamingMessage: (sessionId) => {
+                    const s = get().sessions.find((x) => x.id === sessionId);
+                    return Boolean(s?.messages.some((m) => m.streaming === true));
+                },
+
+                clearAllStreamingFlags: () =>
+                    set((state) => ({
+                        sessions: state.sessions.map((s) => {
+                            if (!s.messages.some((m) => m.streaming)) return s;
+                            return {
+                                ...s,
+                                messages: s.messages.map((m) =>
+                                    m.streaming
+                                        ? { ...m, streaming: false }
+                                        : m,
+                                ),
+                            };
+                        }),
+                    })),
 
                 setSessionMode: (sessionId, mode) =>
                     set((state) => ({
@@ -478,6 +597,8 @@ export const useCockpitStore = create<CockpitState>()(
                                     ...s,
                                     messages,
                                     historyNonce: (s.historyNonce ?? 0) + 1,
+                                    historyStatus: "ready",
+                                    historyError: null,
                                 };
                             }),
                         };
@@ -532,6 +653,9 @@ export const useCockpitStore = create<CockpitState>()(
                                 messages: [],
                                 lastFailedUserMessage: null,
                                 titleLockedByUser: false,
+                                historyStatus: "idle" as SessionHistoryStatus,
+                                historyError: null,
+                                historyNonce: 0,
                             };
                         });
                         const serverIds = new Set(rows.map((r) => r.id));
@@ -655,7 +779,7 @@ export const useCockpitStore = create<CockpitState>()(
         },
         {
             name: "aihub-cockpit-store",
-            version: 7,
+            version: 8,
             skipHydration: true,
             storage: createJSONStorage(() => localStorage),
             /** Transkrypt czatu = backend (GET history); tu tylko metadane sesji — brak „fanfiku” w localStorage. */
@@ -664,6 +788,8 @@ export const useCockpitStore = create<CockpitState>()(
                 sessions: state.sessions.map((s) => ({
                     ...s,
                     messages: [],
+                    historyStatus: "idle" as SessionHistoryStatus,
+                    historyError: null,
                 })),
                 activeSessionId: state.activeSessionId,
                 authUserId: state.authUserId,
@@ -691,6 +817,16 @@ export const useCockpitStore = create<CockpitState>()(
                 if (oldVersion < 7) {
                     clearLegacyUserScopeStorage();
                     sessions = [createInitialSession(1, "default")];
+                }
+
+                // v8: historyStatus — po rehydrate zawsze idle (messages i tak puste).
+                if (oldVersion < 8) {
+                    sessions = sessions.map((s) => ({
+                        ...s,
+                        messages: [],
+                        historyStatus: "idle" as SessionHistoryStatus,
+                        historyError: null,
+                    }));
                 }
 
                 const activeSessionId = sessions.some(

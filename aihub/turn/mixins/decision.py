@@ -91,6 +91,7 @@ class DecisionMixin:
         tools: list[ProviderToolSpec],
         strategy: str,
         tool_order_hint: list[str] | None = None,
+        forced_tool_prefixes: list[str] | None = None,
     ) -> list[ProviderToolSpec]:
         """Restrict available tools to those relevant for the selected strategy."""
         _WHITELIST: dict[str, list[str] | None] = {
@@ -105,6 +106,7 @@ class DecisionMixin:
                 "goal.",
                 "runtime.status",
                 "system.health",
+                "image.",
             ],
             # research: web-forward; include memory for context but skip heavy agentic tools
             "research": [
@@ -115,6 +117,7 @@ class DecisionMixin:
                 "goal.",
                 "psyche.",
                 "runtime.",
+                "image.",
             ],
             # agentic: full tool set — no restriction
             "agentic": None,
@@ -124,6 +127,16 @@ class DecisionMixin:
             filtered = list(tools)
         else:
             filtered = [t for t in tools if any(t.name.startswith(p) for p in whitelist)]
+            # Capability closing: forced prefixes always pierce the strategy whitelist.
+            forced = [str(p) for p in (forced_tool_prefixes or []) if str(p).strip()]
+            if forced:
+                have = {t.name for t in filtered}
+                for t in tools:
+                    if t.name in have:
+                        continue
+                    if any(t.name.startswith(p) for p in forced):
+                        filtered.append(t)
+                        have.add(t.name)
             # Safety: never return an empty tool list — fall back to full set
             if not filtered:
                 filtered = list(tools)
@@ -192,10 +205,19 @@ class DecisionMixin:
                 f"web_decision={web_decision}_overrides_handoff(strategy={strategy})",
             )
 
+        # Capability Plan→Execute: explicit execute intent forces handoff.
+        if decision_core.get("force_agent_execute") and not web_overrides_handoff:
+            if effective_handoff_bias <= -0.25:
+                return (
+                    False,
+                    f"capability_execute_veto_handoff_bias={effective_handoff_bias:.2f}",
+                )
+            return True, "capability_force_agent_execute"
+
         # Plan-only asks stay on chat LLM (agentic budget + planner hints) so the
         # user receives a real written plan, not an executive telemetry stub.
         message_lower_early = (message or "").lower()
-        exec_force = any(
+        exec_force = decision_core.get("force_agent_execute") or any(
             x in message_lower_early
             for x in (
                 "wykonaj teraz",
@@ -203,6 +225,15 @@ class DecisionMixin:
                 "zrób migracj",
                 "zrob migracj",
                 "odpal migracj",
+                "zrób to",
+                "zrob to",
+                "wykonaj plan",
+                "zastosuj plan",
+                "odpal to",
+                "uruchom to",
+                "do it",
+                "execute now",
+                "go ahead",
             )
         )
         plan_only = (not exec_force) and any(

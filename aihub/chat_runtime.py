@@ -27,7 +27,6 @@ from aihub.turn.ops import (
     TurnOps,
     get_cached_chat_traces,
     get_last_traces as _ops_get_last_traces,
-    get_turn_ops,
 )
 from aihub.turn.ops import _TRACE_CACHE  # noqa: F401
 from aihub.turn.provider_service import ProviderExecutionService

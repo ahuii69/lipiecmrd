@@ -521,6 +521,22 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
 
                     'long_horizon_accepted': result.get('long_horizon_accepted'),
 
+                    'long_horizon_status': result.get('long_horizon_status'),
+
+                    'long_horizon_title': result.get('long_horizon_title'),
+
+                    'long_horizon_objective': result.get('long_horizon_objective'),
+
+                    'long_horizon_stage': result.get('long_horizon_stage'),
+
+                    'long_horizon_next_step': result.get('long_horizon_next_step'),
+
+                    'long_horizon_pending': result.get('long_horizon_pending'),
+
+                    'long_horizon_completed': result.get('long_horizon_completed'),
+
+                    'long_horizon_brief': result.get('long_horizon_brief'),
+
                     'blocked_rejected_options': result.get('blocked_rejected_options'),
 
                     'learning_suppress_options': result.get('learning_suppress_options'),
@@ -692,6 +708,17 @@ def run_pre_exec_decision_core(self, *, turn: ChatTurnInput, ctx: ChatTurnContex
     except Exception:
         logger.debug("greeting strategy clamp skipped", exc_info=True)
     self._finalize_escalation(result)
+    # Capability closing: escalate tools/web/handoff AFTER finalize so flags stick.
+    try:
+        from aihub.turn.capability_escalation import apply_capability_escalation
+
+        apply_capability_escalation(result, turn.message or "")
+        if result.get("capability_tools_required"):
+            result["escalation_use_tools"] = True
+            # Re-sync final_strategy after capability may have changed selected_strategy
+            result["final_strategy"] = str(result.get("selected_strategy") or result.get("final_strategy") or "instant")
+    except Exception:
+        logger.debug("capability escalation skipped", exc_info=True)
     result['user_turn_text'] = turn.message or ''
     # 19.07: one controlled adjustment trail — base → adjustments → final
     base = str(result.get('base_strategy') or result.get('selected_strategy') or 'instant')

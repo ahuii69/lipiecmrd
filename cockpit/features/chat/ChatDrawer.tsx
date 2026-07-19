@@ -1,8 +1,8 @@
 "use client";
 
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { X } from "lucide-react";
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 
 import { useChatUiStore, type ChatDrawerTab } from "@/features/chat/chat-ui-store";
 import { formatMemoryErrorMessage } from "@/lib/api/hub-auth-errors";
@@ -56,18 +56,41 @@ function extractSources(messages: ChatUIMessage[]): string[] {
     return [];
 }
 
+function extractHttpUrls(sources: string[]): string[] {
+    const out: string[] = [];
+    for (const s of sources) {
+        if (s.startsWith("http")) {
+            out.push(s);
+            continue;
+        }
+        const m = s.match(/https?:\/\/[^\s]+/i);
+        if (m) out.push(m[0]);
+    }
+    return Array.from(new Set(out));
+}
+
 export function ChatDrawer({
     userId,
+    sessionId,
     apiKeyOverride,
     messages,
 }: {
     userId: string;
+    sessionId: string;
     apiKeyOverride?: string;
     messages: ChatUIMessage[];
 }) {
     const { drawerOpen, setDrawerOpen, drawerTab, setDrawerTab } =
         useChatUiStore();
     const enabled = drawerOpen && Boolean(userId) && userId !== "default";
+    const queryClient = useQueryClient();
+
+    const [searchQ, setSearchQ] = useState("");
+    const [searchHits, setSearchHits] = useState<
+        Array<{ title?: string; content?: string; id?: string }>
+    >([]);
+    const [searchErr, setSearchErr] = useState<string | null>(null);
+    const [actionMsg, setActionMsg] = useState<string | null>(null);
 
     const memory = useQuery({
         queryKey: ["chat-drawer-memory", userId, apiKeyOverride],
@@ -105,12 +128,115 @@ export function ChatDrawer({
     );
 
     const sources = useMemo(() => extractSources(messages), [messages]);
+    const httpSources = useMemo(() => extractHttpUrls(sources), [sources]);
     const lastAssistant = useMemo(() => {
         for (let i = messages.length - 1; i >= 0; i -= 1) {
             if (messages[i].role === "assistant") return messages[i];
         }
         return null;
     }, [messages]);
+
+    const searchMutation = useMutation({
+        mutationFn: async (query: string) => {
+            const r = await apiClient.memorySearch(
+                {
+                    user_id: userId,
+                    session_id: sessionId,
+                    mode: "chat",
+                    query,
+                    limit: 8,
+                },
+                apiKeyOverride,
+            );
+            return r;
+        },
+        onSuccess: (data) => {
+            setSearchErr(null);
+            const semantic = Array.isArray(
+                (data as { semantic?: unknown })?.semantic,
+            )
+                ? ((data as { semantic: Array<Record<string, unknown>> }).semantic)
+                : [];
+            const episodic = Array.isArray(
+                (data as { episodic?: unknown })?.episodic,
+            )
+                ? ((data as { episodic: Array<Record<string, unknown>> }).episodic)
+                : [];
+            const hits = [...semantic, ...episodic].slice(0, 8).map((row) => ({
+                id: String(row.id ?? ""),
+                title: String(row.title ?? row.layer ?? "Wynik"),
+                content: String(row.content ?? row.text ?? ""),
+            }));
+            setSearchHits(hits);
+            if (hits.length === 0) {
+                setActionMsg("Brak trafień w pamięci dla tego zapytania.");
+            } else {
+                setActionMsg(`Znaleziono ${hits.length} wpis(ów).`);
+            }
+        },
+        onError: (err) => {
+            setSearchErr(formatMemoryErrorMessage(err));
+            setSearchHits([]);
+        },
+    });
+
+    const ingestMutation = useMutation({
+        mutationFn: async (url: string) => {
+            return apiClient.executeCapability(
+                {
+                    user_id: userId,
+                    session_id: sessionId,
+                    mode: "chat",
+                    tool_name: "web.ingest_url",
+                    arguments: { url, session_id: sessionId },
+                },
+                apiKeyOverride,
+            );
+        },
+        onSuccess: () => {
+            setActionMsg("Źródło zapisane do pamięci.");
+            void queryClient.invalidateQueries({
+                queryKey: ["chat-drawer-memory", userId],
+            });
+            void queryClient.invalidateQueries({
+                queryKey: ["chat-drawer-pack", userId],
+            });
+        },
+        onError: (err) => {
+            setActionMsg(formatMemoryErrorMessage(err));
+        },
+    });
+
+    const rememberMutation = useMutation({
+        mutationFn: async (fact: string) => {
+            return apiClient.executeCapability(
+                {
+                    user_id: userId,
+                    session_id: sessionId,
+                    mode: "chat",
+                    tool_name: "memory.add_fact",
+                    arguments: {
+                        fact,
+                        tags: ["drawer", "explicit"],
+                        meta: { source: "chat_drawer" },
+                    },
+                },
+                apiKeyOverride,
+            );
+        },
+        onSuccess: () => {
+            setActionMsg("Fakt zapisany w pamięci.");
+            void queryClient.invalidateQueries({
+                queryKey: ["chat-drawer-memory", userId],
+            });
+            void queryClient.invalidateQueries({
+                queryKey: ["chat-drawer-pack", userId],
+            });
+        },
+        onError: (err) => {
+            setActionMsg(formatMemoryErrorMessage(err));
+        },
+    });
 
     if (!drawerOpen) return null;
 
@@ -161,6 +287,12 @@ export function ChatDrawer({
                 </div>
 
                 <div className="min-h-0 flex-1 overflow-y-auto p-4 [scrollbar-width:thin]">
+                    {actionMsg ? (
+                        <p className="mb-3 text-xs text-[var(--chat-accent-alt)]">
+                            {actionMsg}
+                        </p>
+                    ) : null}
+
                     {drawerTab === "pamiec" ? (
                         <MemoryPane
                             loading={memory.isLoading}
@@ -169,10 +301,30 @@ export function ChatDrawer({
                                 !memory.isLoading &&
                                 !memory.isError &&
                                 memoryTotal(memory.data) === 0 &&
-                                packedItems.length === 0
+                                packedItems.length === 0 &&
+                                searchHits.length === 0
                             }
                             items={packedItems}
                             facts={(memory.data?.facts ?? []).slice(0, 5)}
+                            searchQ={searchQ}
+                            onSearchQ={setSearchQ}
+                            onSearch={() => {
+                                const q = searchQ.trim();
+                                if (q.length < 2) {
+                                    setActionMsg("Wpisz co najmniej 2 znaki.");
+                                    return;
+                                }
+                                searchMutation.mutate(q);
+                            }}
+                            searchBusy={searchMutation.isPending}
+                            searchHits={searchHits}
+                            searchErr={searchErr}
+                            onRememberFact={(fact) => {
+                                const f = fact.trim();
+                                if (f.length < 3) return;
+                                rememberMutation.mutate(f);
+                            }}
+                            rememberBusy={rememberMutation.isPending}
                         />
                     ) : null}
 
@@ -184,32 +336,70 @@ export function ChatDrawer({
                             </p>
                         ) : (
                             <ul className="space-y-3">
-                                {sources.map((src) => (
-                                    <li
-                                        key={src}
-                                        className="border-b border-[var(--chat-border)] pb-3 last:border-0"
-                                    >
-                                        <p className="text-sm font-medium text-[var(--chat-text)]">
-                                            {src.startsWith("http")
-                                                ? tryDomain(src)
-                                                : src}
-                                        </p>
-                                        {src.startsWith("http") ? (
-                                            <a
-                                                href={src}
-                                                target="_blank"
-                                                rel="noopener noreferrer"
-                                                className="mt-1 block truncate text-xs text-[var(--chat-accent-alt)] hover:underline"
-                                            >
-                                                {src}
-                                            </a>
-                                        ) : (
-                                            <p className="mt-1 text-xs text-[var(--chat-text-muted)]">
-                                                {src}
+                                {sources.map((src) => {
+                                    const url = src.startsWith("http")
+                                        ? src
+                                        : extractHttpUrls([src])[0];
+                                    return (
+                                        <li
+                                            key={src}
+                                            className="border-b border-[var(--chat-border)] pb-3 last:border-0"
+                                        >
+                                            <p className="text-sm font-medium text-[var(--chat-text)]">
+                                                {src.startsWith("http")
+                                                    ? tryDomain(src)
+                                                    : src}
                                             </p>
-                                        )}
+                                            {url ? (
+                                                <a
+                                                    href={url}
+                                                    target="_blank"
+                                                    rel="noopener noreferrer"
+                                                    className="mt-1 block truncate text-xs text-[var(--chat-accent-alt)] hover:underline"
+                                                >
+                                                    {url}
+                                                </a>
+                                            ) : (
+                                                <p className="mt-1 text-xs text-[var(--chat-text-muted)]">
+                                                    {src}
+                                                </p>
+                                            )}
+                                            {url ? (
+                                                <button
+                                                    type="button"
+                                                    className="mt-2 text-xs font-medium text-[var(--chat-accent)] hover:underline disabled:opacity-50"
+                                                    disabled={ingestMutation.isPending}
+                                                    onClick={() =>
+                                                        ingestMutation.mutate(url)
+                                                    }
+                                                >
+                                                    {ingestMutation.isPending
+                                                        ? "Zapisuję…"
+                                                        : "Zapisz do pamięci"}
+                                                </button>
+                                            ) : null}
+                                        </li>
+                                    );
+                                })}
+                                {httpSources.length > 1 ? (
+                                    <li>
+                                        <button
+                                            type="button"
+                                            className="text-xs font-medium text-[var(--chat-accent)] hover:underline disabled:opacity-50"
+                                            disabled={ingestMutation.isPending}
+                                            onClick={() => {
+                                                for (const u of httpSources.slice(
+                                                    0,
+                                                    3,
+                                                )) {
+                                                    ingestMutation.mutate(u);
+                                                }
+                                            }}
+                                        >
+                                            Zapisz wszystkie URL (max 3)
+                                        </button>
                                     </li>
-                                ))}
+                                ) : null}
                             </ul>
                         )
                     ) : null}
@@ -237,59 +427,150 @@ function MemoryPane({
     empty,
     items,
     facts,
+    searchQ,
+    onSearchQ,
+    onSearch,
+    searchBusy,
+    searchHits,
+    searchErr,
+    onRememberFact,
+    rememberBusy,
 }: {
     loading: boolean;
     error: unknown;
     empty: boolean;
     items: MemoryContextPackItem[];
     facts: MemoryV2SummaryItem[];
+    searchQ: string;
+    onSearchQ: (v: string) => void;
+    onSearch: () => void;
+    searchBusy: boolean;
+    searchHits: Array<{ title?: string; content?: string; id?: string }>;
+    searchErr: string | null;
+    onRememberFact: (fact: string) => void;
+    rememberBusy: boolean;
 }) {
-    if (loading) {
-        return (
-            <p className="text-sm text-[var(--chat-text-muted)]">
-                Ładowanie pamięci…
-            </p>
-        );
-    }
-    if (error) {
-        console.error("[chat-drawer-memory]", error);
-        return (
-            <p className="text-sm text-[var(--chat-text-muted)]">
-                {formatMemoryErrorMessage(error)}
-            </p>
-        );
-    }
-    if (empty) {
-        return (
-            <p className="text-sm leading-relaxed text-[var(--chat-text-muted)]">
-                Pamięć jest jeszcze pusta. Będzie się budować w trakcie rozmowy.
-            </p>
-        );
-    }
+    const [factDraft, setFactDraft] = useState("");
+
     return (
-        <div className="space-y-3">
-            {items.map((item, idx) => (
-                <div key={String(item.id ?? idx)}>
-                    <p className="text-sm font-medium text-[var(--chat-text)]">
-                        {shortText(item.title || item.memory_type, "Pamięć")}
-                    </p>
-                    <p className="mt-1 line-clamp-4 text-xs text-[var(--chat-text-muted)]">
-                        {shortText(item.content, "")}
-                    </p>
+        <div className="space-y-4">
+            <form
+                className="space-y-2"
+                onSubmit={(e) => {
+                    e.preventDefault();
+                    onSearch();
+                }}
+            >
+                <label className="block text-[10px] uppercase tracking-wider text-[var(--chat-text-muted)]">
+                    Szukaj w pamięci
+                </label>
+                <div className="flex gap-2">
+                    <input
+                        value={searchQ}
+                        onChange={(e) => onSearchQ(e.target.value)}
+                        placeholder="np. preferencje, fakty…"
+                        className="min-w-0 flex-1 rounded border border-[var(--chat-border)] bg-[#12151a] px-2 py-1.5 text-sm text-[var(--chat-text)] placeholder:text-[var(--chat-text-muted)]"
+                    />
+                    <button
+                        type="submit"
+                        disabled={searchBusy}
+                        className="shrink-0 px-2 text-xs font-medium text-[var(--chat-accent)] hover:underline disabled:opacity-50"
+                    >
+                        {searchBusy ? "…" : "Szukaj"}
+                    </button>
                 </div>
-            ))}
-            {items.length === 0
-                ? facts.map((item, idx) => (
-                      <div key={String(item.id ?? idx)}>
-                          <p className="text-sm font-medium text-[var(--chat-text)]">
-                              {shortText(item.title ?? item.label, "Fakt")}
-                          </p>
-                          <p className="mt-1 line-clamp-4 text-xs text-[var(--chat-text-muted)]">
-                              {shortText(item.content, "")}
-                          </p>
-                      </div>
-                  ))
-                : null}
+                {searchErr ? (
+                    <p className="text-xs text-[var(--chat-text-muted)]">{searchErr}</p>
+                ) : null}
+            </form>
+
+            {searchHits.length > 0 ? (
+                <div className="space-y-2">
+                    <p className="text-[10px] uppercase tracking-wider text-[var(--chat-text-muted)]">
+                        Wyniki wyszukiwania
+                    </p>
+                    {searchHits.map((hit, idx) => (
+                        <div key={String(hit.id ?? idx)}>
+                            <p className="text-sm font-medium text-[var(--chat-text)]">
+                                {shortText(hit.title, "Wynik")}
+                            </p>
+                            <p className="mt-1 line-clamp-3 text-xs text-[var(--chat-text-muted)]">
+                                {shortText(hit.content, "")}
+                            </p>
+                        </div>
+                    ))}
+                </div>
+            ) : null}
+
+            <form
+                className="space-y-2 border-t border-[var(--chat-border)] pt-3"
+                onSubmit={(e) => {
+                    e.preventDefault();
+                    onRememberFact(factDraft);
+                    setFactDraft("");
+                }}
+            >
+                <label className="block text-[10px] uppercase tracking-wider text-[var(--chat-text-muted)]">
+                    Zapamiętaj fakt
+                </label>
+                <textarea
+                    value={factDraft}
+                    onChange={(e) => setFactDraft(e.target.value)}
+                    rows={2}
+                    placeholder="Krótki fakt do L2 / Memory V2…"
+                    className="w-full rounded border border-[var(--chat-border)] bg-[#12151a] px-2 py-1.5 text-sm text-[var(--chat-text)] placeholder:text-[var(--chat-text-muted)]"
+                />
+                <button
+                    type="submit"
+                    disabled={rememberBusy || factDraft.trim().length < 3}
+                    className="text-xs font-medium text-[var(--chat-accent)] hover:underline disabled:opacity-50"
+                >
+                    {rememberBusy ? "Zapisuję…" : "Zapisz fakt"}
+                </button>
+            </form>
+
+            {loading ? (
+                <p className="text-sm text-[var(--chat-text-muted)]">
+                    Ładowanie pamięci…
+                </p>
+            ) : null}
+            {error ? (
+                <p className="text-sm text-[var(--chat-text-muted)]">
+                    {formatMemoryErrorMessage(error)}
+                </p>
+            ) : null}
+            {!loading && !error && empty ? (
+                <p className="text-sm leading-relaxed text-[var(--chat-text-muted)]">
+                    Pamięć jest jeszcze pusta. Będzie się budować w trakcie rozmowy
+                    — albo zapisz fakt powyżej.
+                </p>
+            ) : null}
+            {!loading && !error && !empty ? (
+                <div className="space-y-3 border-t border-[var(--chat-border)] pt-3">
+                    {items.map((item, idx) => (
+                        <div key={String(item.id ?? idx)}>
+                            <p className="text-sm font-medium text-[var(--chat-text)]">
+                                {shortText(item.title || item.memory_type, "Pamięć")}
+                            </p>
+                            <p className="mt-1 line-clamp-4 text-xs text-[var(--chat-text-muted)]">
+                                {shortText(item.content, "")}
+                            </p>
+                        </div>
+                    ))}
+                    {items.length === 0
+                        ? facts.map((item, idx) => (
+                              <div key={String(item.id ?? idx)}>
+                                  <p className="text-sm font-medium text-[var(--chat-text)]">
+                                      {shortText(item.title ?? item.label, "Fakt")}
+                                  </p>
+                                  <p className="mt-1 line-clamp-4 text-xs text-[var(--chat-text-muted)]">
+                                      {shortText(item.content, "")}
+                                  </p>
+                              </div>
+                          ))
+                        : null}
+                </div>
+            ) : null}
         </div>
     );
 }

@@ -143,6 +143,25 @@ async def lifespan(app: FastAPI):
         from aihub.local_auth import ensure_auth_schema
 
         ensure_auth_schema()
+        try:
+            from aihub.cost_ledger import ensure_cost_ledger_schema
+
+            ensure_cost_ledger_schema()
+            logger.info("Cost ledger schema ready")
+        except Exception:
+            logger.exception("Cost ledger schema init failed")
+        # Optional Sentry — real when SENTRY_DSN set, silent no-op otherwise.
+        try:
+            dsn = (os.getenv("SENTRY_DSN") or "").strip()
+            if dsn:
+                import sentry_sdk
+
+                sentry_sdk.init(dsn=dsn, environment=os.getenv("ENV", "production"), traces_sample_rate=0.05)
+                logger.info("Sentry initialized")
+            else:
+                logger.info("Sentry skipped (SENTRY_DSN empty)")
+        except Exception:
+            logger.exception("Sentry init failed")
         logger.info("Database initialized")
         load_from_db()
         logger.info("Knowledge graph loaded from DB")
@@ -273,6 +292,24 @@ def ops_capabilities() -> dict[str, Any]:
     from aihub.ops_platform import capability_matrix
 
     return capability_matrix()
+
+
+@app.get("/ops/cost/today")
+def ops_cost_today(user_id: str = Query("default")) -> dict[str, Any]:
+    """Per-user daily cost ledger summary (no secrets)."""
+    from aihub.cost_ledger import ensure_cost_ledger_schema, user_day_summary
+
+    ensure_cost_ledger_schema()
+    return {"ok": True, **user_day_summary(user_id)}
+
+
+@app.get("/ops/cost/global-today")
+def ops_cost_global_today() -> dict[str, Any]:
+    """Global daily cost rollup for operator dashboards."""
+    from aihub.cost_ledger import ensure_cost_ledger_schema, global_day_summary
+
+    ensure_cost_ledger_schema()
+    return {"ok": True, **global_day_summary()}
 
 
 @app.get("/system/health/{user_id}")
@@ -521,9 +558,17 @@ def _principal_user_id(request: Request) -> str:
 
 @app.post("/fs/write")
 def fs_write(request: Request, inp: FSWriteIn) -> dict[str, Any]:
-    """Write file (admin)."""
+    """Write file (admin). MutationPolicy: requires confirmed=true."""
     user_id = _principal_user_id(request)
     try:
+        from aihub.tools.mutation_guard import block_unconfirmed_mutation
+
+        blocked = block_unconfirmed_mutation(
+            "fs.write_file",
+            {"confirmed": bool(inp.confirmed), "path": inp.path},
+        )
+        if blocked:
+            raise HTTPException(status_code=403, detail=blocked)
         get_psyche_core().ensure_user(user_id)
         result = write_file(user_id, inp.path, inp.content, overwrite=inp.overwrite)
         logger.info("File written for %s: %s", user_id, inp.path)
@@ -725,9 +770,17 @@ async def web_ingest(inp: WebIngestIn, user_id: str = "default") -> dict[str, An
 # ---------------------------
 @app.post("/system/snapshot/create")
 def snapshot_create(request: Request, inp: SnapshotCreateIn) -> dict[str, Any]:
-    """Create snapshot (admin)."""
+    """Create snapshot (admin). MutationPolicy: requires confirmed=true."""
     user_id = _principal_user_id(request)
     try:
+        from aihub.tools.mutation_guard import block_unconfirmed_mutation
+
+        blocked = block_unconfirmed_mutation(
+            "snapshot.create",
+            {"confirmed": bool(inp.confirmed), "reason": inp.reason},
+        )
+        if blocked:
+            raise HTTPException(status_code=403, detail=blocked)
         get_psyche_core().ensure_user(user_id)
         result = create_snapshot(user_id, inp.reason)
         logger.info("Snapshot created for %s: %s", user_id, inp.reason)

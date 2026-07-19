@@ -22,7 +22,24 @@ async def run_execute_agent_handoff(self, *, turn: ChatTurnInput, decision_core:
                 logger.debug('WK execution resume skipped', exc_info=True)
         controller = _cr_hook('get_executive_controller', get_executive_controller)()
         fstr, freason = map_chat_execution_mode_to_force_strategy(decision_core)
-        cycle = await controller.run_cycle({'text': turn.message, 'max_steps': 8, 'timeout_seconds': 20.0, 'force_strategy': fstr, 'force_strategy_reason': f'{freason};chat_runtime:agent_handoff', 'execution_graph_id': _egid or None, 'long_horizon_task_id': decision_core.get('long_horizon_task_id'), 'session_id': turn.session_id, 'turn_id': getattr(turn, 'turn_id', None) or getattr(ctx, 'turn_id', None) or ''}, mode='run', user_id=turn.user_id)
+        # force_agent_execute must never imply mutation auto-confirm.
+        cycle_payload = {
+            'text': turn.message,
+            'max_steps': 8,
+            'timeout_seconds': 20.0,
+            'force_strategy': fstr,
+            'force_strategy_reason': f'{freason};chat_runtime:agent_handoff',
+            'execution_graph_id': _egid or None,
+            'long_horizon_task_id': decision_core.get('long_horizon_task_id'),
+            'session_id': turn.session_id,
+            'turn_id': getattr(turn, 'turn_id', None) or getattr(ctx, 'turn_id', None) or '',
+            'mutation_auto_confirm': False,
+            'respect_tool_confirmation': True,
+            'mutation_confirmation_required': bool(
+                decision_core.get('mutation_confirmation_required', True)
+            ),
+        }
+        cycle = await controller.run_cycle(cycle_payload, mode='run', user_id=turn.user_id)
         agent_response = _cr_hook('build_agent_cycle_response', build_agent_cycle_response)(cycle, include_debug=turn.include_debug)
     except Exception as exc:
         logger.error('Agent handoff failed user=%s error=%s', turn.user_id, exc)

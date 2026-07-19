@@ -101,11 +101,34 @@ class TurnOps(
         self._provider_service = build_provider_execution_service(primary=primary)
         self._tool_service = ToolExecutionService(self._tool_router)
         self._completion_service = TurnCompletionService()
-        self._active_turn_ctx = None
-        self._active_trace_builder = None
         # Managed hooks kept as attributes so runtime wiring is explicit and testable.
         self._memory_process_fn = get_memory_core().ingest_turn
         self._psyche_evolve_fn = get_psyche_core().evolve
+
+    @property
+    def _active_turn_ctx(self):
+        """Per-task turn context (ContextVar) — safe under concurrent sessions."""
+        from aihub.turn.active_context import get_active_turn_ctx
+
+        return get_active_turn_ctx()
+
+    @_active_turn_ctx.setter
+    def _active_turn_ctx(self, value) -> None:
+        from aihub.turn.active_context import set_active_turn_ctx
+
+        set_active_turn_ctx(value)
+
+    @property
+    def _active_trace_builder(self):
+        from aihub.turn.active_context import get_active_trace_builder
+
+        return get_active_trace_builder()
+
+    @_active_trace_builder.setter
+    def _active_trace_builder(self, value) -> None:
+        from aihub.turn.active_context import set_active_trace_builder
+
+        set_active_trace_builder(value)
 
     @property
     def _provider(self):
@@ -162,28 +185,15 @@ for _m in (_m_decision, _m_execution, _m_experience, _m_prompt, _m_web, _m_pipel
     _m.TurnOps = TurnOps
 TurnOps.__module__ = "aihub.turn.ops"
 
-_RUNTIME: TurnOps | None = None
-
-
 def get_turn_ops() -> TurnOps:
-    global _RUNTIME
-    if _RUNTIME is None:
-        _RUNTIME = TurnOps()
-    else:
-        try:
-            from aihub.llm.provider_registry import build_provider_execution_service, get_primary_provider
+    """Canonical turn ops singleton — same live instance as ``get_chat_runtime()``.
 
-            fresh_provider = get_primary_provider()
-        except Exception:
-            fresh_provider = None
-        if fresh_provider is not None:
-            current = getattr(_RUNTIME, "_provider", None)
-            current_key = (type(current), getattr(current, "provider_name", None), getattr(current, "name", None))
-            fresh_key = (type(fresh_provider), getattr(fresh_provider, "provider_name", None), getattr(fresh_provider, "name", None))
-            if current is None or current_key != fresh_key:
-                _RUNTIME._provider = fresh_provider
-                _RUNTIME._provider_service = build_provider_execution_service(primary=fresh_provider)
-    return _RUNTIME
+    ``ChatRuntime`` subclasses ``TurnOps``; HTTP and internal callers must share one
+    pipeline object (provider refresh, tools, application service).
+    """
+    from aihub.chat_runtime import get_chat_runtime
+
+    return get_chat_runtime()
 
 
 def get_cached_chat_traces(user_id: str, limit: int = 5) -> list[dict[str, Any]]:

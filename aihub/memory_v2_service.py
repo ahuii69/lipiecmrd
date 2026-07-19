@@ -39,6 +39,7 @@ from aihub.memory_v2_repository import (
     count_memory_items,
     get_contradicted_memories,
     get_lessons_for_user,
+    get_memory_item,
     get_memory_links_from,
     get_procedures_for_user,
     get_top_salient_memories,
@@ -565,13 +566,10 @@ class MemoryV2Service:
 
         Returns updated item if successful.
         """
-        item = search_memory_items(user_id=user_id, limit=1)
-        matching = [i for i in item if i.id == memory_id]
-        if not matching:
+        item = get_memory_item(memory_id, user_id)
+        if not item:
             logger.warning(f"Memory item {memory_id} not found for reinforcement")
             return None
-
-        item = matching[0]
         now = time.time()
 
         item.last_accessed_ts = now

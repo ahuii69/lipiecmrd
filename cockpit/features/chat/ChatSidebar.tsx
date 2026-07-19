@@ -1,6 +1,8 @@
 "use client";
 
 import {
+    Archive,
+    ArchiveRestore,
     Brain,
     FileText,
     LogOut,
@@ -18,30 +20,37 @@ import { useMemo, useState } from "react";
 import { groupSessionsByDate } from "@/features/chat/chat-session-groups";
 import { useChatUiStore } from "@/features/chat/chat-ui-store";
 import { Input } from "@/components/ui/input";
+import { apiClient } from "@/lib/api/client";
+import { chatSessionRuntime } from "@/lib/chat/chat-session-runtime";
+import { filterSessionsForSidebar } from "@/lib/chat/session-list-filter";
 import { lastUserVisiblePreview } from "@/lib/chat/session-title";
+import { publishSessionsSync } from "@/lib/chat/sessions-sync";
 import { logoutAndRedirect } from "@/lib/hooks/use-auth-principal";
 import { useCockpitStore } from "@/lib/store/cockpit-store";
 import { cn } from "@/lib/utils";
 
 export function ChatSidebar({
     username,
+    sessionsSyncing = false,
+    onNewChat,
     onSelectSession,
     onOpenMemory,
     onOpenFiles,
 }: {
     username?: string;
-    onSelectSession?: () => void;
+    sessionsSyncing?: boolean;
+    onNewChat: () => void;
+    onSelectSession: (sessionId: string) => void;
     onOpenMemory: () => void;
     onOpenFiles: () => void;
 }) {
-    const {
-        sessions,
-        activeSessionId,
-        createSession,
-        setActiveSession,
-        deleteSession,
-        updateSessionTitle,
-    } = useCockpitStore();
+    const sessions = useCockpitStore((s) => s.sessions);
+    const activeSessionId = useCockpitStore((s) => s.activeSessionId);
+    const deleteSession = useCockpitStore((s) => s.deleteSession);
+    const updateSessionTitle = useCockpitStore((s) => s.updateSessionTitle);
+    const authUserId = useCockpitStore((s) => s.authUserId);
+    const apiKeyOverride = useCockpitStore((s) => s.apiKeyOverride);
+
     const {
         sidebarCollapsed,
         sidebarMobileOpen,
@@ -51,28 +60,104 @@ export function ChatSidebar({
         setSearchQuery,
         pinnedSessionIds,
         togglePinSession,
+        archivedSessionIds,
+        archiveSession,
+        unarchiveSession,
     } = useChatUiStore();
     const [menuSessionId, setMenuSessionId] = useState<string | null>(null);
     const [renameId, setRenameId] = useState<string | null>(null);
     const [renameDraft, setRenameDraft] = useState("");
+    const [showArchived, setShowArchived] = useState(false);
 
     const filtered = useMemo(() => {
-        const q = searchQuery.trim().toLowerCase();
-        return [...sessions]
-            .filter((s) => {
-                if (!q) return true;
-                return (
-                    s.title.toLowerCase().includes(q) ||
-                    lastUserVisiblePreview(s.messages).toLowerCase().includes(q)
-                );
-            })
-            .sort((a, b) => b.updatedAt - a.updatedAt);
-    }, [sessions, searchQuery]);
+        return filterSessionsForSidebar({
+            sessions: [...sessions],
+            archivedSessionIds,
+            showArchived,
+            searchQuery,
+            previewOf: (s) => lastUserVisiblePreview(s.messages),
+        }).sort((a, b) => b.updatedAt - a.updatedAt);
+    }, [sessions, searchQuery, archivedSessionIds, showArchived]);
 
     const pinned = filtered.filter((s) => pinnedSessionIds.includes(s.id));
     const unpinned = filtered.filter((s) => !pinnedSessionIds.includes(s.id));
     const groups = groupSessionsByDate(unpinned);
     const expanded = sidebarMobileOpen || !sidebarCollapsed;
+
+    const persistArchive = async (sessionId: string, archived: boolean) => {
+        if (archived) {
+            archiveSession(sessionId);
+        } else {
+            unarchiveSession(sessionId);
+        }
+        const uid =
+            authUserId ||
+            sessions.find((s) => s.id === sessionId)?.userId ||
+            "";
+        if (!uid || uid === "default") return;
+        try {
+            if (archived) {
+                await apiClient.archiveSession(
+                    { user_id: uid, session_id: sessionId },
+                    apiKeyOverride || undefined,
+                );
+            } else {
+                await apiClient.unarchiveSession(
+                    { user_id: uid, session_id: sessionId },
+                    apiKeyOverride || undefined,
+                );
+            }
+        } catch (err) {
+            console.error("[sidebar] archive sync failed", err);
+            return;
+        }
+        publishSessionsSync({
+            type: "archive-changed",
+            userId: uid,
+            sessionId,
+            archived,
+        });
+        publishSessionsSync({ type: "sessions-changed", userId: uid });
+    };
+
+    const persistRename = async (sessionId: string, title: string) => {
+        const prev = sessions.find((s) => s.id === sessionId)?.title;
+        updateSessionTitle(sessionId, title);
+        const uid =
+            authUserId ||
+            sessions.find((s) => s.id === sessionId)?.userId ||
+            "";
+        if (!uid || uid === "default") return;
+        try {
+            await apiClient.renameSession(
+                { user_id: uid, session_id: sessionId, title },
+                apiKeyOverride || undefined,
+            );
+        } catch (err) {
+            console.error("[sidebar] rename failed", err);
+            if (prev) updateSessionTitle(sessionId, prev);
+        }
+    };
+
+    const persistDelete = async (sessionId: string) => {
+        if (sessionId === activeSessionId) {
+            chatSessionRuntime.abortAll();
+        }
+        const snapshot = sessions.find((s) => s.id === sessionId);
+        deleteSession(sessionId);
+        unarchiveSession(sessionId);
+        const uid = authUserId || snapshot?.userId || "";
+        if (!uid || uid === "default") return;
+        try {
+            await apiClient.deleteSession(
+                { user_id: uid, session_id: sessionId },
+                apiKeyOverride || undefined,
+            );
+            publishSessionsSync({ type: "sessions-changed", userId: uid });
+        } catch (err) {
+            console.error("[sidebar] delete failed", err);
+        }
+    };
 
     return (
         <>
@@ -135,10 +220,7 @@ export function ChatSidebar({
                             "flex h-[38px] w-full items-center gap-2 bg-white/[0.06] px-3 text-sm font-medium text-[var(--chat-text)] hover:bg-white/[0.08]",
                             !expanded && "md:justify-center md:px-0",
                         )}
-                        onClick={() => {
-                            createSession();
-                            onSelectSession?.();
-                        }}
+                        onClick={onNewChat}
                         data-testid="user-new-session"
                     >
                         <Plus className="h-4 w-4 shrink-0" />
@@ -158,7 +240,45 @@ export function ChatSidebar({
                             />
                         </div>
 
-                        {pinned.length > 0 ? (
+                        <div className="mb-3 flex gap-1">
+                            <button
+                                type="button"
+                                className={cn(
+                                    "flex-1 rounded px-2 py-1 text-[11px]",
+                                    !showArchived
+                                        ? "bg-white/[0.08] text-[var(--chat-text)]"
+                                        : "text-[var(--chat-text-muted)]",
+                                )}
+                                onClick={() => setShowArchived(false)}
+                            >
+                                Aktywne
+                            </button>
+                            <button
+                                type="button"
+                                className={cn(
+                                    "flex-1 rounded px-2 py-1 text-[11px]",
+                                    showArchived
+                                        ? "bg-white/[0.08] text-[var(--chat-text)]"
+                                        : "text-[var(--chat-text-muted)]",
+                                )}
+                                onClick={() => setShowArchived(true)}
+                            >
+                                Archiwum
+                            </button>
+                        </div>
+
+                        {sessionsSyncing && filtered.length === 0 ? (
+                            <div className="space-y-2 px-1" aria-busy>
+                                {[0, 1, 2, 3].map((i) => (
+                                    <div
+                                        key={i}
+                                        className="h-9 animate-pulse rounded bg-white/[0.05]"
+                                    />
+                                ))}
+                            </div>
+                        ) : null}
+
+                        {pinned.length > 0 && !showArchived ? (
                             <SessionGroup label="Przypięte">
                                 {pinned.map((s) => (
                                     <SessionRow
@@ -169,13 +289,12 @@ export function ChatSidebar({
                                         renaming={renameId === s.id}
                                         renameDraft={renameDraft}
                                         onRenameDraft={setRenameDraft}
-                                        onSelect={() => {
-                                            setActiveSession(s.id);
-                                            onSelectSession?.();
-                                        }}
+                                        onSelect={() => onSelectSession(s.id)}
                                         onMenuToggle={() =>
                                             setMenuSessionId(
-                                                menuSessionId === s.id ? null : s.id,
+                                                menuSessionId === s.id
+                                                    ? null
+                                                    : s.id,
                                             )
                                         }
                                         onRenameStart={() => {
@@ -185,7 +304,7 @@ export function ChatSidebar({
                                         }}
                                         onRenameSave={() => {
                                             if (renameDraft.trim()) {
-                                                updateSessionTitle(
+                                                void persistRename(
                                                     s.id,
                                                     renameDraft.trim(),
                                                 );
@@ -194,11 +313,20 @@ export function ChatSidebar({
                                         }}
                                         onRenameCancel={() => setRenameId(null)}
                                         onPin={() => togglePinSession(s.id)}
+                                        onArchive={() => {
+                                            void persistArchive(s.id, true);
+                                            setMenuSessionId(null);
+                                        }}
+                                        onUnarchive={() => {
+                                            void persistArchive(s.id, false);
+                                            setMenuSessionId(null);
+                                        }}
                                         onDelete={() => {
-                                            deleteSession(s.id);
-                                            onSelectSession?.();
+                                            void persistDelete(s.id);
+                                            setMenuSessionId(null);
                                         }}
                                         pinned
+                                        archived={false}
                                     />
                                 ))}
                             </SessionGroup>
@@ -215,13 +343,12 @@ export function ChatSidebar({
                                         renaming={renameId === s.id}
                                         renameDraft={renameDraft}
                                         onRenameDraft={setRenameDraft}
-                                        onSelect={() => {
-                                            setActiveSession(s.id);
-                                            onSelectSession?.();
-                                        }}
+                                        onSelect={() => onSelectSession(s.id)}
                                         onMenuToggle={() =>
                                             setMenuSessionId(
-                                                menuSessionId === s.id ? null : s.id,
+                                                menuSessionId === s.id
+                                                    ? null
+                                                    : s.id,
                                             )
                                         }
                                         onRenameStart={() => {
@@ -231,7 +358,7 @@ export function ChatSidebar({
                                         }}
                                         onRenameSave={() => {
                                             if (renameDraft.trim()) {
-                                                updateSessionTitle(
+                                                void persistRename(
                                                     s.id,
                                                     renameDraft.trim(),
                                                 );
@@ -240,11 +367,20 @@ export function ChatSidebar({
                                         }}
                                         onRenameCancel={() => setRenameId(null)}
                                         onPin={() => togglePinSession(s.id)}
+                                        onArchive={() => {
+                                            void persistArchive(s.id, true);
+                                            setMenuSessionId(null);
+                                        }}
+                                        onUnarchive={() => {
+                                            void persistArchive(s.id, false);
+                                            setMenuSessionId(null);
+                                        }}
                                         onDelete={() => {
-                                            deleteSession(s.id);
-                                            onSelectSession?.();
+                                            void persistDelete(s.id);
+                                            setMenuSessionId(null);
                                         }}
                                         pinned={pinnedSessionIds.includes(s.id)}
+                                        archived={archivedSessionIds.includes(s.id)}
                                     />
                                 ))}
                             </SessionGroup>
@@ -315,8 +451,11 @@ function SessionRow({
     onRenameSave,
     onRenameCancel,
     onPin,
+    onArchive,
+    onUnarchive,
     onDelete,
     pinned,
+    archived,
 }: {
     session: { id: string; title: string };
     active: boolean;
@@ -330,8 +469,11 @@ function SessionRow({
     onRenameSave: () => void;
     onRenameCancel: () => void;
     onPin: () => void;
+    onArchive: () => void;
+    onUnarchive: () => void;
     onDelete: () => void;
     pinned: boolean;
+    archived: boolean;
 }) {
     if (renaming) {
         return (
@@ -354,6 +496,7 @@ function SessionRow({
     return (
         <div
             data-testid="user-session-item"
+            data-active={active ? "true" : "false"}
             className={cn(
                 "group relative flex h-[40px] items-center",
                 active && "bg-[rgba(255,255,255,0.06)]",
@@ -380,17 +523,37 @@ function SessionRow({
                 <MoreHorizontal className="h-4 w-4" />
             </button>
             {menuOpen ? (
-                <div className="absolute right-0 top-full z-20 min-w-[8rem] border border-[var(--chat-border)] bg-[#15181D] py-1 shadow-lg">
+                <div className="absolute right-0 top-full z-20 min-w-[9rem] border border-[var(--chat-border)] bg-[#15181D] py-1 shadow-lg">
                     <MenuItem onClick={onRenameStart}>Zmień nazwę</MenuItem>
-                    <MenuItem onClick={onPin}>
-                        {pinned ? "Odepnij" : "Przypnij"}
-                    </MenuItem>
+                    {!archived ? (
+                        <MenuItem onClick={onPin}>
+                            {pinned ? "Odepnij" : "Przypnij"}
+                        </MenuItem>
+                    ) : null}
+                    {archived ? (
+                        <MenuItem onClick={onUnarchive}>
+                            <span className="inline-flex items-center gap-1.5">
+                                <ArchiveRestore className="h-3 w-3" />
+                                Przywróć
+                            </span>
+                        </MenuItem>
+                    ) : (
+                        <MenuItem onClick={onArchive}>
+                            <span className="inline-flex items-center gap-1.5">
+                                <Archive className="h-3 w-3" />
+                                Archiwizuj
+                            </span>
+                        </MenuItem>
+                    )}
                     <MenuItem
                         onClick={onDelete}
                         className="text-red-300 hover:text-red-200"
                         data-testid="user-session-delete"
                     >
-                        Usuń
+                        <span className="inline-flex items-center gap-1.5">
+                            <Trash2 className="h-3 w-3" />
+                            Usuń
+                        </span>
                     </MenuItem>
                 </div>
             ) : null}
@@ -428,13 +591,11 @@ function NavBtn({
     label,
     onClick,
     disabled,
-    hint,
 }: {
     icon: typeof Brain;
     label: string;
     onClick: () => void;
     disabled?: boolean;
-    hint?: string;
 }) {
     return (
         <button
@@ -445,9 +606,6 @@ function NavBtn({
         >
             <Icon className="h-4 w-4 shrink-0" />
             {label}
-            {hint ? (
-                <span className="ml-auto text-[10px] opacity-60">{hint}</span>
-            ) : null}
         </button>
     );
 }

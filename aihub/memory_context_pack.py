@@ -348,6 +348,240 @@ def _graph_items(graph: dict[str, Any] | None) -> list[MemoryContextPackItem]:
     return out
 
 
+SOURCE_RELIABILITY: dict[str, float] = {
+    "memory_v2": 0.88,
+    "procedure": 0.92,
+    "contradiction": 0.78,
+    "graph_semantic": 0.72,
+    "graph_episodic": 0.65,
+    "graph_stm": 0.52,
+}
+
+# Half-life for recency decay (seconds) — ~14 days.
+_RECENCY_HALF_LIFE_S = 14.0 * 86400.0
+
+
+def baseline_score_components(
+    item: MemoryContextPackItem,
+    *,
+    query: str,
+    correction_hints: str = "",
+) -> dict[str, float]:
+    """Pre-evidence ranking formula (marker/correction/type only) for A/B eval."""
+    type_boost = {
+        "preference": 0.18,
+        "fact": 0.12,
+        "procedural": 0.16,
+        "autobiographical": 0.07,
+        "relationship": 0.08,
+        "lesson": 0.11,
+        "contradiction": 0.20,
+    }.get(item.memory_type, 0.0)
+    q_tokens = {
+        t.lower()
+        for t in re.findall(r"[A-Za-z0-9_-]{5,}", query or "")
+    }
+    c_low = f"{item.title} {item.content}".lower()
+    overlap = sum(1 for t in q_tokens if t in c_low)
+    overlap_boost = min(0.45, 0.12 * overlap)
+    exact_marker = 0.0
+    for t in q_tokens:
+        if "-" in t and len(t) >= 10 and t in c_low:
+            exact_marker = 0.55
+            break
+    correction_boost = 0.0
+    if correction_hints and any(k in c_low for k in ("poprawka", "korekta", "nie, ", "jednak")):
+        correction_boost = 0.35
+    composite = (
+        float(item.score or 0.0)
+        + float(item.salience or 0.0) * 0.35
+        + float(item.confidence or 0.0) * 0.20
+        + type_boost
+        + overlap_boost
+        + exact_marker
+        + correction_boost
+    )
+    return {
+        "composite": composite,
+        "exact_marker": exact_marker,
+        "correction_boost": correction_boost,
+        "overlap_boost": overlap_boost,
+    }
+
+
+def _item_timestamp(item: MemoryContextPackItem) -> float:
+    md = item.metadata or {}
+    for key in ("updated_ts", "created_ts", "ts", "timestamp"):
+        try:
+            v = float(md.get(key) or 0)
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            continue
+    return 0.0
+
+
+def _token_set(text: str) -> set[str]:
+    return {t.lower() for t in re.findall(r"[A-Za-z0-9À-ÿ_-]{3,}", text or "")}
+
+
+def _jaccard(a: set[str], b: set[str]) -> float:
+    if not a or not b:
+        return 0.0
+    inter = len(a & b)
+    union = len(a | b)
+    return inter / union if union else 0.0
+
+
+def evidence_score_components(
+    item: MemoryContextPackItem,
+    *,
+    query: str,
+    correction_hints: str = "",
+    now: float | None = None,
+) -> dict[str, float]:
+    """Enterprise evidence features for one memory candidate."""
+    now_ts = float(now if now is not None else time.time())
+    q_tokens = _token_set(query)
+    c_text = f"{item.title} {item.content}"
+    c_low = c_text.lower()
+    c_tokens = _token_set(c_text)
+
+    # Base semantic / retrieval score already on the item.
+    base = float(item.score or 0.0)
+
+    # Evidence confidence (explicit item confidence + reinforcement hints).
+    evidence_conf = float(item.confidence or 0.0)
+    if "reinforced" in (item.reason_codes or []):
+        evidence_conf = min(1.0, evidence_conf + 0.1)
+    if "high_confidence" in (item.reason_codes or []):
+        evidence_conf = max(evidence_conf, 0.8)
+
+    # Source reliability.
+    source_rel = float(SOURCE_RELIABILITY.get(item.source, 0.55))
+
+    # Recency decay + freshness (1 = fresh).
+    ts = _item_timestamp(item)
+    if ts <= 0:
+        freshness = 0.45
+        recency = 0.35
+    else:
+        age = max(0.0, now_ts - ts)
+        # Exponential half-life decay.
+        recency = 0.5 ** (age / _RECENCY_HALF_LIFE_S)
+        freshness = recency
+        # STM is fresh by nature even without ts.
+        if item.source == "graph_stm":
+            freshness = max(freshness, 0.7)
+
+    # Exact marker / rare token overlap.
+    overlap = sum(1 for t in q_tokens if len(t) >= 5 and t in c_low)
+    overlap_boost = min(0.45, 0.12 * overlap)
+    exact_marker = 0.0
+    for t in q_tokens:
+        if "-" in t and len(t) >= 10 and t in c_low:
+            exact_marker = 0.55
+            break
+
+    correction_boost = 0.0
+    if correction_hints and any(k in c_low for k in ("poprawka", "korekta", "nie, ", "jednak")):
+        correction_boost = 0.35
+
+    # Contradiction score: surface contradictions when relevant; penalize unresolved conflicts.
+    contradiction = 0.0
+    if item.memory_type == "contradiction" or item.source == "contradiction":
+        contradiction = 0.25  # useful to show
+    for rc in item.reason_codes or []:
+        if str(rc).startswith("contradiction:"):
+            state = str(rc).split(":", 1)[-1]
+            if state in ("unresolved", "open", "active"):
+                contradiction -= 0.2
+            elif state in ("resolved", "superseded"):
+                contradiction += 0.05
+
+    type_boost = {
+        "preference": 0.18,
+        "fact": 0.12,
+        "procedural": 0.16,
+        "autobiographical": 0.07,
+        "relationship": 0.08,
+        "lesson": 0.11,
+        "contradiction": 0.20,
+    }.get(item.memory_type, 0.0)
+
+    # Reliability-weighted base: raw retrieval score cannot dominate weak sources.
+    weighted_base = base * (0.30 + 0.70 * source_rel) * (0.35 + 0.65 * max(evidence_conf, 0.12))
+    low_conf_penalty = 0.0 if evidence_conf >= 0.45 else (0.45 - evidence_conf) * 1.05
+    # Fresh STM noise: freshness helps, but not when confidence is tiny.
+    freshness_term = freshness * (0.12 if evidence_conf >= 0.4 else 0.03)
+
+    composite = (
+        weighted_base
+        + float(item.salience or 0.0) * 0.30
+        + evidence_conf * 0.28
+        + source_rel * 0.28
+        + recency * 0.14
+        + freshness_term
+        + type_boost
+        + overlap_boost
+        + exact_marker
+        + correction_boost
+        + contradiction
+        - low_conf_penalty
+    )
+
+    return {
+        "composite": composite,
+        "base": base,
+        "weighted_base": weighted_base,
+        "evidence_confidence": evidence_conf,
+        "source_reliability": source_rel,
+        "recency": recency,
+        "freshness": freshness,
+        "contradiction": contradiction,
+        "overlap_boost": overlap_boost,
+        "exact_marker": exact_marker,
+        "correction_boost": correction_boost,
+        "low_conf_penalty": low_conf_penalty,
+        "jaccard_query": _jaccard(q_tokens, c_tokens),
+    }
+
+
+def select_with_diversity(
+    ranked: list[tuple[MemoryContextPackItem, dict[str, float]]],
+    *,
+    max_items: int,
+    lambda_diversity: float = 0.72,
+) -> list[tuple[MemoryContextPackItem, dict[str, float]]]:
+    """MMR-style selection: relevance vs redundancy."""
+    if not ranked:
+        return []
+    remaining = list(ranked)
+    selected: list[tuple[MemoryContextPackItem, dict[str, float]]] = []
+    selected_tokens: list[set[str]] = []
+
+    while remaining and len(selected) < max_items:
+        best_i = 0
+        best_val = float("-inf")
+        for i, (item, feats) in enumerate(remaining):
+            rel = float(feats.get("composite") or 0.0)
+            red = 0.0
+            toks = _token_set(f"{item.title} {item.content}")
+            if selected_tokens:
+                red = max(_jaccard(toks, st) for st in selected_tokens)
+            mmr = lambda_diversity * rel - (1.0 - lambda_diversity) * red * 1.2
+            # Prefer source diversity slightly.
+            if selected and item.source in {s.source for s, _ in selected}:
+                mmr -= 0.05
+            if mmr > best_val:
+                best_val = mmr
+                best_i = i
+        chosen = remaining.pop(best_i)
+        selected.append(chosen)
+        selected_tokens.append(_token_set(f"{chosen[0].title} {chosen[0].content}"))
+    return selected
+
+
 def build_memory_context_pack(
     outcome: MemoryReadOutcome,
     *,
@@ -395,32 +629,10 @@ def build_memory_context_pack(
         )
     candidates.extend(_graph_items(outcome.graph_context))
 
-    def candidate_score(item: MemoryContextPackItem) -> tuple[float, float, float]:
-        type_boost = {
-            "preference": 0.18,
-            "fact": 0.12,
-            "procedural": 0.16,
-            "autobiographical": 0.07,
-            "relationship": 0.08,
-            "lesson": 0.11,
-            "contradiction": 0.20,
-        }.get(item.memory_type, 0.0)
-        # Exact marker / rare token overlap with the query beats stale similar facts.
-        q_tokens = {
-            t.lower()
-            for t in re.findall(r"[A-Za-z0-9_-]{5,}", query or "")
-        }
-        c_low = f"{item.title} {item.content}".lower()
-        overlap = sum(1 for t in q_tokens if t in c_low)
-        overlap_boost = min(0.45, 0.12 * overlap)
-        return (
-            item.score + item.salience * 0.35 + item.confidence * 0.20 + type_boost + overlap_boost,
-            item.salience,
-            item.confidence,
-        )
-
     query = str(outcome.query or "")
-    for item in sorted(candidates, key=candidate_score, reverse=True):
+    now = time.time()
+    scored: list[tuple[MemoryContextPackItem, dict[str, float]]] = []
+    for item in candidates:
         if item.id in seen_ids:
             excluded.append(item.id)
             continue
@@ -443,6 +655,26 @@ def build_memory_context_pack(
         if content_key in seen_content:
             excluded.append(item.id)
             continue
+        seen_content.add(content_key)
+        feats = evidence_score_components(
+            item, query=query, correction_hints=correction_hints, now=now
+        )
+        item.reason_codes = list(item.reason_codes or []) + [
+            f"ev_conf={feats['evidence_confidence']:.2f}",
+            f"src_rel={feats['source_reliability']:.2f}",
+            f"recency={feats['recency']:.2f}",
+            f"fresh={feats['freshness']:.2f}",
+        ]
+        if feats["exact_marker"] > 0:
+            item.reason_codes.append("exact_marker")
+        if feats["correction_boost"] > 0:
+            item.reason_codes.append("correction_bearing")
+        scored.append((item, feats))
+
+    scored.sort(key=lambda pair: pair[1]["composite"], reverse=True)
+    diverse = select_with_diversity(scored, max_items=max_items * 2)  # oversample then pack
+
+    for item, feats in diverse:
         src_cap = per_source_caps.get(item.source, 3)
         if per_source_counts.get(item.source, 0) >= src_cap:
             excluded.append(item.id)
@@ -451,9 +683,13 @@ def build_memory_context_pack(
         if len(selected) >= max_items or used + size > max_chars:
             excluded.append(item.id)
             continue
+        # Attach composite into metadata for traces.
+        md = dict(item.metadata or {})
+        md["evidence"] = {k: round(float(v), 4) for k, v in feats.items()}
+        item.metadata = md
+        item.score = float(feats["composite"])
         selected.append(item)
         seen_ids.add(item.id)
-        seen_content.add(content_key)
         per_source_counts[item.source] = per_source_counts.get(item.source, 0) + 1
         used += size
 
@@ -473,6 +709,17 @@ def build_memory_context_pack(
             "candidate_count": len(candidates),
             "junk_or_dup_excluded": len(excluded),
             "per_source_counts": dict(per_source_counts),
+            "evidence_driven": True,
+            "diversity_mmr": True,
+            "scoring": [
+                "recency_decay",
+                "evidence_confidence",
+                "source_reliability",
+                "contradiction",
+                "freshness",
+                "marker",
+                "correction",
+            ],
         },
     )
     dist: dict[str, int] = {}

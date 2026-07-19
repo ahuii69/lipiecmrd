@@ -176,6 +176,110 @@ function buildRows(trace: Record<string, unknown>): Row[] {
         });
     }
 
+    if (hasKey(trace, "budget_profile")) {
+        rows.push({
+            label: "budget_profile",
+            value: (
+                <InsightBadge tone="neutral">
+                    {formatScalar(trace.budget_profile)}
+                </InsightBadge>
+            ),
+        });
+    }
+
+    if (hasKey(trace, "cost_usd") || hasKey(trace, "cost_day_usd")) {
+        const turnCost = hasKey(trace, "cost_usd") ? Number(trace.cost_usd) : NaN;
+        const dayCost = hasKey(trace, "cost_day_usd") ? Number(trace.cost_day_usd) : NaN;
+        const alert = hasKey(trace, "cost_day_alert") && trace.cost_day_alert === true;
+        rows.push({
+            label: "cost_usd",
+            value: (
+                <InsightBadge tone={alert ? "fail" : "success"}>
+                    {Number.isFinite(turnCost) ? `turn $${turnCost.toFixed(5)}` : "—"}
+                    {Number.isFinite(dayCost) ? ` · day $${dayCost.toFixed(4)}` : ""}
+                    {alert ? " · ALERT" : ""}
+                </InsightBadge>
+            ),
+        });
+    }
+
+    if (hasKey(trace, "hallucination_risk") || hasKey(trace, "self_eval_overall_quality")) {
+        const hall = hasKey(trace, "hallucination_risk") ? Number(trace.hallucination_risk) : NaN;
+        const q = hasKey(trace, "self_eval_overall_quality")
+            ? Number(trace.self_eval_overall_quality)
+            : NaN;
+        rows.push({
+            label: "self_eval",
+            value: (
+                <InsightBadge
+                    tone={
+                        Number.isFinite(hall) && hall >= 0.55
+                            ? "fail"
+                            : Number.isFinite(q) && q >= 0.6
+                              ? "success"
+                              : "neutral"
+                    }
+                >
+                    {Number.isFinite(hall) ? `hall ${hall.toFixed(2)}` : "hall —"}
+                    {Number.isFinite(q) ? ` · q ${q.toFixed(2)}` : ""}
+                </InsightBadge>
+            ),
+        });
+    }
+
+    if (hasKey(trace, "adaptive_runtime") && typeof trace.adaptive_runtime === "object") {
+        const ar = trace.adaptive_runtime as Record<string, unknown>;
+        const bits: string[] = [];
+        if (ar.skip_reflection === true) bits.push("skip_refl");
+        if (ar.skip_critic === true) bits.push("skip_critic");
+        if (ar.skip_response_variants === false) bits.push("variants_on");
+        if (ar.skip_planner === false) bits.push("planner_on");
+        rows.push({
+            label: "adaptive_runtime",
+            value: (
+                <InsightBadge tone={bits.length ? "success" : "neutral"}>
+                    {bits.length ? bits.join(", ") : "default"}
+                </InsightBadge>
+            ),
+        });
+    }
+
+    if (hasKey(trace, "response_variants_triggered")) {
+        const on = trace.response_variants_triggered === true;
+        rows.push({
+            label: "response_variants",
+            value: (
+                <InsightBadge tone={on ? "success" : "neutral"}>
+                    {on ? "triggered" : "idle"}
+                </InsightBadge>
+            ),
+        });
+    }
+
+    if (hasKey(trace, "simulation_ran") || hasKey(trace, "simulation_integrated")) {
+        const on =
+            trace.simulation_ran === true || trace.simulation_integrated === true;
+        rows.push({
+            label: "simulation",
+            value: (
+                <InsightBadge tone={on ? "success" : "neutral"}>
+                    {on ? "ran" : "off"}
+                </InsightBadge>
+            ),
+        });
+    }
+
+    if (hasKey(trace, "effective_runtime_path")) {
+        rows.push({
+            label: "runtime_path",
+            value: (
+                <InsightBadge tone="success">
+                    {formatScalar(trace.effective_runtime_path)}
+                </InsightBadge>
+            ),
+        });
+    }
+
     if (
         hasKey(trace, "experience_write_back_attempted") ||
         hasKey(trace, "experience_write_back_succeeded")

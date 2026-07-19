@@ -63,12 +63,36 @@ def _history_created_iso(ts: float) -> str:
 
 
 def _row_to_item(row: Any) -> dict[str, Any]:
-    return {
+    archived = bool(int(row["archived"] or 0)) if "archived" in row.keys() else False
+    item: dict[str, Any] = {
         "id": str(row["id"]),
         "title": str(row["title"]),
         "created_at": float(row["created_at"]),
         "updated_at": float(row["updated_at"]),
+        "archived": archived,
     }
+    if archived:
+        raw_at = row["archived_at"] if "archived_at" in row.keys() else None
+        if raw_at is not None:
+            item["archived_at"] = float(raw_at)
+    return item
+
+
+def _ensure_session_row(user_id: str, session_id: str, *, title: str = "Nowa rozmowa") -> None:
+    row = fetch_one(
+        "SELECT id FROM chat_sessions WHERE user_id=? AND id=?",
+        (user_id, session_id),
+    )
+    if row:
+        return
+    ts = now_ts()
+    exec_one(
+        """
+        INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at, archived, archived_at)
+        VALUES(?,?,?,?,?,0,NULL)
+        """,
+        (user_id, session_id, title, ts, ts),
+    )
 
 
 @router.get("/session/{session_id}/history")
@@ -104,14 +128,33 @@ def get_session_history(
 
 
 @router.get("/sessions")
-def list_sessions(user_id: str = Query(min_length=1, max_length=128)) -> dict[str, Any]:
-    rows = fetch_all(
-        """
-        SELECT id, title, created_at, updated_at FROM chat_sessions
-        WHERE user_id=? ORDER BY updated_at DESC
-        """,
-        (user_id,),
-    )
+def list_sessions(
+    user_id: str = Query(min_length=1, max_length=128),
+    include_archived: bool = Query(
+        True,
+        description="When true (default), archived sessions are included with archived=true.",
+    ),
+) -> dict[str, Any]:
+    if include_archived:
+        rows = fetch_all(
+            """
+            SELECT id, title, created_at, updated_at, archived, archived_at
+            FROM chat_sessions
+            WHERE user_id=?
+            ORDER BY updated_at DESC
+            """,
+            (user_id,),
+        )
+    else:
+        rows = fetch_all(
+            """
+            SELECT id, title, created_at, updated_at, archived, archived_at
+            FROM chat_sessions
+            WHERE user_id=? AND COALESCE(archived, 0)=0
+            ORDER BY updated_at DESC
+            """,
+            (user_id,),
+        )
     return {"sessions": [_row_to_item(r) for r in rows]}
 
 
@@ -132,8 +175,8 @@ def rename_session(body: RenameBody) -> dict[str, Any]:
     else:
         exec_one(
             """
-            INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at)
-            VALUES(?,?,?,?,?)
+            INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at, archived, archived_at)
+            VALUES(?,?,?,?,?,0,NULL)
             """,
             (body.user_id, body.session_id, body.title, ts, ts),
         )
@@ -148,6 +191,38 @@ def delete_session(body: SessionIdBody) -> dict[str, Any]:
         (body.user_id, body.session_id),
     )
     return {"ok": True}
+
+
+@router.post("/session/archive")
+def archive_session(body: SessionIdBody) -> dict[str, Any]:
+    """Mark session archived (soft). Transcript retained; listable with archived=true."""
+    ts = now_ts()
+    _ensure_session_row(body.user_id, body.session_id)
+    exec_one(
+        """
+        UPDATE chat_sessions
+        SET archived=1, archived_at=?, updated_at=?
+        WHERE user_id=? AND id=?
+        """,
+        (ts, ts, body.user_id, body.session_id),
+    )
+    return {"ok": True, "session_id": body.session_id, "archived": True, "archived_at": ts}
+
+
+@router.post("/session/unarchive")
+def unarchive_session(body: SessionIdBody) -> dict[str, Any]:
+    """Restore archived session to the active list."""
+    ts = now_ts()
+    _ensure_session_row(body.user_id, body.session_id)
+    exec_one(
+        """
+        UPDATE chat_sessions
+        SET archived=0, archived_at=NULL, updated_at=?
+        WHERE user_id=? AND id=?
+        """,
+        (ts, body.user_id, body.session_id),
+    )
+    return {"ok": True, "session_id": body.session_id, "archived": False}
 
 
 @router.post("/session/auto-title")
@@ -168,8 +243,8 @@ def auto_title_session(body: AutoTitleBody) -> dict[str, Any]:
     else:
         exec_one(
             """
-            INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at)
-            VALUES(?,?,?,?,?)
+            INSERT INTO chat_sessions(user_id, id, title, created_at, updated_at, archived, archived_at)
+            VALUES(?,?,?,?,?,0,NULL)
             """,
             (body.user_id, body.session_id, title, ts, ts),
         )
