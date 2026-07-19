@@ -45,11 +45,16 @@ export function ChatConfirmationBar({
                 apiKeyOverride,
             );
             if (!res?.ok) {
+                const raw = res as unknown as {
+                    error?: unknown;
+                    tool_result?: { error?: unknown };
+                };
                 const errMsg =
-                    typeof (res as { error?: unknown })?.error === "string"
-                        ? (res as { error: string }).error
-                        : res?.tool_result?.error ||
-                          "Potwierdzenie nie powiodło się";
+                    typeof raw.error === "string"
+                        ? raw.error
+                        : typeof raw.tool_result?.error === "string"
+                          ? raw.tool_result.error
+                          : "Potwierdzenie nie powiodło się";
                 throw new Error(String(errMsg));
             }
             onConfirmed(`Wykonano po potwierdzeniu: ${tool}.`);
